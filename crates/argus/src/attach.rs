@@ -73,7 +73,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
         bail!("attach needs a terminal on stdin");
     }
     let (rows, cols) = crate::client::terminal_size();
-    let restore = target.id.and_then(|id| fetch_screen(id));
+    let restore = target.id.and_then(fetch_screen);
 
     let mut stream = UnixStream::connect(&target.socket)
         .with_context(|| format!("{} is not reachable (has it exited?)", target.name))?;

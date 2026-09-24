@@ -407,11 +407,7 @@ impl Holder {
             self.make_owner(i);
             let size = self.conns[i].size;
             if size == self.size.current {
-                // A client with backfill already has a picture (a manager
-                // snapshot, or a raw replay now streaming to it); jiggling
-                // for a redraw would only add a flicker on top of it. A
-                // client with neither starts out blank and needs one.
-                if req.from_offset.is_none() && !req.replay {
+                if needs_jiggle(&req) {
                     self.jiggle();
                 }
             } else {
@@ -668,4 +664,37 @@ fn drain(fd: RawFd) {
     let mut buf = [0u8; 64];
     // SAFETY: reading into a local buffer from a non-blocking pipe.
     while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+/// Whether an attach at unchanged PTY size still needs the resize-and-back
+/// trick to make the agent redraw. Not needed when the client already
+/// arrives with a picture — a manager snapshot (`from_offset`) or a raw
+/// ring-buffer replay now streaming to it (`replay`) — since jiggling would
+/// only flicker on top of it for no benefit.
+fn needs_jiggle(req: &AttachRequest) -> bool {
+    req.from_offset.is_none() && !req.replay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(from_offset: Option<u64>, replay: bool) -> AttachRequest {
+        AttachRequest { rows: 24, cols: 80, readonly: false, steal: false, replay, from_offset }
+    }
+
+    #[test]
+    fn jiggles_a_blank_client() {
+        assert!(needs_jiggle(&req(None, false)));
+    }
+
+    #[test]
+    fn skips_the_jiggle_for_a_manager_restored_client() {
+        assert!(!needs_jiggle(&req(Some(42), false)));
+    }
+
+    #[test]
+    fn skips_the_jiggle_for_a_ring_buffer_replay() {
+        assert!(!needs_jiggle(&req(None, true)));
+    }
 }

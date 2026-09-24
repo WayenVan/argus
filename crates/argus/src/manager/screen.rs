@@ -98,3 +98,85 @@ impl Screens {
         ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screens() -> Screens {
+        Screens { states: Mutex::new(HashMap::new()) }
+    }
+
+    #[test]
+    fn unavailable_before_any_state() {
+        let s = screens();
+        let r = s.get(1, None);
+        assert_eq!(r.mode, ScreenMode::Unavailable);
+        assert!(r.bytes.is_empty());
+    }
+
+    #[test]
+    fn data_before_a_size_is_known_is_dropped() {
+        let s = screens();
+        s.on_data(1, 0, b"too early");
+        assert_eq!(s.get(1, None).mode, ScreenMode::Unavailable);
+    }
+
+    #[test]
+    fn replay_mode_without_alternate_screen() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_data(1, 0, b"conversation line\r\n");
+        let r = s.get(1, None);
+        assert_eq!(r.mode, ScreenMode::Replay);
+        assert_eq!((r.rows, r.cols), (24, 80));
+        // 0 tells the holder to replay from its oldest retained byte, not
+        // from wherever the manager's own tracking happens to be.
+        assert_eq!(r.offset, 0);
+        assert!(r.bytes.is_empty());
+    }
+
+    #[test]
+    fn snapshot_mode_in_alternate_screen() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_data(1, 0, b"\x1b[?1049hHELLO");
+        let r = s.get(1, None);
+        assert_eq!(r.mode, ScreenMode::Snapshot);
+        assert_eq!((r.rows, r.cols), (24, 80));
+        assert_eq!(r.offset, "\x1b[?1049hHELLO".len() as u64);
+        assert!(r.bytes.starts_with(b"\x1b[?1049h"), "must re-enter alt screen before the redraw: {:?}", r.bytes);
+    }
+
+    #[test]
+    fn since_offset_dedupes_an_unchanged_snapshot() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_data(1, 0, b"\x1b[?1049hHELLO");
+        let first = s.get(1, None);
+        assert!(!first.bytes.is_empty());
+        let second = s.get(1, Some(first.offset));
+        assert_eq!(second.mode, ScreenMode::Snapshot);
+        assert_eq!(second.offset, first.offset);
+        assert!(second.bytes.is_empty());
+    }
+
+    #[test]
+    fn resize_updates_the_tracked_size_in_place() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_event(1, HolderEvent::Resized { rows: 30, cols: 100 });
+        let r = s.get(1, None);
+        assert_eq!((r.rows, r.cols), (30, 100));
+    }
+
+    #[test]
+    fn agents_are_tracked_independently() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_data(1, 0, b"\x1b[?1049hone");
+        // Agent 2 has never been heard from.
+        assert_eq!(s.get(2, None).mode, ScreenMode::Unavailable);
+        assert_eq!(s.get(1, None).mode, ScreenMode::Snapshot);
+    }
+}
