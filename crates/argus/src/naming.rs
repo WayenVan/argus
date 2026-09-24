@@ -141,6 +141,7 @@ mod tests {
             status: AgentStatus::Running,
             exit_code: None,
             activity: "unknown".into(),
+            activity_since: None,
             attached: 0,
             labels: Default::default(),
         }

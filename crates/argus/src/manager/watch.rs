@@ -52,7 +52,7 @@ pub async fn serve(
         // Snapshot and subscription under one lock: nothing slips between them.
         let (seq, agents, mut changes) = {
             let reg = manager.registry.lock().unwrap();
-            let agents: Vec<AgentInfo> = reg.agents.values().filter(|a| filter.wants(a)).cloned().collect();
+            let agents: Vec<AgentInfo> = reg.infos().filter(|a| filter.wants(a)).cloned().collect();
             (reg.seq, agents, reg.subscribe())
         };
         // id → whether the client last saw it live.
@@ -112,7 +112,7 @@ fn collect(
     let mut events = Vec::new();
     for id in dirty {
         let was = known.get(&id).copied();
-        let Some(agent) = reg.agents.get(&id) else {
+        let Some(agent) = reg.agents.get(&id).map(|r| &r.info) else {
             if known.remove(&id).is_some() {
                 events.push(AgentEvent::Removed { id });
             }

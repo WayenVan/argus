@@ -119,6 +119,7 @@ pub struct RunOptions {
     pub group: Option<String>,
     pub cwd: Option<PathBuf>,
     pub labels: Vec<(String, String)>,
+    pub kind: Option<String>,
     pub attach: bool,
 }
 
@@ -140,13 +141,20 @@ pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
         rows,
         cols,
         labels: opts.labels.into_iter().collect(),
+        kind: opts.kind,
     };
-    match Conn::connect()?.request(&Request::Run(req))? {
-        Response::Agent { agent } if opts.attach => {
+    let reply = Conn::connect()?.request(&Request::Run(req))?;
+    if let Response::Agent { warnings, .. } = &reply {
+        for w in warnings {
+            eprintln!("argus: warning: {w}");
+        }
+    }
+    match reply {
+        Response::Agent { agent, .. } if opts.attach => {
             let target = attach::Target { socket: paths::holder_socket(agent.id), name: agent.name };
             attach::attach(&target, attach::Options { readonly: false, steal: false, replay: false })
         }
-        Response::Agent { agent } => {
+        Response::Agent { agent, .. } => {
             println!("{}\t{}", agent.id, agent.name);
             Ok(())
         }
@@ -187,7 +195,7 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let now = now_secs();
     let with_labels = agents.iter().any(|a| !a.labels.is_empty());
-    let mut header = vec!["ID", "NAME", "KIND", "STATUS", "AGE", "ATTACHED", "CWD"];
+    let mut header = vec!["ID", "NAME", "KIND", "STATUS", "ACTIVITY", "AGE", "ATTACHED", "CWD"];
     if with_labels {
         header.push("LABELS");
     }
@@ -208,6 +216,7 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
                 a.name.clone(),
                 a.kind.clone(),
                 status,
+                activity(a, now),
                 age(now.saturating_sub(a.created_at)),
                 attached,
                 cwd,
@@ -232,6 +241,19 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// `done 3m` — how long a result has been waiting is what matters most.
+fn activity(a: &AgentInfo, now: u64) -> String {
+    if !a.status.is_live() {
+        return "-".into();
+    }
+    match (a.activity.as_str(), a.activity_since) {
+        ("done" | "waiting_approval" | "error", Some(since)) => {
+            format!("{} {}", a.activity, age(now.saturating_sub(since)))
+        }
+        _ => a.activity.clone(),
+    }
 }
 
 fn age(secs: u64) -> String {
@@ -300,7 +322,7 @@ pub fn send(target: String, text: String, enter: bool) -> Result<()> {
 }
 
 pub fn rename(target: String, name: String) -> Result<()> {
-    if let Response::Agent { agent } = Conn::connect()?.request(&Request::Rename { target, name })? {
+    if let Response::Agent { agent, .. } = Conn::connect()?.request(&Request::Rename { target, name })? {
         println!("{}\t{}", agent.id, agent.name);
     }
     Ok(())
@@ -332,6 +354,11 @@ pub fn label(target: String, changes: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+pub fn ack(target: String) -> Result<()> {
+    Conn::connect()?.request(&Request::Ack { target })?;
+    Ok(())
+}
+
 pub fn manager_start() -> Result<()> {
     Conn::connect()?;
     manager_status()
@@ -346,6 +373,28 @@ pub fn manager_stop(kill_agents: bool) -> Result<()> {
         None => println!("manager is not running"),
     }
     Ok(())
+}
+
+/// Replaces the running manager with the installed binary, e.g. after an
+/// upgrade. Agents keep running; the new manager reconnects to their holders.
+pub fn manager_restart() -> Result<()> {
+    if let Some(mut conn) = Conn::open(false)? {
+        let Response::Hello { pid, .. } = conn.request(&Request::Hello { version: PROTOCOL_VERSION })? else {
+            bail!("unexpected reply to Hello");
+        };
+        conn.request(&Request::Shutdown { kill_agents: false })?;
+        // The old manager holds the single-instance lock until it exits.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: kill with signal 0 only checks whether the process exists.
+        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+            if Instant::now() > deadline {
+                bail!("the old manager (pid {pid}) did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Conn::connect()?;
+    manager_status()
 }
 
 pub fn manager_status() -> Result<()> {

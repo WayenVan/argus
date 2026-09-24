@@ -83,6 +83,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "argus-hook"
+version = "0.1.0"
+dependencies = [
+ "argus-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "argus-proto"
 version = "0.1.0"
 dependencies = [

@@ -48,6 +48,8 @@ pub struct Conn {
     pub role: Role,
     /// Terminal size reported by an attached client.
     pub size: (u16, u16),
+    /// Whether this attached terminal reported having focus.
+    pub focused: bool,
     pub dead: bool,
     inbuf: Vec<u8>,
     out: VecDeque<Queued>,
@@ -62,6 +64,7 @@ impl Conn {
             stream,
             role: Role::New,
             size: (0, 0),
+            focused: false,
             dead: false,
             inbuf: Vec::new(),
             out: VecDeque::new(),

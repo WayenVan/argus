@@ -4,6 +4,8 @@
 //! alive"; the manager is an index that can crash or restart at any time and
 //! rebuild itself by reconnecting to every holder socket.
 
+mod activity;
+pub(crate) mod driver;
 mod holder;
 mod registry;
 mod watch;
@@ -17,14 +19,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{aio, ty};
-use argus_proto::msg::{AgentInfo, AgentStatus, Request, Response, RunRequest, now_secs};
+use argus_proto::msg::{AgentInfo, AgentStatus, HolderEvent, Request, Response, RunRequest, now_secs};
 use argus_proto::{PROTOCOL_VERSION, paths};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 
 use crate::naming;
-use registry::Registry;
+use activity::Fact;
+use registry::{AgentRecord, Registry};
 
 /// Longer than the holder's SIGTERM → SIGKILL grace period.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
@@ -36,6 +39,7 @@ pub fn run() -> Result<()> {
 pub struct Manager {
     registry: Mutex<Registry>,
     holder_exe: PathBuf,
+    drivers: driver::Context,
     shutdown: Notify,
     /// Identifies this manager instance to watchers; changes on restart.
     epoch: u64,
@@ -55,9 +59,22 @@ async fn serve() -> Result<()> {
         bail!("argus-holder not found next to argus at {}", holder_exe.display());
     }
 
+    let hook_exe = std::env::current_exe()?.with_file_name("argus-hook");
+    let drivers =
+        driver::Context { hook_exe: hook_exe.is_file().then_some(hook_exe), dir: paths::state_dir().join("drivers") };
+    paths::ensure_private_dir(&drivers.dir)?;
+    if let Err(e) = driver::install_shared_files(&drivers) {
+        log(&format!("writing driver files: {e:#}"));
+    }
+
     let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
-    let manager =
-        Arc::new(Manager { registry: Mutex::new(Registry::load()?), holder_exe, shutdown: Notify::new(), epoch });
+    let manager = Arc::new(Manager {
+        registry: Mutex::new(Registry::load()?),
+        holder_exe,
+        drivers,
+        shutdown: Notify::new(),
+        epoch,
+    });
     manager.recover();
 
     let socket = paths::manager_socket();
@@ -113,6 +130,10 @@ async fn handle_conn(manager: Arc<Manager>, stream: UnixStream) -> Result<()> {
             break;
         }
         greeted = true;
+        if let Request::Report { agent_id, source, event } = &req {
+            manager.report(*agent_id, source, event); // Never answered.
+            continue;
+        }
         if let Request::Watch { ids, include_exited } = req {
             // The connection belongs to the watch from here on.
             return watch::serve(&manager, reader, writer, ids, include_exited).await;
@@ -140,12 +161,14 @@ impl Manager {
                 }
                 Ok(Response::Hello { version: PROTOCOL_VERSION, pid: std::process::id() })
             }
-            Request::Run(req) => Ok(Response::Agent { agent: self.spawn_agent(req).await? }),
+            Request::Run(req) => {
+                let (agent, warnings) = self.spawn_agent(req).await?;
+                Ok(Response::Agent { agent, warnings })
+            }
             Request::List { all, prefix } => {
                 let reg = self.registry.lock().unwrap();
                 let agents = reg
-                    .agents
-                    .values()
+                    .infos()
                     .filter(|a| all || a.status.is_live())
                     .filter(|a| prefix.as_deref().is_none_or(|p| naming::in_prefix(&a.name, p)))
                     .cloned()
@@ -156,8 +179,8 @@ impl Manager {
                 let signal = signal.unwrap_or(libc::SIGTERM);
                 let ids = {
                     let reg = self.registry.lock().unwrap();
-                    let ids = naming::resolve(&target, reg.agents.values())?;
-                    let live: Vec<u64> = ids.into_iter().filter(|id| reg.agents[id].status.is_live()).collect();
+                    let ids = naming::resolve(&target, reg.infos())?;
+                    let live: Vec<u64> = ids.into_iter().filter(|&id| reg.info(id).status.is_live()).collect();
                     if live.is_empty() {
                         bail!("{target} is not running");
                     }
@@ -171,8 +194,8 @@ impl Manager {
             Request::Remove { target } => {
                 let mut reg = self.registry.lock().unwrap();
                 let id = resolve_one(&reg, &target, "rm")?;
-                if reg.agents[&id].status.is_live() {
-                    bail!("{} is still running; `argus kill` it first", reg.agents[&id].name);
+                if reg.info(id).status.is_live() {
+                    bail!("{} is still running; `argus kill` it first", reg.info(id).name);
                 }
                 reg.agents.remove(&id);
                 reg.changed(id);
@@ -184,8 +207,7 @@ impl Manager {
                 let cutoff = now_secs().saturating_sub(older_than.unwrap_or(0));
                 let mut reg = self.registry.lock().unwrap();
                 let doomed: Vec<u64> = reg
-                    .agents
-                    .values()
+                    .infos()
                     .filter(|a| !a.status.is_live())
                     .filter(|a| a.exited_at.unwrap_or(a.created_at) <= cutoff)
                     .filter(|a| prefix.as_deref().is_none_or(|p| naming::in_prefix(&a.name, p)))
@@ -193,7 +215,7 @@ impl Manager {
                     .collect();
                 let mut agents = Vec::with_capacity(doomed.len());
                 for id in doomed {
-                    agents.extend(reg.agents.remove(&id));
+                    agents.extend(reg.agents.remove(&id).map(|r| r.info));
                     reg.changed(id);
                     let _ = fs::remove_dir_all(paths::agent_dir(id));
                 }
@@ -204,23 +226,31 @@ impl Manager {
                 let id = {
                     let reg = self.registry.lock().unwrap();
                     let id = resolve_one(&reg, &target, "send")?;
-                    if !reg.agents[&id].status.is_live() {
-                        bail!("{} is not running", reg.agents[&id].name);
+                    if !reg.info(id).status.is_live() {
+                        bail!("{} is not running", reg.info(id).name);
                     }
                     id
                 };
                 holder::write(id, text).await?;
+                self.on_fact(id, Fact::Input);
                 Ok(Response::Ok)
             }
-            Request::Rename { target, name } => Ok(Response::Agent { agent: self.rename(&target, &name)? }),
+            Request::Rename { target, name } => {
+                Ok(Response::Agent { agent: self.rename(&target, &name)?, warnings: vec![] })
+            }
+            Request::Ack { target } => {
+                let id = resolve_one(&self.registry.lock().unwrap(), &target, "ack")?;
+                self.on_fact(id, Fact::Ack);
+                Ok(Response::Ok)
+            }
             Request::Label { target, set, unset } => {
                 for (k, v) in &set {
                     naming::validate_label(k, v)?;
                 }
                 let mut reg = self.registry.lock().unwrap();
-                let ids = naming::resolve(&target, reg.agents.values())?;
+                let ids = naming::resolve(&target, reg.infos())?;
                 for &id in &ids {
-                    let labels = &mut reg.agents.get_mut(&id).expect("resolved").labels;
+                    let labels = &mut reg.agents.get_mut(&id).expect("resolved").info.labels;
                     labels.extend(set.clone());
                     for key in &unset {
                         labels.remove(key);
@@ -228,14 +258,14 @@ impl Manager {
                     reg.changed(id);
                 }
                 reg.save()?;
-                let agents = ids.iter().map(|id| reg.agents[id].clone()).collect();
+                let agents = ids.iter().map(|&id| reg.info(id).clone()).collect();
                 Ok(Response::Agents { agents })
             }
             Request::Shutdown { kill_agents } => {
                 if kill_agents {
                     let live: Vec<u64> = {
                         let reg = self.registry.lock().unwrap();
-                        reg.agents.values().filter(|a| a.status.is_live()).map(|a| a.id).collect()
+                        reg.infos().filter(|a| a.status.is_live()).map(|a| a.id).collect()
                     };
                     for &id in &live {
                         if let Err(e) = holder::signal(id, libc::SIGTERM).await {
@@ -246,13 +276,20 @@ impl Manager {
                 }
                 Ok(Response::Ok)
             }
-            Request::Watch { .. } => bail!("Watch is handled by the connection loop"),
+            Request::Watch { .. } | Request::Report { .. } => bail!("handled by the connection loop"),
         }
     }
 
-    async fn spawn_agent(self: &Arc<Self>, req: RunRequest) -> Result<AgentInfo> {
+    async fn spawn_agent(self: &Arc<Self>, req: RunRequest) -> Result<(AgentInfo, Vec<String>)> {
         let Some(program) = req.command.first() else { bail!("no command given") };
-        let kind = naming::kind_of(program);
+        let kind = match &req.kind {
+            Some(k) => {
+                naming::validate_name(k).context("invalid --kind")?;
+                k.clone()
+            }
+            None => naming::kind_of(program),
+        };
+        let driver = driver::for_kind(&kind);
         let group = match &req.group {
             Some(g) => naming::normalize_group(g)?,
             None => None,
@@ -289,21 +326,34 @@ impl Manager {
                 status: AgentStatus::Starting,
                 exit_code: None,
                 activity: "unknown".into(),
+                activity_since: None,
                 attached: 0,
                 labels: req.labels.clone(),
             };
-            reg.agents.insert(id, info.clone());
+            reg.agents.insert(id, AgentRecord::new(info.clone()));
             reg.changed(id);
             reg.save()?;
             info
         };
 
-        match holder::start(&self.holder_exe, info.id, &req).await {
+        let dir = paths::agent_dir(info.id);
+        paths::ensure_private_dir(&dir)?;
+        let mut launch = driver::Launch { command: req.command.clone(), agent_dir: dir };
+        let warnings: Vec<String> = match driver.prepare(&mut launch, &self.drivers) {
+            Ok(w) => w.into_iter().collect(),
+            Err(e) => vec![format!("{} setup failed, activity will not be tracked: {e:#}", driver.kind())],
+        };
+
+        match holder::start(&self.holder_exe, info.id, &req, launch.command).await {
             Ok((holder_pid, agent_pid)) => {
                 let info = {
                     let mut reg = self.registry.lock().unwrap();
-                    let agent = reg.agents.get_mut(&info.id).expect("agent inserted above");
+                    let agent = &mut reg.agents.get_mut(&info.id).expect("agent inserted above").info;
                     agent.status = AgentStatus::Running;
+                    if let Some(activity) = driver.initial_activity() {
+                        agent.activity = activity.into();
+                        agent.activity_since = Some(now_secs());
+                    }
                     agent.holder_pid = Some(holder_pid);
                     agent.agent_pid = Some(agent_pid);
                     let info = agent.clone();
@@ -314,7 +364,7 @@ impl Manager {
                 holder::link_name(&info.name, info.id);
                 self.follow(info.id);
                 log(&format!("started {} (id {}, holder {holder_pid}, agent {agent_pid})", info.name, info.id));
-                Ok(info)
+                Ok((info, warnings))
             }
             Err(e) => {
                 let mut reg = self.registry.lock().unwrap();
@@ -332,7 +382,7 @@ impl Manager {
     fn rename(&self, target: &str, name: &str) -> Result<AgentInfo> {
         let mut reg = self.registry.lock().unwrap();
         let id = resolve_one(&reg, target, "rename")?;
-        let old = reg.agents[&id].name.clone();
+        let old = reg.info(id).name.clone();
         let (group, leaf) = match old.rsplit_once('/') {
             Some((g, l)) => (Some(g), l),
             None => (None, old.as_str()),
@@ -347,12 +397,12 @@ impl Manager {
         };
         naming::validate_name(&new)?;
         if new == old {
-            return Ok(reg.agents[&id].clone());
+            return Ok(reg.info(id).clone());
         }
         if reg.name_taken(&new) {
             bail!("name {new} is already in use");
         }
-        let agent = reg.agents.get_mut(&id).expect("resolved");
+        let agent = &mut reg.agents.get_mut(&id).expect("resolved").info;
         agent.name = new.clone();
         let info = agent.clone();
         if info.status.is_live() {
@@ -374,7 +424,7 @@ impl Manager {
         loop {
             let pending = {
                 let reg = self.registry.lock().unwrap();
-                ids.iter().filter(|id| reg.agents.get(id).is_some_and(|a| a.status.is_live())).count()
+                ids.iter().filter(|id| reg.agents.get(id).is_some_and(|r| r.info.status.is_live())).count()
             };
             if pending == 0 {
                 return;
@@ -390,7 +440,7 @@ impl Manager {
     fn recover(self: &Arc<Self>) {
         let live: Vec<(u64, String)> = {
             let reg = self.registry.lock().unwrap();
-            reg.agents.values().filter(|a| a.status.is_live()).map(|a| (a.id, a.name.clone())).collect()
+            reg.infos().filter(|a| a.status.is_live()).map(|a| (a.id, a.name.clone())).collect()
         };
         log(&format!("recovering {} live agents", live.len()));
         for (id, name) in live {
@@ -401,23 +451,25 @@ impl Manager {
 
     /// Follows a holder's events until the agent exits, then records it.
     fn follow(self: &Arc<Self>, id: u64) {
+        let hookless = {
+            let reg = self.registry.lock().unwrap();
+            reg.agents.get(&id).is_some_and(|r| !driver::for_kind(&r.info.kind).has_hooks())
+        };
+        if hookless {
+            self.poll_output(id);
+        }
         let manager = self.clone();
         tokio::spawn(async move {
-            let on_attached = |count: u32| {
-                let mut reg = manager.registry.lock().unwrap();
-                if let Some(agent) = reg.agents.get_mut(&id)
-                    && agent.attached != count
-                {
-                    agent.attached = count;
-                    reg.changed(id);
-                }
+            let on_event = |event: HolderEvent| match event {
+                HolderEvent::Attached { count, focused } => manager.on_fact(id, Fact::Attached { count, focused }),
+                HolderEvent::Input => manager.on_fact(id, Fact::Input),
             };
-            let (status, code, exited_at) = match holder::follow(id, on_attached).await {
+            let (status, code, exited_at) = match holder::follow(id, on_event).await {
                 Ok(Some(code)) => (AgentStatus::Exited, Some(code), Some(now_secs())),
                 Ok(None) | Err(_) => holder::exit_from_disk(id),
             };
             let mut reg = manager.registry.lock().unwrap();
-            if let Some(agent) = reg.agents.get_mut(&id)
+            if let Some(agent) = reg.agents.get_mut(&id).map(|r| &mut r.info)
                 && agent.status.is_live()
             {
                 agent.status = status;
@@ -436,7 +488,7 @@ impl Manager {
 }
 
 fn resolve_one(reg: &Registry, target: &str, verb: &str) -> Result<u64> {
-    let ids = naming::resolve(target, reg.agents.values())?;
+    let ids = naming::resolve(target, reg.infos())?;
     match ids[..] {
         [id] => Ok(id),
         _ => bail!("{target} matches {} agents; {verb} takes one", ids.len()),

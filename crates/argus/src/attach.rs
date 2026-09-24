@@ -15,15 +15,18 @@ use argus_proto::frame::{self, ty};
 use argus_proto::msg::{AttachRequest, HolderRequest, HolderResponse};
 use argus_proto::{PROTOCOL_VERSION, paths};
 
-/// Ctrl-\ (FS). In raw mode it arrives as a byte instead of SIGQUIT.
+/// Ctrl-\ (FS). In raw mode it arrives as a byte instead of SIGQUIT, unless
+/// the agent turned on an extended keyboard mode: see [`find_detach`].
 const DETACH_KEY: u8 = 0x1c;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
 const ENTER: &str = "\x1b[?1004h\x1b[H\x1b[2J";
-/// Leaves the agent's terminal modes behind: focus reporting, alternate
-/// screen, mouse modes, bracketed paste, hidden cursor, colours.
-const RESET: &str = "\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m";
+/// Leaves the agent's terminal modes behind: kitty keyboard flags (popped
+/// before leaving the alternate screen, which has its own stack),
+/// modifyOtherKeys, focus reporting, alternate screen, mouse modes, bracketed
+/// paste, colour scheme reports, hidden cursor, colours.
+const RESET: &str = "\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m";
 
 pub struct Options {
     pub readonly: bool,
@@ -107,6 +110,9 @@ pub fn call(stream: &mut UnixStream, req: &HolderRequest) -> Result<HolderRespon
 fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let detached = Arc::new(AtomicBool::new(false));
+    // The user just ran `argus attach` here, so this terminal has focus now;
+    // terminals only report focus when it changes.
+    frame::write_frame(&mut *writer.lock().unwrap(), ty::FOCUS, &[1])?;
 
     // Keyboard → holder.
     {
@@ -161,20 +167,21 @@ fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, read
             Ok(n) => n,
         };
         let mut chunk = &buf[..n];
-        let detach_at = chunk.iter().position(|&b| b == DETACH_KEY);
+        let detach_at = find_detach(chunk);
         if let Some(pos) = detach_at {
             chunk = &chunk[..pos];
         }
 
         // Terminals send focus reports as one write, so they arrive whole.
         let mut data = Vec::with_capacity(chunk.len());
-        let mut focus = false;
+        let mut focus = None;
         let mut i = 0;
         while i < chunk.len() {
             if chunk[i..].starts_with(FOCUS_IN) {
-                focus = true;
+                focus = Some(true);
                 i += FOCUS_IN.len();
             } else if chunk[i..].starts_with(FOCUS_OUT) {
+                focus = Some(false);
                 i += FOCUS_OUT.len();
             } else {
                 data.push(chunk[i]);
@@ -183,10 +190,14 @@ fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, read
         }
 
         let mut w = writer.lock().unwrap();
-        if focus && frame::write_frame(&mut *w, ty::FOCUS, &[]).is_err() {
+        if let Some(focused) = focus
+            && frame::write_frame(&mut *w, ty::FOCUS, &[u8::from(focused)]).is_err()
+        {
             return;
         }
-        if !readonly && !data.is_empty() && frame::write_frame(&mut *w, ty::DATA, &data).is_err() {
+        // Mouse moves are forwarded, but they are not the user doing anything.
+        let kind = if only_mouse_reports(&data) { ty::MOUSE } else { ty::DATA };
+        if !readonly && !data.is_empty() && frame::write_frame(&mut *w, kind, &data).is_err() {
             return;
         }
         if detach_at.is_some() {
@@ -196,6 +207,65 @@ fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, read
             return;
         }
     }
+}
+
+/// Where the detach key starts in `input`. Besides the plain byte, agents
+/// such as Claude Code turn on the kitty keyboard protocol or xterm's
+/// modifyOtherKeys, and the terminal then sends Ctrl-\\ as `ESC [ 92 ; 5 u`
+/// or `ESC [ 27 ; 5 ; 92 ~`.
+fn find_detach(input: &[u8]) -> Option<usize> {
+    (0..input.len())
+        .find(|&i| input[i] == DETACH_KEY || input[i..].starts_with(b"\x1b[") && is_ctrl_backslash(&input[i + 2..]))
+}
+
+/// Whether the CSI sequence whose parameters start `csi` is Ctrl-\\.
+fn is_ctrl_backslash(csi: &[u8]) -> bool {
+    let Some(end) = csi.iter().position(|&b| (0x40..=0x7e).contains(&b)) else { return false };
+    let Ok(params) = std::str::from_utf8(&csi[..end]) else { return false };
+    // Each parameter may carry `:`-separated sub-fields; the first is the value.
+    let params: Vec<Vec<&str>> = params.split(';').map(|p| p.split(':').collect()).collect();
+    let value = |i: usize, j: usize| params.get(i).and_then(|p| p.get(j)).map(|v| v.parse::<u32>().ok());
+    // Modifiers are 1 + a bitmask; Caps Lock (64) and Num Lock (128) do not count.
+    let ctrl_only = |m: Option<Option<u32>>| matches!(m, Some(Some(m)) if m >= 1 && (m - 1) & !(64 | 128) == 4);
+    match csi[end] {
+        // Kitty: `92[:alternates];modifiers[:event]u`, press or repeat only.
+        b'u' => {
+            value(0, 0) == Some(Some(92)) && ctrl_only(value(1, 0)) && matches!(value(1, 1), None | Some(Some(1 | 2)))
+        }
+        // modifyOtherKeys: `27;modifiers;92~`.
+        b'~' => {
+            params.len() == 3
+                && value(0, 0) == Some(Some(27))
+                && ctrl_only(value(1, 0))
+                && value(2, 0) == Some(Some(92))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `data` consists solely of terminal mouse reports: SGR
+/// (`ESC [ < b ; x ; y M|m`) or legacy X10 (`ESC [ M` + 3 bytes).
+fn only_mouse_reports(mut data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    while !data.is_empty() {
+        if let Some(rest) = data.strip_prefix(b"\x1b[<") {
+            let Some(end) = rest.iter().position(|&b| b == b'M' || b == b'm') else { return false };
+            if !rest[..end].iter().all(|&b| b.is_ascii_digit() || b == b';') {
+                return false;
+            }
+            data = &rest[end + 1..];
+        } else if let Some(rest) = data.strip_prefix(b"\x1b[M") {
+            if rest.len() < 3 {
+                return false;
+            }
+            data = &rest[3..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn forward_resizes(winch: std::fs::File, writer: Arc<Mutex<UnixStream>>) {
@@ -290,4 +360,34 @@ pub fn resolve(target: &str, from_manager: Option<(u64, String)>) -> Result<Targ
         return Ok(Target { socket: link, name: target.to_string() });
     }
     bail!("no running agent named {target} (the manager is not running, so use an ID or the full name)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_detach, only_mouse_reports};
+
+    #[test]
+    fn detach_key_in_every_encoding() {
+        assert_eq!(find_detach(b"ab\x1c"), Some(2));
+        assert_eq!(find_detach(b"x\x1b[92;5u"), Some(1));
+        assert_eq!(find_detach(b"\x1b[92;69u"), Some(0), "caps lock on");
+        assert_eq!(find_detach(b"\x1b[92:124;5:1u"), Some(0));
+        assert_eq!(find_detach(b"\x1b[27;5;92~"), Some(0));
+        assert_eq!(find_detach(b"\x1b[92;5:3u"), None, "release");
+        assert_eq!(find_detach(b"\x1b[92;7u"), None, "ctrl+alt");
+        assert_eq!(find_detach(b"\x1b[92u"), None, "plain backslash");
+        assert_eq!(find_detach(b"\x1b[97;5u\x1b[<0;1;2M"), None);
+    }
+
+    #[test]
+    fn mouse_reports_are_not_input() {
+        assert!(only_mouse_reports(b"\x1b[<35;40;12M"));
+        assert!(only_mouse_reports(b"\x1b[<35;40;12M\x1b[<35;41;12M\x1b[<0;41;12m"));
+        assert!(only_mouse_reports(b"\x1b[M #!"));
+        assert!(!only_mouse_reports(b"a"));
+        assert!(!only_mouse_reports(b"\x1b[<35;40;12Mx"), "a keypress mixed in is input");
+        assert!(!only_mouse_reports(b"\x1b[A"), "arrow keys are input");
+        assert!(!only_mouse_reports(b"\x1b"), "a lone Esc is input");
+        assert!(!only_mouse_reports(b""));
+    }
 }

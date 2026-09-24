@@ -1,0 +1,11 @@
+[package]
+name = "argus-hook"
+description = "Forwards agent hook events (Claude Code, Codex) to the argus manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Runs once per hook event: keep it tiny and quick to start.
+[dependencies]
+argus-proto.workspace = true
+serde_json.workspace = true

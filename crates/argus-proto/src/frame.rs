@@ -22,10 +22,15 @@ pub mod ty {
     pub const EXIT: u8 = 0x13;
     /// holder → client: disconnected by `--steal`.
     pub const KICKED: u8 = 0x14;
-    /// client → holder: terminal gained focus, claim size ownership.
+    /// client → holder: `[1]` focus in (claims size ownership), `[0]` focus
+    /// out. An empty payload means focus in (M1 clients).
     pub const FOCUS: u8 = 0x15;
     /// holder → subscriber: `from: u64 BE, to: u64 BE`, backlog dropped.
     pub const SKIPPED: u8 = 0x16;
+    /// client → holder: mouse reports only. Written to the agent like `DATA`,
+    /// but not user activity: it neither counts as input nor claims the size.
+    /// (Agents that ask for any-motion tracking get a report per mouse move.)
+    pub const MOUSE: u8 = 0x17;
 }
 
 #[derive(Debug)]

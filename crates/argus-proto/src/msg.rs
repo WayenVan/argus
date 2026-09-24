@@ -54,9 +54,14 @@ pub struct AgentInfo {
     pub status: AgentStatus,
     #[serde(default)]
     pub exit_code: Option<i32>,
-    /// Adapter state. Fixed to `unknown` until adapters exist (M3).
+    /// What the agent is doing, as understood by its driver: `working`,
+    /// `tool:<name>`, `waiting_approval`, `done`, `waiting_input`, `error`,
+    /// `unknown`; `busy` / `quiet` for agents without hooks.
     #[serde(default = "unknown")]
     pub activity: String,
+    /// Unix seconds when `activity` last changed.
+    #[serde(default)]
+    pub activity_since: Option<u64>,
     #[serde(default)]
     pub attached: u32,
     /// Free-form `key=value` tags, orthogonal to the group path.
@@ -128,6 +133,18 @@ pub enum Request {
         #[serde(default)]
         include_exited: bool,
     },
+    /// Sent by `argus-hook` on behalf of an agent. Never answered.
+    Report {
+        agent_id: u64,
+        /// The hook's origin (`claude`, `codex`); must match the agent's kind.
+        source: String,
+        /// The hook payload exactly as the agent wrote it.
+        event: serde_json::Value,
+    },
+    /// Marks a finished agent as seen: `done` → `waiting_input`.
+    Ack {
+        target: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -146,6 +163,9 @@ pub struct RunRequest {
     pub cols: u16,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Overrides kind detection from the program name (`--kind`).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -157,6 +177,10 @@ pub enum Response {
     },
     Agent {
         agent: AgentInfo,
+        /// Problems worth telling the user about, e.g. activity tracking
+        /// being unavailable for this agent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
     },
     Agents {
         agents: Vec<AgentInfo>,
@@ -244,7 +268,7 @@ pub enum HolderReady {
 pub enum SubscribeLevel {
     /// Lifecycle events only (`Exit`).
     Events,
-    /// Events plus output bytes, for adapters.
+    /// Events plus output bytes, for screen snapshots and logs.
     Output,
 }
 
@@ -292,7 +316,14 @@ pub struct AttachRequest {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum HolderEvent {
-    Attached { count: u32 },
+    /// Attached terminals, and how many of them have focus.
+    Attached {
+        count: u32,
+        #[serde(default)]
+        focused: u32,
+    },
+    /// Someone typed into the agent. At most one per second.
+    Input,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

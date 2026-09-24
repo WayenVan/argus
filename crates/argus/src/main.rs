@@ -39,8 +39,11 @@ enum Command {
         /// Label as key=value (repeatable)
         #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
         label: Vec<(String, String)>,
-        /// Program to run; its name becomes the agent kind
-        kind: String,
+        /// Treat the program as this kind of agent (e.g. a wrapper script for claude)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Program to run; its name selects the kind unless --kind is given
+        program: String,
         /// Arguments passed to the program
         #[arg(last = true)]
         args: Vec<String>,
@@ -94,6 +97,8 @@ enum Command {
         #[arg(required = true, value_name = "KEY=VALUE|KEY-")]
         changes: Vec<String>,
     },
+    /// Mark a finished agent as seen (done → waiting_input)
+    Ack { target: String },
     /// Print agent events as they happen
     Events {
         /// One JSON object per line
@@ -153,6 +158,8 @@ enum Command {
 enum ManagerAction {
     /// Start the manager if it is not running
     Start,
+    /// Restart the manager (e.g. after upgrading); running agents keep running
+    Restart,
     /// Stop the manager; running agents keep running
     Stop {
         /// Also kill every running agent
@@ -183,8 +190,8 @@ fn parse_age(s: &str) -> Result<u64, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Run { name, group, cwd, attach, label, kind, args } => {
-            client::run(client::RunOptions { name, group, cwd, labels: label, attach }, kind, args)
+        Command::Run { name, group, cwd, attach, label, kind, program, args } => {
+            client::run(client::RunOptions { name, group, cwd, labels: label, kind, attach }, program, args)
         }
         Command::Attach { target, ro, steal, replay } => {
             client::attach(target, attach::Options { readonly: ro, steal, replay })
@@ -198,6 +205,7 @@ fn main() -> ExitCode {
         Command::Mv { target, group } => client::mv(target, group),
         Command::Label { target, changes } => client::label(target, changes),
         Command::Events { json } => stream::events(json),
+        Command::Ack { target } => client::ack(target),
         Command::Wait { target, until, timeout } => stream::wait(target, until, timeout),
         Command::Kill { target, signal } => client::kill(target, signal),
         Command::Rm { target } => client::rm(target),
@@ -205,6 +213,7 @@ fn main() -> ExitCode {
         Command::Manager { action } => match action {
             ManagerAction::Start => client::manager_start(),
             ManagerAction::Stop { kill_agents } => client::manager_stop(kill_agents),
+            ManagerAction::Restart => client::manager_restart(),
             ManagerAction::Status => client::manager_status(),
             ManagerAction::Run => manager::run(),
         },

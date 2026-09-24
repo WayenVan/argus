@@ -34,6 +34,7 @@ const READ_CHUNK: usize = 64 * 1024;
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const LINGER: Duration = Duration::from_secs(60);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+const INPUT_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 
 static SIGCHLD_PIPE: AtomicI32 = AtomicI32::new(-1);
 
@@ -62,7 +63,9 @@ pub struct Holder {
     kill_deadline: Option<Instant>,
     linger_deadline: Option<Instant>,
     size: Size,
-    attached_reported: u32,
+    /// Last `(attached, focused)` counts sent to subscribers.
+    attached_reported: (u32, u32),
+    last_input_event: Option<Instant>,
 }
 
 /// PTY size and who decides it.
@@ -128,7 +131,8 @@ impl Holder {
             kill_deadline: None,
             linger_deadline: None,
             size: Size { current, owner: None, history: Vec::new(), last_change: None, pending: None },
-            attached_reported: 0,
+            attached_reported: (0, 0),
+            last_input_event: None,
         })
     }
 
@@ -275,6 +279,13 @@ impl Holder {
                     self.write_master();
                 }
                 self.claim_size(i);
+                self.report_input();
+            }
+            (ty::MOUSE, Role::Attach { readonly: false }) => {
+                if self.exit_code.is_none() {
+                    self.master_out.extend_from_slice(payload);
+                    self.write_master();
+                }
             }
             (ty::RESIZE, Role::Attach { .. }) if payload.len() == 4 => {
                 let rows = u16::from_be_bytes([payload[0], payload[1]]);
@@ -284,7 +295,14 @@ impl Holder {
                     self.request_resize();
                 }
             }
-            (ty::FOCUS, Role::Attach { .. }) => self.claim_size(i),
+            (ty::FOCUS, Role::Attach { .. }) => {
+                let focused = payload.first() != Some(&0);
+                self.conns[i].focused = focused;
+                if focused {
+                    self.claim_size(i);
+                }
+                self.report_attached();
+            }
             (ty::DETACH, Role::Attach { .. }) => self.conns[i].dead = true,
             _ => {}
         }
@@ -311,8 +329,8 @@ impl Holder {
                     SubscribeLevel::Output => Role::Output,
                 };
                 self.conns[i].push(frame::encode_json(&HolderResponse::Ok));
-                let count = self.attached_count();
-                self.conns[i].push(frame::encode_json(&HolderEvent::Attached { count }));
+                let (count, focused) = self.attached_counts();
+                self.conns[i].push(frame::encode_json(&HolderEvent::Attached { count, focused }));
                 if let (SubscribeLevel::Output, Some(offset)) = (level, from_offset) {
                     let (start, bytes) = self.ring.since(offset);
                     let mut at = start;
@@ -450,18 +468,42 @@ impl Holder {
     }
 
     fn attached_count(&self) -> u32 {
-        self.conns.iter().filter(|c| c.role.is_attach() && !c.dead).count() as u32
+        self.attached_counts().0
+    }
+
+    /// Attached terminals, and how many of them currently have focus.
+    fn attached_counts(&self) -> (u32, u32) {
+        let attached = self.conns.iter().filter(|c| c.role.is_attach() && !c.dead);
+        let (count, focused) = attached.fold((0, 0), |(n, f), c| (n + 1, f + u32::from(c.focused)));
+        (count, focused)
     }
 
     fn report_attached(&mut self) {
-        let count = self.attached_count();
-        if count == self.attached_reported {
+        let counts = self.attached_counts();
+        if counts == self.attached_reported {
             return;
         }
-        self.attached_reported = count;
-        let event = frame::encode_json(&HolderEvent::Attached { count });
+        self.attached_reported = counts;
+        let (count, focused) = counts;
+        self.notify_subscribers(&HolderEvent::Attached { count, focused });
+    }
+
+    /// Tells subscribers someone typed, at most once per second.
+    fn report_input(&mut self) {
+        let now = Instant::now();
+        if self.last_input_event.is_some_and(|t| now.duration_since(t) < INPUT_EVENT_INTERVAL) {
+            return;
+        }
+        self.last_input_event = Some(now);
+        self.notify_subscribers(&HolderEvent::Input);
+    }
+
+    /// Events are facts for whoever is subscribed right now; nothing is queued
+    /// for subscribers that are not connected.
+    fn notify_subscribers(&mut self, event: &HolderEvent) {
+        let frame = frame::encode_json(event);
         for c in self.conns.iter_mut().filter(|c| c.role.is_subscriber()) {
-            c.push(event.clone());
+            c.push(frame.clone());
         }
     }
 

@@ -22,13 +22,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Launches `argus-holder` and waits for it to report the agent is running.
 /// Returns `(holder_pid, agent_pid)`.
-pub async fn start(holder_exe: &Path, id: u64, req: &RunRequest) -> Result<(u32, u32)> {
+pub async fn start(holder_exe: &Path, id: u64, req: &RunRequest, command: Vec<String>) -> Result<(u32, u32)> {
     let dir = paths::agent_dir(id);
     paths::ensure_private_dir(&dir)?;
     let log_file = OpenOptions::new().create(true).append(true).open(dir.join("holder.log"))?;
     let spec = HolderSpec {
         id,
-        command: req.command.clone(),
+        command,
         cwd: req.cwd.clone(),
         env: req.env.clone(),
         rows: req.rows,
@@ -84,21 +84,32 @@ async fn call(stream: &mut UnixStream, req: &HolderRequest) -> Result<HolderResp
     }
 }
 
-/// Returns the exit code once the holder reports it, or `None` on EOF.
-pub async fn follow(id: u64, on_attached: impl Fn(u32)) -> Result<Option<i32>> {
+/// Passes the holder's events to `on_event` and returns the exit code once
+/// the holder reports it, or `None` on EOF.
+pub async fn follow(id: u64, on_event: impl Fn(HolderEvent)) -> Result<Option<i32>> {
     let mut stream = connect(id).await?;
     call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Events, from_offset: None }).await?;
     while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
         match t {
             ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),
-            ty::CONTROL => match serde_json::from_slice(&payload) {
-                Ok(HolderEvent::Attached { count }) => on_attached(count),
-                Err(_) => {} // Newer holder events this manager does not know.
-            },
+            // Events from a newer holder that this manager does not know are skipped.
+            ty::CONTROL => {
+                if let Ok(event) = serde_json::from_slice(&payload) {
+                    on_event(event);
+                }
+            }
             _ => {}
         }
     }
     Ok(None)
+}
+
+/// How many bytes of output the agent has produced so far.
+pub async fn output_offset(id: u64) -> Result<u64> {
+    match call(&mut connect(id).await?, &HolderRequest::Info).await? {
+        HolderResponse::Info(info) => Ok(info.output_offset),
+        other => bail!("unexpected reply to Info: {other:?}"),
+    }
 }
 
 pub async fn signal(id: u64, signal: i32) -> Result<()> {

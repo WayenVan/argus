@@ -1,7 +1,12 @@
 //! The agent registry: persisted index plus change notifications for watchers.
+//!
+//! Each agent is an [`AgentRecord`]: the public [`AgentInfo`] (persisted and
+//! sent to clients) plus [`AgentRuntime`], state that only means something to
+//! this manager process and is rebuilt from scratch after a restart.
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use argus_proto::msg::AgentInfo;
@@ -13,9 +18,37 @@ use tokio::sync::broadcast;
 /// it is told to resync.
 const CHANGE_BACKLOG: usize = 4096;
 
+pub struct AgentRecord {
+    pub info: AgentInfo,
+    pub runtime: AgentRuntime,
+}
+
+#[derive(Default)]
+pub struct AgentRuntime {
+    /// Attached terminals that currently have focus (from the holder).
+    pub focused: u32,
+    /// The agent session hook reports are bound to; others are dropped.
+    pub session_id: Option<String>,
+    /// Last tool seen, restored when a permission prompt is answered.
+    pub last_tool: Option<String>,
+    /// Silence watchdog: when to look at the output offset next.
+    pub deadline: Option<Instant>,
+    /// Whether a watchdog task is running for this agent.
+    pub watchdog: bool,
+    /// Bumped each time the agent enters `working`, so the watchdog takes a
+    /// fresh output baseline for every working period.
+    pub working_gen: u64,
+}
+
+impl AgentRecord {
+    pub fn new(info: AgentInfo) -> AgentRecord {
+        AgentRecord { info, runtime: AgentRuntime::default() }
+    }
+}
+
 pub struct Registry {
     pub next_id: u64,
-    pub agents: BTreeMap<u64, AgentInfo>,
+    pub agents: BTreeMap<u64, AgentRecord>,
     /// Bumped on every change; watch events carry it.
     pub seq: u64,
     changes: broadcast::Sender<u64>,
@@ -35,10 +68,20 @@ impl Registry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegistryFile { next_id: 1, agents: vec![] },
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let mut agents: BTreeMap<u64, AgentInfo> = file.agents.into_iter().map(|a| (a.id, a)).collect();
-        for agent in agents.values_mut() {
-            agent.attached = 0; // Holders report the real count on subscribe.
-        }
+        let agents: BTreeMap<u64, AgentRecord> = file
+            .agents
+            .into_iter()
+            .map(|mut info| {
+                // Holders report the real attach count on subscribe, and hook
+                // state from before the restart can no longer be trusted.
+                info.attached = 0;
+                if info.status.is_live() {
+                    info.activity = "unknown".into();
+                    info.activity_since = None;
+                }
+                (info.id, AgentRecord::new(info))
+            })
+            .collect();
         // Never hand out an ID twice, even if the counter was lost.
         let next_id = file.next_id.max(agents.keys().max().map_or(1, |m| m + 1));
         let (changes, _) = broadcast::channel(CHANGE_BACKLOG);
@@ -48,10 +91,18 @@ impl Registry {
     pub fn save(&self) -> Result<()> {
         let path = paths::registry_file();
         let tmp = path.with_extension("json.tmp");
-        let file = RegistryFile { next_id: self.next_id, agents: self.agents.values().cloned().collect() };
+        let file = RegistryFile { next_id: self.next_id, agents: self.infos().cloned().collect() };
         fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
         fs::rename(&tmp, &path)?;
         Ok(())
+    }
+
+    pub fn infos(&self) -> impl Iterator<Item = &AgentInfo> + Clone {
+        self.agents.values().map(|r| &r.info)
+    }
+
+    pub fn info(&self, id: u64) -> &AgentInfo {
+        &self.agents[&id].info
     }
 
     /// Records that agent `id` changed (or was removed) and wakes watchers.
@@ -68,6 +119,6 @@ impl Registry {
     }
 
     pub fn name_taken(&self, name: &str) -> bool {
-        self.agents.values().any(|a| a.name == name)
+        self.infos().any(|a| a.name == name)
     }
 }
