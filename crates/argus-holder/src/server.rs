@@ -305,7 +305,7 @@ impl Holder {
                 output_offset: self.ring.end,
                 attached: self.attached_count(),
             }),
-            Ok(HolderRequest::Subscribe { level }) => {
+            Ok(HolderRequest::Subscribe { level, from_offset }) => {
                 self.conns[i].role = match level {
                     SubscribeLevel::Events => Role::Events,
                     SubscribeLevel::Output => Role::Output,
@@ -313,6 +313,17 @@ impl Holder {
                 self.conns[i].push(frame::encode_json(&HolderResponse::Ok));
                 let count = self.attached_count();
                 self.conns[i].push(frame::encode_json(&HolderEvent::Attached { count }));
+                if let (SubscribeLevel::Output, Some(offset)) = (level, from_offset) {
+                    let (start, bytes) = self.ring.since(offset);
+                    let mut at = start;
+                    for chunk in bytes.chunks(READ_CHUNK) {
+                        let mut payload = Vec::with_capacity(8 + chunk.len());
+                        payload.extend_from_slice(&at.to_be_bytes());
+                        payload.extend_from_slice(chunk);
+                        self.conns[i].push(frame::encode(ty::DATA, &payload));
+                        at += chunk.len() as u64;
+                    }
+                }
                 if let Some(code) = self.exit_code {
                     self.conns[i].push(frame::encode(ty::EXIT, &code.to_be_bytes()));
                 }
@@ -326,6 +337,15 @@ impl Holder {
                     if signal == libc::SIGTERM {
                         self.kill_deadline = Some(Instant::now() + KILL_GRACE);
                     }
+                    HolderResponse::Ok
+                }
+            }
+            Ok(HolderRequest::Write { text }) => {
+                if self.exit_code.is_some() {
+                    HolderResponse::Error { message: "agent has already exited".into() }
+                } else {
+                    self.master_out.extend_from_slice(text.as_bytes());
+                    self.write_master();
                     HolderResponse::Ok
                 }
             }

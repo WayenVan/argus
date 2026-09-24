@@ -1,5 +1,6 @@
 //! JSON control messages.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,9 @@ pub struct AgentInfo {
     pub activity: String,
     #[serde(default)]
     pub attached: u32,
+    /// Free-form `key=value` tags, orthogonal to the group path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 fn unknown() -> String {
@@ -89,9 +93,40 @@ pub enum Request {
     Remove {
         target: String,
     },
+    /// Removes every exited agent, optionally only those that ended more than
+    /// `older_than` seconds ago and/or under a group prefix.
+    Prune {
+        #[serde(default)]
+        older_than: Option<u64>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
     Shutdown {
         #[serde(default)]
         kill_agents: bool,
+    },
+    /// Writes input to the agent without attaching.
+    Send {
+        target: String,
+        text: String,
+    },
+    Rename {
+        target: String,
+        name: String,
+    },
+    Label {
+        target: String,
+        #[serde(default)]
+        set: BTreeMap<String, String>,
+        #[serde(default)]
+        unset: Vec<String>,
+    },
+    /// Long-lived: `Snapshot`, then an `Event` whenever something changes.
+    Watch {
+        #[serde(default)]
+        ids: Option<Vec<u64>>,
+        #[serde(default)]
+        include_exited: bool,
     },
 }
 
@@ -109,17 +144,67 @@ pub struct RunRequest {
     pub env: Vec<(String, String)>,
     pub rows: u16,
     pub cols: u16,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum Response {
-    Hello { version: u32, pid: u32 },
-    Agent { agent: AgentInfo },
-    Agents { agents: Vec<AgentInfo> },
-    Killed { ids: Vec<u64> },
+    Hello {
+        version: u32,
+        pid: u32,
+    },
+    Agent {
+        agent: AgentInfo,
+    },
+    Agents {
+        agents: Vec<AgentInfo>,
+    },
+    Killed {
+        ids: Vec<u64>,
+    },
+    Pruned {
+        agents: Vec<AgentInfo>,
+    },
     Ok,
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
+    /// First message of a watch. `epoch` changes when the manager restarts.
+    Snapshot {
+        epoch: u64,
+        seq: u64,
+        agents: Vec<AgentInfo>,
+    },
+    Event {
+        epoch: u64,
+        seq: u64,
+        event: AgentEvent,
+    },
+}
+
+/// Watch events carry the agent's whole current record, so a client simply
+/// replaces its row. Changes to one agent within ~100 ms are coalesced.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind")]
+pub enum AgentEvent {
+    Created {
+        agent: AgentInfo,
+    },
+    /// Any change to a live agent: status, activity, attach count, name, labels.
+    Updated {
+        agent: AgentInfo,
+    },
+    Exited {
+        agent: AgentInfo,
+    },
+    Removed {
+        id: u64,
+    },
+    /// The watcher fell behind; a fresh `Snapshot` follows.
+    Resync,
 }
 
 impl Response {
@@ -170,11 +255,19 @@ pub enum HolderRequest {
         version: u32,
     },
     Info,
+    /// With `from_offset`, output subscribers first get the ring buffer from
+    /// that offset (or its oldest byte), then live output.
     Subscribe {
         level: SubscribeLevel,
+        #[serde(default)]
+        from_offset: Option<u64>,
     },
     Signal {
         signal: i32,
+    },
+    /// Input written to the agent as if typed.
+    Write {
+        text: String,
     },
     /// Switches the connection to stream mode after `Ok`.
     Attach(AttachRequest),

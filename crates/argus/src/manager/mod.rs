@@ -1,34 +1,31 @@
-//! The manager: registry, holder spawning, and recovery.
+//! The manager: registry, holder spawning, recovery, and watch streams.
 //!
 //! It holds no PTY. Holders are the source of truth for "is this agent
 //! alive"; the manager is an index that can crash or restart at any time and
 //! rebuild itself by reconnecting to every holder socket.
 
-use std::collections::BTreeMap;
+mod holder;
+mod registry;
+mod watch;
+
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{aio, ty};
-use argus_proto::msg::{
-    AgentInfo, AgentStatus, ExitRecord, HolderEvent, HolderReady, HolderRequest, HolderResponse, HolderSpec, Request,
-    Response, RunRequest, SubscribeLevel, now_secs,
-};
+use argus_proto::msg::{AgentInfo, AgentStatus, Request, Response, RunRequest, now_secs};
 use argus_proto::{PROTOCOL_VERSION, paths};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 
 use crate::naming;
+use registry::Registry;
 
-const HOLDER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longer than the holder's SIGTERM → SIGKILL grace period.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
 
@@ -36,12 +33,12 @@ pub fn run() -> Result<()> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(serve())
 }
 
-type Shared = Arc<Manager>;
-
-struct Manager {
+pub struct Manager {
     registry: Mutex<Registry>,
     holder_exe: PathBuf,
     shutdown: Notify,
+    /// Identifies this manager instance to watchers; changes on restart.
+    epoch: u64,
 }
 
 async fn serve() -> Result<()> {
@@ -58,7 +55,9 @@ async fn serve() -> Result<()> {
         bail!("argus-holder not found next to argus at {}", holder_exe.display());
     }
 
-    let manager = Arc::new(Manager { registry: Mutex::new(Registry::load()?), holder_exe, shutdown: Notify::new() });
+    let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
+    let manager =
+        Arc::new(Manager { registry: Mutex::new(Registry::load()?), holder_exe, shutdown: Notify::new(), epoch });
     manager.recover();
 
     let socket = paths::manager_socket();
@@ -94,7 +93,7 @@ async fn serve() -> Result<()> {
     Ok(())
 }
 
-async fn handle_conn(manager: Shared, stream: UnixStream) -> Result<()> {
+async fn handle_conn(manager: Arc<Manager>, stream: UnixStream) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let mut greeted = false;
     while let Some((t, payload)) = aio::read_frame(&mut reader).await? {
@@ -114,6 +113,10 @@ async fn handle_conn(manager: Shared, stream: UnixStream) -> Result<()> {
             break;
         }
         greeted = true;
+        if let Request::Watch { ids, include_exited } = req {
+            // The connection belongs to the watch from here on.
+            return watch::serve(&manager, reader, writer, ids, include_exited).await;
+        }
         let shutdown = matches!(req, Request::Shutdown { .. });
         let resp = match manager.dispatch(req).await {
             Ok(resp) => resp,
@@ -161,21 +164,72 @@ impl Manager {
                     live
                 };
                 for &id in &ids {
-                    signal_holder(id, signal).await.with_context(|| format!("signalling agent {id}"))?;
+                    holder::signal(id, signal).await.with_context(|| format!("signalling agent {id}"))?;
                 }
                 Ok(Response::Killed { ids })
             }
             Request::Remove { target } => {
                 let mut reg = self.registry.lock().unwrap();
-                let ids = naming::resolve(&target, reg.agents.values())?;
-                let [id] = ids[..] else { bail!("{target} matches {} agents; rm takes one", ids.len()) };
+                let id = resolve_one(&reg, &target, "rm")?;
                 if reg.agents[&id].status.is_live() {
                     bail!("{} is still running; `argus kill` it first", reg.agents[&id].name);
                 }
                 reg.agents.remove(&id);
+                reg.changed(id);
                 reg.save()?;
                 let _ = fs::remove_dir_all(paths::agent_dir(id));
                 Ok(Response::Ok)
+            }
+            Request::Prune { older_than, prefix } => {
+                let cutoff = now_secs().saturating_sub(older_than.unwrap_or(0));
+                let mut reg = self.registry.lock().unwrap();
+                let doomed: Vec<u64> = reg
+                    .agents
+                    .values()
+                    .filter(|a| !a.status.is_live())
+                    .filter(|a| a.exited_at.unwrap_or(a.created_at) <= cutoff)
+                    .filter(|a| prefix.as_deref().is_none_or(|p| naming::in_prefix(&a.name, p)))
+                    .map(|a| a.id)
+                    .collect();
+                let mut agents = Vec::with_capacity(doomed.len());
+                for id in doomed {
+                    agents.extend(reg.agents.remove(&id));
+                    reg.changed(id);
+                    let _ = fs::remove_dir_all(paths::agent_dir(id));
+                }
+                reg.save()?;
+                Ok(Response::Pruned { agents })
+            }
+            Request::Send { target, text } => {
+                let id = {
+                    let reg = self.registry.lock().unwrap();
+                    let id = resolve_one(&reg, &target, "send")?;
+                    if !reg.agents[&id].status.is_live() {
+                        bail!("{} is not running", reg.agents[&id].name);
+                    }
+                    id
+                };
+                holder::write(id, text).await?;
+                Ok(Response::Ok)
+            }
+            Request::Rename { target, name } => Ok(Response::Agent { agent: self.rename(&target, &name)? }),
+            Request::Label { target, set, unset } => {
+                for (k, v) in &set {
+                    naming::validate_label(k, v)?;
+                }
+                let mut reg = self.registry.lock().unwrap();
+                let ids = naming::resolve(&target, reg.agents.values())?;
+                for &id in &ids {
+                    let labels = &mut reg.agents.get_mut(&id).expect("resolved").labels;
+                    labels.extend(set.clone());
+                    for key in &unset {
+                        labels.remove(key);
+                    }
+                    reg.changed(id);
+                }
+                reg.save()?;
+                let agents = ids.iter().map(|id| reg.agents[id].clone()).collect();
+                Ok(Response::Agents { agents })
             }
             Request::Shutdown { kill_agents } => {
                 if kill_agents {
@@ -184,7 +238,7 @@ impl Manager {
                         reg.agents.values().filter(|a| a.status.is_live()).map(|a| a.id).collect()
                     };
                     for &id in &live {
-                        if let Err(e) = signal_holder(id, libc::SIGTERM).await {
+                        if let Err(e) = holder::signal(id, libc::SIGTERM).await {
                             log(&format!("stopping agent {id}: {e:#}"));
                         }
                     }
@@ -192,6 +246,7 @@ impl Manager {
                 }
                 Ok(Response::Ok)
             }
+            Request::Watch { .. } => bail!("Watch is handled by the connection loop"),
         }
     }
 
@@ -202,6 +257,9 @@ impl Manager {
             Some(g) => naming::normalize_group(g)?,
             None => None,
         };
+        for (k, v) in &req.labels {
+            naming::validate_label(k, v)?;
+        }
 
         let info = {
             let mut reg = self.registry.lock().unwrap();
@@ -232,13 +290,15 @@ impl Manager {
                 exit_code: None,
                 activity: "unknown".into(),
                 attached: 0,
+                labels: req.labels.clone(),
             };
             reg.agents.insert(id, info.clone());
+            reg.changed(id);
             reg.save()?;
             info
         };
 
-        match self.start_holder(info.id, &req).await {
+        match holder::start(&self.holder_exe, info.id, &req).await {
             Ok((holder_pid, agent_pid)) => {
                 let info = {
                     let mut reg = self.registry.lock().unwrap();
@@ -247,17 +307,19 @@ impl Manager {
                     agent.holder_pid = Some(holder_pid);
                     agent.agent_pid = Some(agent_pid);
                     let info = agent.clone();
+                    reg.changed(info.id);
                     reg.save()?;
                     info
                 };
-                link_name(&info.name, info.id);
-                self.watch(info.id);
+                holder::link_name(&info.name, info.id);
+                self.follow(info.id);
                 log(&format!("started {} (id {}, holder {holder_pid}, agent {agent_pid})", info.name, info.id));
                 Ok(info)
             }
             Err(e) => {
                 let mut reg = self.registry.lock().unwrap();
                 reg.agents.remove(&info.id);
+                reg.changed(info.id);
                 reg.save()?;
                 let _ = fs::remove_dir_all(paths::agent_dir(info.id));
                 Err(e)
@@ -265,9 +327,48 @@ impl Manager {
         }
     }
 
-    /// Waits for the watch tasks to record every agent's exit, so the registry
-    /// and name links are final before the manager goes away. Holders escalate
-    /// to SIGKILL after 5s, so this normally ends well before the deadline.
+    /// `name` may be a full path, a new last segment (group kept), or a group
+    /// ending in `/` (last segment kept; `/` alone means the top level).
+    fn rename(&self, target: &str, name: &str) -> Result<AgentInfo> {
+        let mut reg = self.registry.lock().unwrap();
+        let id = resolve_one(&reg, target, "rename")?;
+        let old = reg.agents[&id].name.clone();
+        let (group, leaf) = match old.rsplit_once('/') {
+            Some((g, l)) => (Some(g), l),
+            None => (None, old.as_str()),
+        };
+        let new = if let Some(dest) = name.strip_suffix('/') {
+            let dest = dest.trim_start_matches('/');
+            naming::join((!dest.is_empty()).then_some(dest), leaf)
+        } else if name.contains('/') {
+            name.trim_start_matches('/').to_string()
+        } else {
+            naming::join(group, name)
+        };
+        naming::validate_name(&new)?;
+        if new == old {
+            return Ok(reg.agents[&id].clone());
+        }
+        if reg.name_taken(&new) {
+            bail!("name {new} is already in use");
+        }
+        let agent = reg.agents.get_mut(&id).expect("resolved");
+        agent.name = new.clone();
+        let info = agent.clone();
+        if info.status.is_live() {
+            holder::unlink_name(&old);
+            holder::link_name(&new, id);
+        }
+        reg.changed(id);
+        reg.save()?;
+        log(&format!("renamed {old} to {new} (id {id})"));
+        Ok(info)
+    }
+
+    /// Waits for the follow tasks to record every agent's exit, so the
+    /// registry and name links are final before the manager goes away.
+    /// Holders escalate to SIGKILL after 5s, so this normally ends well before
+    /// the deadline.
     async fn wait_until_stopped(&self, ids: &[u64]) {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
         loop {
@@ -285,50 +386,6 @@ impl Manager {
         }
     }
 
-    /// Launches `argus-holder` and waits for it to report the agent is running.
-    async fn start_holder(&self, id: u64, req: &RunRequest) -> Result<(u32, u32)> {
-        let dir = paths::agent_dir(id);
-        paths::ensure_private_dir(&dir)?;
-        let log_file = OpenOptions::new().create(true).append(true).open(dir.join("holder.log"))?;
-        let spec = HolderSpec {
-            id,
-            command: req.command.clone(),
-            cwd: req.cwd.clone(),
-            env: req.env.clone(),
-            rows: req.rows,
-            cols: req.cols,
-            socket: paths::holder_socket(id),
-            state_dir: dir,
-            manager_socket: paths::manager_socket(),
-        };
-
-        let mut child = tokio::process::Command::new(&self.holder_exe)
-            .args(["--id", &id.to_string()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(log_file)
-            .spawn()
-            .context("launching argus-holder")?;
-        let mut stdin = child.stdin.take().expect("piped");
-        stdin.write_all(&serde_json::to_vec(&spec)?).await?;
-        drop(stdin);
-        let stdout = child.stdout.take().expect("piped");
-        // The holder forks and its parent exits at once; reap that parent.
-        tokio::spawn(async move {
-            let _ = child.wait().await;
-        });
-
-        let mut lines = BufReader::new(stdout).lines();
-        let line = tokio::time::timeout(HOLDER_READY_TIMEOUT, lines.next_line())
-            .await
-            .context("argus-holder did not report ready in time")??
-            .context("argus-holder exited without reporting")?;
-        match serde_json::from_str(&line).context("bad ready message from argus-holder")? {
-            HolderReady::Ready { holder_pid, agent_pid } => Ok((holder_pid, agent_pid)),
-            HolderReady::Failed { message } => bail!(message),
-        }
-    }
-
     /// Re-attaches to holders after a manager restart.
     fn recover(self: &Arc<Self>) {
         let live: Vec<(u64, String)> = {
@@ -337,23 +394,27 @@ impl Manager {
         };
         log(&format!("recovering {} live agents", live.len()));
         for (id, name) in live {
-            link_name(&name, id);
-            self.watch(id);
+            holder::link_name(&name, id);
+            self.follow(id);
         }
     }
 
     /// Follows a holder's events until the agent exits, then records it.
-    fn watch(self: &Arc<Self>, id: u64) {
+    fn follow(self: &Arc<Self>, id: u64) {
         let manager = self.clone();
         tokio::spawn(async move {
             let on_attached = |count: u32| {
-                if let Some(agent) = manager.registry.lock().unwrap().agents.get_mut(&id) {
+                let mut reg = manager.registry.lock().unwrap();
+                if let Some(agent) = reg.agents.get_mut(&id)
+                    && agent.attached != count
+                {
                     agent.attached = count;
+                    reg.changed(id);
                 }
             };
-            let (status, code, exited_at) = match follow_holder(id, on_attached).await {
+            let (status, code, exited_at) = match holder::follow(id, on_attached).await {
                 Ok(Some(code)) => (AgentStatus::Exited, Some(code), Some(now_secs())),
-                Ok(None) | Err(_) => exit_from_disk(id),
+                Ok(None) | Err(_) => holder::exit_from_disk(id),
             };
             let mut reg = manager.registry.lock().unwrap();
             if let Some(agent) = reg.agents.get_mut(&id)
@@ -363,8 +424,9 @@ impl Manager {
                 agent.exit_code = code;
                 agent.exited_at = exited_at;
                 agent.attached = 0;
-                unlink_name(&agent.name);
+                holder::unlink_name(&agent.name);
                 log(&format!("{} (id {id}) is {}", agent.name, status.as_str()));
+                reg.changed(id);
                 if let Err(e) = reg.save() {
                     log(&format!("saving registry: {e:#}"));
                 }
@@ -373,113 +435,11 @@ impl Manager {
     }
 }
 
-async fn holder_conn(id: u64) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(paths::holder_socket(id)).await?;
-    holder_call(&mut stream, &HolderRequest::Hello { version: PROTOCOL_VERSION }).await?;
-    Ok(stream)
-}
-
-async fn holder_call(stream: &mut UnixStream, req: &HolderRequest) -> Result<HolderResponse> {
-    aio::write_json(stream, req).await?;
-    loop {
-        let Some((t, payload)) = aio::read_frame(stream).await? else { bail!("holder closed the connection") };
-        if t == ty::CONTROL {
-            return match serde_json::from_slice(&payload)? {
-                HolderResponse::Error { message } => bail!(message),
-                resp => Ok(resp),
-            };
-        }
-    }
-}
-
-/// Returns the exit code once the holder reports it, or `None` on EOF.
-async fn follow_holder(id: u64, on_attached: impl Fn(u32)) -> Result<Option<i32>> {
-    let mut stream = holder_conn(id).await?;
-    holder_call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Events }).await?;
-    while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
-        match t {
-            ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),
-            ty::CONTROL => match serde_json::from_slice(&payload) {
-                Ok(HolderEvent::Attached { count }) => on_attached(count),
-                Err(_) => {} // Newer holder events this manager does not know.
-            },
-            _ => {}
-        }
-    }
-    Ok(None)
-}
-
-/// Points `holders/by-name/<name>.sock` at the holder socket so attach works
-/// by name without the manager. The holder never learns its name.
-fn link_name(name: &str, id: u64) {
-    let link = paths::name_socket(name);
-    if let Some(dir) = link.parent()
-        && let Err(e) = paths::ensure_private_dir(dir)
-    {
-        return log(&format!("creating {}: {e}", dir.display()));
-    }
-    let _ = fs::remove_file(&link);
-    if let Err(e) = std::os::unix::fs::symlink(paths::holder_socket(id), &link) {
-        log(&format!("linking {}: {e}", link.display()));
-    }
-}
-
-fn unlink_name(name: &str) {
-    let _ = fs::remove_file(paths::name_socket(name));
-}
-
-async fn signal_holder(id: u64, signal: i32) -> Result<()> {
-    let mut stream = holder_conn(id).await?;
-    holder_call(&mut stream, &HolderRequest::Signal { signal }).await?;
-    Ok(())
-}
-
-/// Used when the holder is gone: its exit record says how the agent ended.
-fn exit_from_disk(id: u64) -> (AgentStatus, Option<i32>, Option<u64>) {
-    let path = paths::exit_record(&paths::agent_dir(id));
-    match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<ExitRecord>(&b).ok()) {
-        Some(rec) => (AgentStatus::Exited, Some(rec.code), Some(rec.exited_at)),
-        None => (AgentStatus::Lost, None, None),
-    }
-}
-
-#[derive(Default)]
-struct Registry {
-    next_id: u64,
-    agents: BTreeMap<u64, AgentInfo>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RegistryFile {
-    next_id: u64,
-    agents: Vec<AgentInfo>,
-}
-
-impl Registry {
-    fn load() -> Result<Registry> {
-        let path = paths::registry_file();
-        let file: RegistryFile = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegistryFile { next_id: 1, agents: vec![] },
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-        let agents: BTreeMap<u64, AgentInfo> = file.agents.into_iter().map(|a| (a.id, a)).collect();
-        // Never hand out an ID twice, even if the counter was lost.
-        let next_id = file.next_id.max(agents.keys().max().map_or(1, |m| m + 1));
-        Ok(Registry { next_id, agents })
-    }
-
-    fn save(&self) -> Result<()> {
-        let path = paths::registry_file();
-        let tmp = path.with_extension("json.tmp");
-        let file = RegistryFile { next_id: self.next_id, agents: self.agents.values().cloned().collect() };
-        fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    fn name_taken(&self, name: &str) -> bool {
-        self.agents.values().any(|a| a.name == name)
+fn resolve_one(reg: &Registry, target: &str, verb: &str) -> Result<u64> {
+    let ids = naming::resolve(target, reg.agents.values())?;
+    match ids[..] {
+        [id] => Ok(id),
+        _ => bail!("{target} matches {} agents; {verb} takes one", ids.len()),
     }
 }
 

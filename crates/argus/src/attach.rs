@@ -91,7 +91,8 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
     Ok(())
 }
 
-fn call(stream: &mut UnixStream, req: &HolderRequest) -> Result<()> {
+/// One request/response exchange with a holder, before any stream frames.
+pub fn call(stream: &mut UnixStream, req: &HolderRequest) -> Result<HolderResponse> {
     frame::write_json(stream, req)?;
     let Some((t, payload)) = frame::read_frame(stream)? else { bail!("holder closed the connection") };
     if t != ty::CONTROL {
@@ -99,7 +100,7 @@ fn call(stream: &mut UnixStream, req: &HolderRequest) -> Result<()> {
     }
     match serde_json::from_slice(&payload)? {
         HolderResponse::Error { message } => bail!(message),
-        _ => Ok(()),
+        resp => Ok(resp),
     }
 }
 

@@ -1,5 +1,6 @@
-//! User-facing commands. The client is stateless: one request, one response.
+//! User-facing one-shot commands. The client is stateless.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -12,17 +13,17 @@ use argus_proto::frame::{self, ty};
 use argus_proto::msg::{AgentInfo, Request, Response, RunRequest, now_secs};
 use argus_proto::{PROTOCOL_VERSION, paths};
 
-use crate::{attach, naming};
+use crate::{attach, naming, stream};
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Conn {
+pub struct Conn {
     stream: UnixStream,
 }
 
 impl Conn {
     /// Connects to the manager, starting it first when `autostart` is set.
-    fn open(autostart: bool) -> Result<Option<Conn>> {
+    pub fn open(autostart: bool) -> Result<Option<Conn>> {
         let socket = paths::manager_socket();
         let stream = match UnixStream::connect(&socket) {
             Ok(s) => s,
@@ -42,22 +43,41 @@ impl Conn {
         }
     }
 
-    fn connect() -> Result<Conn> {
+    pub fn connect() -> Result<Conn> {
         Ok(Conn::open(true)?.expect("autostart always yields a connection"))
     }
 
-    fn request(&mut self, req: &Request) -> Result<Response> {
+    pub fn request(&mut self, req: &Request) -> Result<Response> {
         frame::write_json(&mut self.stream, req).context("sending request to manager")?;
-        let Some((t, payload)) = frame::read_frame(&mut self.stream)? else {
-            bail!("manager closed the connection");
-        };
+        self.next()?.context("manager closed the connection")
+    }
+
+    /// Reads the next message; `None` when the manager closed the connection.
+    pub fn next(&mut self) -> Result<Option<Response>> {
+        let Some((t, payload)) = frame::read_frame(&mut self.stream)? else { return Ok(None) };
         if t != ty::CONTROL {
             bail!("unexpected frame type {t:#x} from manager");
         }
         match serde_json::from_slice(&payload)? {
             Response::Error { message, .. } => bail!(message),
-            resp => Ok(resp),
+            resp => Ok(Some(resp)),
         }
+    }
+
+    pub fn list(&mut self, all: bool) -> Result<Vec<AgentInfo>> {
+        match self.request(&Request::List { all, prefix: None })? {
+            Response::Agents { agents } => Ok(agents),
+            other => bail!("unexpected reply to List: {other:?}"),
+        }
+    }
+
+    /// Resolves a target that must name exactly one agent.
+    pub fn find(&mut self, target: &str) -> Result<AgentInfo> {
+        let mut agents = self.list(true)?;
+        let ids = naming::resolve(target, agents.iter())?;
+        let [id] = ids[..] else { bail!("{target} matches {} agents", ids.len()) };
+        let idx = agents.iter().position(|a| a.id == id).expect("resolved from this list");
+        Ok(agents.swap_remove(idx))
     }
 }
 
@@ -94,33 +114,35 @@ fn wait_for_socket(socket: &PathBuf) -> Result<UnixStream> {
     }
 }
 
-pub fn run(
-    name: Option<String>,
-    group: Option<String>,
-    cwd: Option<PathBuf>,
-    attach_after: bool,
-    kind: String,
-    args: Vec<String>,
-) -> Result<()> {
-    let cwd = match cwd {
+pub struct RunOptions {
+    pub name: Option<String>,
+    pub group: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub labels: Vec<(String, String)>,
+    pub attach: bool,
+}
+
+pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
+    let cwd = match opts.cwd {
         Some(dir) => std::fs::canonicalize(&dir).with_context(|| format!("no such directory: {}", dir.display()))?,
         None => std::env::current_dir()?,
     };
-    let group = group.or_else(|| std::env::var("ARGUS_GROUP").ok()).filter(|g| !g.is_empty());
+    let group = opts.group.or_else(|| std::env::var("ARGUS_GROUP").ok()).filter(|g| !g.is_empty());
     let (rows, cols) = terminal_size();
     let mut command = vec![kind];
     command.extend(args);
     let req = RunRequest {
         command,
-        name,
+        name: opts.name,
         group,
         cwd: cwd.to_string_lossy().into_owned(),
         env: std::env::vars().collect(),
         rows,
         cols,
+        labels: opts.labels.into_iter().collect(),
     };
     match Conn::connect()?.request(&Request::Run(req))? {
-        Response::Agent { agent } if attach_after => {
+        Response::Agent { agent } if opts.attach => {
             let target = attach::Target { socket: paths::holder_socket(agent.id), name: agent.name };
             attach::attach(&target, attach::Options { readonly: false, steal: false, replay: false })
         }
@@ -132,22 +154,44 @@ pub fn run(
     }
 }
 
-pub fn ps(prefix: Option<String>, all: bool, json: bool) -> Result<()> {
-    let Response::Agents { agents } = Conn::connect()?.request(&Request::List { all, prefix })? else {
-        bail!("unexpected reply to List");
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&agents)?);
-        return Ok(());
+pub struct PsOptions {
+    pub prefix: Option<String>,
+    pub all: bool,
+    pub labels: Vec<(String, String)>,
+    pub json: bool,
+    pub watch: bool,
+}
+
+impl PsOptions {
+    pub fn keeps(&self, agent: &AgentInfo) -> bool {
+        (self.all || agent.status.is_live())
+            && self.prefix.as_deref().is_none_or(|p| naming::in_prefix(&agent.name, p))
+            && self.labels.iter().all(|(k, v)| agent.labels.get(k) == Some(v))
     }
-    print_table(&agents);
+}
+
+pub fn ps(opts: PsOptions) -> Result<()> {
+    if opts.watch {
+        return stream::ps_watch(&opts);
+    }
+    let agents: Vec<AgentInfo> = Conn::connect()?.list(true)?.into_iter().filter(|a| opts.keeps(a)).collect();
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&agents)?);
+    } else {
+        print!("{}", format_table(&agents));
+    }
     Ok(())
 }
 
-fn print_table(agents: &[AgentInfo]) {
+pub fn format_table(agents: &[AgentInfo]) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let now = now_secs();
-    let rows: Vec<[String; 7]> = agents
+    let with_labels = agents.iter().any(|a| !a.labels.is_empty());
+    let mut header = vec!["ID", "NAME", "KIND", "STATUS", "AGE", "ATTACHED", "CWD"];
+    if with_labels {
+        header.push("LABELS");
+    }
+    let rows: Vec<Vec<String>> = agents
         .iter()
         .map(|a| {
             let status = match (a.status.as_str(), a.exit_code) {
@@ -159,7 +203,7 @@ fn print_table(agents: &[AgentInfo]) {
                 _ => a.cwd.clone(),
             };
             let attached = if a.status.is_live() { a.attached.to_string() } else { "-".into() };
-            [
+            let mut row = vec![
                 a.id.to_string(),
                 a.name.clone(),
                 a.kind.clone(),
@@ -167,20 +211,27 @@ fn print_table(agents: &[AgentInfo]) {
                 age(now.saturating_sub(a.created_at)),
                 attached,
                 cwd,
-            ]
+            ];
+            if with_labels {
+                row.push(a.labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","));
+            }
+            row
         })
         .collect();
-    let header = ["ID", "NAME", "KIND", "STATUS", "AGE", "ATTACHED", "CWD"].map(String::from);
-    let mut widths = header.clone().map(|h| h.len());
+    let header: Vec<String> = header.into_iter().map(String::from).collect();
+    let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
         }
     }
+    let mut out = String::new();
     for row in std::iter::once(&header).chain(&rows) {
-        let line: Vec<String> = row.iter().zip(widths).map(|(cell, w)| format!("{cell:<w$}")).collect();
-        println!("{}", line.join("  ").trim_end());
+        let line: Vec<String> = row.iter().zip(&widths).map(|(cell, w)| format!("{cell:<w$}")).collect();
+        out.push_str(line.join("  ").trim_end());
+        out.push('\n');
     }
+    out
 }
 
 fn age(secs: u64) -> String {
@@ -195,16 +246,11 @@ fn age(secs: u64) -> String {
 pub fn attach(target: String, opts: attach::Options) -> Result<()> {
     let from_manager = match Conn::open(false)? {
         Some(mut conn) => {
-            let Response::Agents { agents } = conn.request(&Request::List { all: true, prefix: None })? else {
-                bail!("unexpected reply to List");
-            };
-            let ids = naming::resolve(&target, agents.iter())?;
-            let [id] = ids[..] else { bail!("{target} matches {} agents; attach takes one", ids.len()) };
-            let agent = agents.iter().find(|a| a.id == id).expect("resolved from this list");
+            let agent = conn.find(&target)?;
             if !agent.status.is_live() {
                 bail!("{} has {}", agent.name, agent.status.as_str());
             }
-            Some((id, agent.name.clone()))
+            Some((agent.id, agent.name))
         }
         None => None,
     };
@@ -225,6 +271,64 @@ pub fn kill(target: String, signal: Option<i32>) -> Result<()> {
 
 pub fn rm(target: String) -> Result<()> {
     Conn::connect()?.request(&Request::Remove { target })?;
+    Ok(())
+}
+
+pub fn prune(prefix: Option<String>, older_than: Option<u64>) -> Result<()> {
+    let Response::Pruned { agents } = Conn::connect()?.request(&Request::Prune { older_than, prefix })? else {
+        bail!("unexpected reply to Prune");
+    };
+    for a in &agents {
+        println!("{}\t{}", a.id, a.name);
+    }
+    eprintln!("removed {} exited agent{}", agents.len(), if agents.len() == 1 { "" } else { "s" });
+    Ok(())
+}
+
+/// Types `text` into the agent. Enter is sent as a separate write so TUIs
+/// see a keypress rather than a pasted line ending.
+pub fn send(target: String, text: String, enter: bool) -> Result<()> {
+    let mut conn = Conn::connect()?;
+    if !text.is_empty() {
+        conn.request(&Request::Send { target: target.clone(), text })?;
+    }
+    if enter {
+        std::thread::sleep(Duration::from_millis(30));
+        conn.request(&Request::Send { target, text: "\r".into() })?;
+    }
+    Ok(())
+}
+
+pub fn rename(target: String, name: String) -> Result<()> {
+    if let Response::Agent { agent } = Conn::connect()?.request(&Request::Rename { target, name })? {
+        println!("{}\t{}", agent.id, agent.name);
+    }
+    Ok(())
+}
+
+/// `argus mv <target> <group>`: keeps the last segment, changes the group.
+pub fn mv(target: String, group: String) -> Result<()> {
+    let dest = if group.ends_with('/') { group } else { format!("{group}/") };
+    rename(target, dest)
+}
+
+pub fn label(target: String, changes: Vec<String>) -> Result<()> {
+    let mut set = BTreeMap::new();
+    let mut unset = Vec::new();
+    for change in changes {
+        if let Some(key) = change.strip_suffix('-').filter(|k| !k.contains('=')) {
+            unset.push(key.to_string());
+        } else {
+            let (k, v) = naming::parse_label(&change)?;
+            set.insert(k, v);
+        }
+    }
+    if let Response::Agents { agents } = Conn::connect()?.request(&Request::Label { target, set, unset })? {
+        for a in agents {
+            let labels: Vec<String> = a.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            println!("{}\t{}\t{}", a.id, a.name, labels.join(","));
+        }
+    }
     Ok(())
 }
 
@@ -252,9 +356,7 @@ pub fn manager_status() -> Result<()> {
     let Response::Hello { pid, version } = conn.request(&Request::Hello { version: PROTOCOL_VERSION })? else {
         bail!("unexpected reply to Hello");
     };
-    let Response::Agents { agents } = conn.request(&Request::List { all: true, prefix: None })? else {
-        bail!("unexpected reply to List");
-    };
+    let agents = conn.list(true)?;
     let running = agents.iter().filter(|a| a.status.is_live()).count();
     println!("manager running (pid {pid}, protocol v{version}), {running} running / {} total agents", agents.len());
     println!("socket: {}", paths::manager_socket().display());

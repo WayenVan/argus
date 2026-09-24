@@ -27,6 +27,15 @@ impl Ring {
     pub fn contents(&self) -> Vec<u8> {
         self.buf.iter().copied().collect()
     }
+
+    /// Bytes from `offset` on, clamped to the oldest byte still held.
+    /// Returns the offset the bytes actually start at.
+    pub fn since(&self, offset: u64) -> (u64, Vec<u8>) {
+        let oldest = self.end - self.buf.len() as u64;
+        let start = offset.clamp(oldest, self.end);
+        let skip = (start - oldest) as usize;
+        (start, self.buf.range(skip..).copied().collect())
+    }
 }
 
 #[cfg(test)]
@@ -42,5 +51,9 @@ mod tests {
         let contents = ring.contents();
         assert_eq!(contents.len(), RING_MAX);
         assert!(contents.ends_with(b"axyz"));
+
+        assert_eq!(ring.since(ring.end - 2), (ring.end - 2, b"yz".to_vec()));
+        assert_eq!(ring.since(0).0, 3); // oldest byte still held
+        assert_eq!(ring.since(u64::MAX), (ring.end, vec![]));
     }
 }

@@ -98,6 +98,25 @@ pub fn resolve<'a>(target: &str, agents: impl Iterator<Item = &'a AgentInfo> + C
     }
 }
 
+/// Label keys follow the name alphabet (plus `/` for namespacing, e.g.
+/// `team/owner`); values are free text on one line.
+pub fn validate_label(key: &str, value: &str) -> Result<()> {
+    if key.is_empty() || !key.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-' | '/')) {
+        bail!("invalid label key {key:?} (use a-z 0-9 . _ - /)");
+    }
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        bail!("invalid value for label {key}: must be one non-empty line");
+    }
+    Ok(())
+}
+
+/// Parses `k=v` into a pair; used for `-l` flags.
+pub fn parse_label(arg: &str) -> Result<(String, String)> {
+    let Some((k, v)) = arg.split_once('=') else { bail!("expected key=value, got {arg:?}") };
+    validate_label(k, v)?;
+    Ok((k.to_string(), v.to_string()))
+}
+
 pub fn in_prefix(name: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches("/**").trim_end_matches('/');
     name == prefix || name.starts_with(&format!("{prefix}/"))
@@ -123,6 +142,7 @@ mod tests {
             exit_code: None,
             activity: "unknown".into(),
             attached: 0,
+            labels: Default::default(),
         }
     }
 
