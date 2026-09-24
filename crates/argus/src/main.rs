@@ -73,6 +73,15 @@ enum Command {
         #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
         label: Vec<(String, String)>,
     },
+    /// Full-screen dashboard: a group-path tree with a live detail pane for
+    /// the selected agent (same app as `argus grid`, opened on the tree mode)
+    Tree {
+        /// Only agents whose name starts with this group prefix
+        prefix: Option<String>,
+        /// Only agents with this label (repeatable; all must match)
+        #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
+        label: Vec<(String, String)>,
+    },
     /// Print an agent's recent output
     Logs {
         target: String,
@@ -219,7 +228,8 @@ fn main() -> ExitCode {
         Command::Ps { prefix, all, label, watch, json } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
         }
-        Command::Grid { prefix, label } => tui::run(prefix, label),
+        Command::Grid { prefix, label } => tui::run(tui::Mode::Grid, prefix, label),
+        Command::Tree { prefix, label } => tui::run(tui::Mode::Tree, prefix, label),
         Command::Logs { target, bytes, follow, raw, screen } => stream::logs(target, bytes, follow, raw, screen),
         Command::Send { target, text, no_enter } => client::send(target, text, !no_enter),
         Command::Rename { target, name } => client::rename(target, name),
