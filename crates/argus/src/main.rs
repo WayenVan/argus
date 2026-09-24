@@ -8,7 +8,7 @@ mod client;
 mod manager;
 mod naming;
 mod stream;
-mod view;
+mod tui;
 
 use std::process::ExitCode;
 
@@ -66,7 +66,7 @@ enum Command {
         json: bool,
     },
     /// Full-screen dashboard: a live thumbnail grid of every agent's screen
-    View {
+    Grid {
         /// Only agents whose name starts with this group prefix
         prefix: Option<String>,
         /// Only agents with this label (repeatable; all must match)
@@ -219,7 +219,7 @@ fn main() -> ExitCode {
         Command::Ps { prefix, all, label, watch, json } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
         }
-        Command::View { prefix, label } => view::run(prefix, label),
+        Command::Grid { prefix, label } => tui::run(prefix, label),
         Command::Logs { target, bytes, follow, raw, screen } => stream::logs(target, bytes, follow, raw, screen),
         Command::Send { target, text, no_enter } => client::send(target, text, !no_enter),
         Command::Rename { target, name } => client::rename(target, name),

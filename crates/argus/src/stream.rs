@@ -149,11 +149,11 @@ fn write_log_bytes(
 // Watch plumbing
 // ---------------------------------------------------------------------------
 
-type Messages = Receiver<Result<Option<Response>>>;
+pub(crate) type Messages = Receiver<Result<Option<Response>>>;
 
 /// Starts a watch and moves the connection to a reader thread, so callers
 /// can wait for messages with a timeout without breaking frame boundaries.
-fn start_watch(ids: Option<Vec<u64>>, include_exited: bool) -> Result<(Vec<AgentInfo>, Messages)> {
+pub(crate) fn start_watch(ids: Option<Vec<u64>>, include_exited: bool) -> Result<(Vec<AgentInfo>, Messages)> {
     let mut conn = Conn::connect()?;
     let Response::Snapshot { agents, .. } = conn.request(&Request::Watch { ids, include_exited })? else {
         bail!("manager did not start the watch");
@@ -172,7 +172,7 @@ fn start_watch(ids: Option<Vec<u64>>, include_exited: bool) -> Result<(Vec<Agent
 }
 
 /// Applies one watch message to a local copy of the agent table.
-fn apply(table: &mut BTreeMap<u64, AgentInfo>, msg: &Response) {
+pub(crate) fn apply(table: &mut BTreeMap<u64, AgentInfo>, msg: &Response) {
     match msg {
         Response::Snapshot { agents, .. } => {
             *table = agents.iter().map(|a| (a.id, a.clone())).collect();

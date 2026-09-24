@@ -1,11 +1,15 @@
-//! `argus view`: a full-screen live thumbnail grid of every agent's screen.
+//! `argus tui`: full-screen agent dashboards. `argus grid` is its first mode
+//! — a live thumbnail grid of every agent's screen.
 //!
 //! One process takes over the whole terminal (like `htop`), the same as
 //! `attach` does — nothing here nests a terminal inside another; it paints
 //! standard widgets into whichever real terminal (or tmux pane) is running
-//! it. Agent data is polled rather than pushed: a list refresh plus one
-//! `ScreenPreview` request per visible tile, every tick.
+//! it. The agent list is pushed by `Watch`, applied as it arrives; only the
+//! screen previews are still a pull, one `ScreenPreview` request per visible
+//! tile on its own tick, since `Watch` deliberately never carries output.
 
+use std::collections::BTreeMap;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,8 +23,15 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::attach;
 use crate::client::{Conn, PsOptions};
+use crate::stream;
 
-const TICK: Duration = Duration::from_millis(500);
+/// How often visible tiles get a fresh `ScreenPreview`. Unlike the agent
+/// list (pushed by Watch, applied as it arrives), preview bytes are always a
+/// pull — Watch deliberately never carries output.
+const PREVIEW_TICK: Duration = Duration::from_millis(500);
+/// Upper bound on how long one loop iteration blocks on keyboard input, so a
+/// pending watch event never waits behind a slow poll to be drawn.
+const INPUT_POLL: Duration = Duration::from_millis(100);
 
 pub fn run(prefix: Option<String>, labels: Vec<(String, String)>) -> Result<()> {
     let opts = PsOptions { prefix, all: false, labels, json: false, watch: false };
@@ -43,18 +54,38 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, conn: &mut Conn, opts: &P
     let mut selected = 0usize;
     let mut tiles: Vec<Tile> = Vec::new();
     // Due immediately, so the first frame is not empty.
-    let mut last_tick = Instant::now() - TICK;
+    let mut last_tick = Instant::now() - PREVIEW_TICK;
+
+    let (agents, mut rx) = stream::start_watch(None, opts.all)?;
+    let mut table: BTreeMap<u64, AgentInfo> = agents.into_iter().map(|a| (a.id, a)).collect();
 
     loop {
-        if last_tick.elapsed() >= TICK {
+        // Non-blocking: apply whatever the watch thread has queued up since
+        // the last frame. A disconnected or ended watch means the manager
+        // went away (restart or upgrade); reconnect and keep going.
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(Some(msg))) => stream::apply(&mut table, &msg),
+                Ok(Ok(None)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let (agents, new_rx) = stream::start_watch(None, opts.all)?;
+                    table = agents.into_iter().map(|a| (a.id, a)).collect();
+                    rx = new_rx;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+
+        if last_tick.elapsed() >= PREVIEW_TICK {
             let area = terminal.size()?;
-            tiles = refresh(conn, opts, area.into()).unwrap_or_default();
+            tiles = refresh(conn, &table, opts, area.into()).unwrap_or_default();
             selected = selected.min(tiles.len().saturating_sub(1));
             last_tick = Instant::now();
         }
         terminal.draw(|frame| draw(frame, &tiles, selected))?;
 
-        let timeout = TICK.saturating_sub(last_tick.elapsed());
+        let timeout = INPUT_POLL.min(PREVIEW_TICK.saturating_sub(last_tick.elapsed()));
         if !event::poll(timeout)? {
             continue;
         }
@@ -88,7 +119,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, conn: &mut Conn, opts: &P
                         attach::Options { readonly: false, steal: false, replay: false, allow_clipboard_replay: false };
                     let _ = attach::attach(&target, opts);
                     *terminal = ratatui::init();
-                    last_tick = Instant::now() - TICK; // Refresh right away.
+                    last_tick = Instant::now() - PREVIEW_TICK; // Refresh right away.
                 }
             }
             _ => {}
@@ -96,10 +127,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, conn: &mut Conn, opts: &P
     }
 }
 
-/// One list request plus one `ScreenPreview` per visible tile, sized to
-/// whatever the grid layout works out to for the current terminal size.
-fn refresh(conn: &mut Conn, opts: &PsOptions, area: Rect) -> Result<Vec<Tile>> {
-    let agents: Vec<AgentInfo> = conn.list(true)?.into_iter().filter(|a| opts.keeps(a)).collect();
+/// One `ScreenPreview` per visible tile, sized to whatever the grid layout
+/// works out to for the current terminal size. The agent list itself comes
+/// from the watch table, not this connection: `ScreenPreview` is always a
+/// pull, since Watch deliberately never carries output bytes.
+fn refresh(conn: &mut Conn, table: &BTreeMap<u64, AgentInfo>, opts: &PsOptions, area: Rect) -> Result<Vec<Tile>> {
+    let agents: Vec<AgentInfo> = table.values().filter(|a| opts.keeps(a)).cloned().collect();
     if agents.is_empty() {
         return Ok(vec![]);
     }
@@ -127,7 +160,7 @@ fn refresh(conn: &mut Conn, opts: &PsOptions, area: Rect) -> Result<Vec<Tile>> {
 fn draw(frame: &mut Frame, tiles: &[Tile], selected: usize) {
     let area = frame.area();
     if tiles.is_empty() {
-        let block = Block::default().borders(Borders::ALL).title(" argus view — no running agents ");
+        let block = Block::default().borders(Borders::ALL).title(" argus grid — no running agents ");
         frame.render_widget(Paragraph::new("").block(block), area);
         return;
     }

@@ -275,7 +275,7 @@ pub enum Response {
     },
 }
 
-/// One styled terminal row used by `argus view` thumbnails.
+/// One styled terminal row used by `argus grid` thumbnails.
 pub type PreviewLine = Vec<PreviewSpan>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
