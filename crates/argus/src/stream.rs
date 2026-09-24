@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
-use argus_proto::msg::{AgentEvent, AgentInfo, HolderRequest, HolderResponse, Request, Response, SubscribeLevel};
-use argus_proto::{PROTOCOL_VERSION, paths};
+use argus_proto::msg::{
+    AgentEvent, AgentInfo, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request, Response, SubscribeLevel,
+};
+use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 
 use crate::attach;
 use crate::client::{self, Conn, PsOptions};
@@ -20,23 +22,28 @@ use crate::client::{self, Conn, PsOptions};
 
 /// Prints recent output. Running agents are read from their holder (at most
 /// the 1 MiB ring buffer); exited agents from the `output.log` it left.
-pub fn logs(target: String, bytes: Option<u64>, follow: bool) -> Result<()> {
+pub fn logs(target: String, bytes: Option<u64>, follow: bool, raw: bool) -> Result<()> {
     let agent = Conn::connect()?.find(&target)?;
     // A connect failure means it exited just now; its log is on disk.
     if agent.status.is_live()
         && let Ok(stream) = UnixStream::connect(paths::holder_socket(agent.id))
     {
-        return logs_live(stream, &agent, bytes, follow);
+        return logs_live(stream, &agent, bytes, follow, raw);
     }
     let path = paths::output_log(&paths::agent_dir(agent.id));
     let data = std::fs::read(&path).with_context(|| format!("no output recorded for {}", agent.name))?;
     let start = bytes.map_or(0, |n| data.len().saturating_sub(n as usize));
-    io::stdout().write_all(&data[start..])?;
+    let output = if raw { data[start..].to_vec() } else { argus_proto::ansi::strip_osc52(&data[start..]) };
+    io::stdout().write_all(&output)?;
     Ok(())
 }
 
-fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, follow: bool) -> Result<()> {
-    attach::call(&mut stream, &HolderRequest::Hello { version: PROTOCOL_VERSION })?;
+fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, follow: bool, raw: bool) -> Result<()> {
+    let hello = attach::call(
+        &mut stream,
+        &HolderRequest::Hello { version: HOLDER_PROTOCOL_VERSION, capabilities: HOLDER_CAPABILITIES.to_vec() },
+    )?;
+    attach::validate_holder_hello(hello)?;
     let HolderResponse::Info(info) = attach::call(&mut stream, &HolderRequest::Info)? else {
         bail!("unexpected reply to Info");
     };
@@ -49,19 +56,20 @@ fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, foll
     attach::call(&mut stream, &subscribe)?;
 
     let mut out = io::stdout().lock();
+    let mut clipboard_filter = (!raw).then(argus_proto::ansi::Osc52Filter::default);
     while let Some((t, payload)) = frame::read_frame(&mut stream)? {
         match t {
             ty::DATA if payload.len() >= 8 => {
                 let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
                 let data = &payload[8..];
                 if follow {
-                    out.write_all(data)?;
+                    write_log_bytes(&mut out, &mut clipboard_filter, data)?;
                     out.flush()?;
                     continue;
                 }
                 // Without --follow, stop at the end offset seen when we started.
                 let keep = end.saturating_sub(offset).min(data.len() as u64) as usize;
-                out.write_all(&data[..keep])?;
+                write_log_bytes(&mut out, &mut clipboard_filter, &data[..keep])?;
                 if offset + data.len() as u64 >= end {
                     break;
                 }
@@ -76,8 +84,27 @@ fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, foll
             _ => {}
         }
     }
+    if let Some(filter) = &mut clipboard_filter {
+        let mut tail = Vec::new();
+        filter.finish(&mut tail);
+        out.write_all(&tail)?;
+    }
     out.flush()?;
     Ok(())
+}
+
+fn write_log_bytes(
+    out: &mut impl Write,
+    filter: &mut Option<argus_proto::ansi::Osc52Filter>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if let Some(filter) = filter {
+        let mut safe = Vec::with_capacity(bytes.len());
+        filter.write_filtered(bytes, &mut safe);
+        out.write_all(&safe)
+    } else {
+        out.write_all(bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------

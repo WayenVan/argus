@@ -1,15 +1,16 @@
 //! Starting the agent on a fresh PTY.
 
 use std::ffi::{CString, c_char};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::msg::HolderSpec;
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{Winsize, openpty};
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, Pid, fork};
+use nix::unistd::{ForkResult, Pid, fork, pipe, read};
 
 pub struct Spawned {
     pub master: OwnedFd,
@@ -165,41 +166,30 @@ fn null_terminated(strings: &[CString]) -> Vec<*const c_char> {
 }
 
 pub fn set_cloexec(fd: RawFd) {
-    // SAFETY: fcntl on an fd we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
 }
 
 pub fn set_nonblocking(fd: RawFd) {
-    // SAFETY: fcntl on an fd we own.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    if let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) {
+        let _ = fcntl(fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK));
     }
 }
 
 pub fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: fds is a valid 2-element buffer.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("pipe");
-    }
-    set_cloexec(fds[0]);
-    set_cloexec(fds[1]);
-    // SAFETY: pipe just returned these fds and nothing else owns them.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    let (read, write) = pipe().context("pipe")?;
+    set_cloexec(read.as_raw_fd());
+    set_cloexec(write.as_raw_fd());
+    Ok((read, write))
 }
 
 fn read_full(fd: RawFd, buf: &mut [u8]) -> usize {
     let mut filled = 0;
     while filled < buf.len() {
-        // SAFETY: reading into the unfilled tail of buf.
-        let n = unsafe { libc::read(fd, buf[filled..].as_mut_ptr().cast(), buf.len() - filled) };
-        if n > 0 {
-            filled += n as usize;
-        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        } else {
-            break;
+        match read(fd, &mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break,
         }
     }
     filled

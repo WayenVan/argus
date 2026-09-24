@@ -11,8 +11,9 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use argus_proto::PROTOCOL_VERSION;
+use argus_proto::MANAGER_PROTOCOL_VERSION;
 use argus_proto::frame;
+use argus_proto::msg::MANAGER_CAPABILITIES;
 use argus_proto::msg::Request;
 
 fn main() {
@@ -31,7 +32,11 @@ fn main() {
     let _ = stream.set_write_timeout(Some(TIMEOUT));
     let _ = stream.set_read_timeout(Some(TIMEOUT));
     // Wait for the Hello reply so the manager is reading before we hang up.
-    if frame::write_json(&mut stream, &Request::Hello { version: PROTOCOL_VERSION }).is_err()
+    if frame::write_json(
+        &mut stream,
+        &Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: MANAGER_CAPABILITIES.to_vec() },
+    )
+    .is_err()
         || !matches!(frame::read_frame(&mut stream), Ok(Some(_)))
     {
         return;

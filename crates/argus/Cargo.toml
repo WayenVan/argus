@@ -10,8 +10,10 @@ argus-proto = { workspace = true, features = ["tokio"] }
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 tokio.workspace = true
 vt100 = "0.16"
 ratatui = "0.30.2"

@@ -12,7 +12,6 @@ mod screen;
 mod watch;
 
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,8 +19,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{aio, ty};
-use argus_proto::msg::{AgentInfo, AgentStatus, HolderEvent, Request, Response, RunRequest, now_secs};
-use argus_proto::{PROTOCOL_VERSION, paths};
+use argus_proto::msg::{
+    AgentInfo, AgentStatus, HolderEvent, MANAGER_CAPABILITIES, Request, Response, RunRequest, now_secs,
+};
+use argus_proto::{MANAGER_PROTOCOL_VERSION, paths};
+use nix::fcntl::{Flock, FlockArg};
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
@@ -159,11 +162,15 @@ async fn handle_conn(manager: Arc<Manager>, stream: UnixStream) -> Result<()> {
 impl Manager {
     async fn dispatch(self: &Arc<Self>, req: Request) -> Result<Response> {
         match req {
-            Request::Hello { version } => {
-                if version != PROTOCOL_VERSION {
-                    log(&format!("client speaks protocol v{version}, manager v{PROTOCOL_VERSION}"));
+            Request::Hello { version, .. } => {
+                if version != MANAGER_PROTOCOL_VERSION {
+                    log(&format!("client speaks protocol v{version}, manager v{MANAGER_PROTOCOL_VERSION}"));
                 }
-                Ok(Response::Hello { version: PROTOCOL_VERSION, pid: std::process::id() })
+                Ok(Response::Hello {
+                    version: MANAGER_PROTOCOL_VERSION,
+                    pid: std::process::id(),
+                    capabilities: MANAGER_CAPABILITIES.to_vec(),
+                })
             }
             Request::Run(req) => {
                 let (agent, warnings) = self.spawn_agent(req).await?;
@@ -511,30 +518,20 @@ fn resolve_one(reg: &Registry, target: &str, verb: &str) -> Result<u64> {
     }
 }
 
-fn acquire_lock() -> Result<File> {
+fn acquire_lock() -> Result<Flock<File>> {
     let path = paths::manager_lock();
     let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-    // SAFETY: flock on an fd owned by `file`, which the caller keeps alive.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another manager is already running ({})", path.display());
-    }
-    Ok(file)
+    Flock::lock(file, FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, _)| anyhow::anyhow!("another manager is already running ({})", path.display()))
 }
 
 /// macOS starts processes with a soft limit of 256 open files, which a few
 /// hundred holder connections would exhaust.
 fn raise_fd_limit() {
-    // SAFETY: getrlimit/setrlimit on a local struct.
-    unsafe {
-        let mut lim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
-            return;
-        }
-        let target = if cfg!(target_os = "macos") { lim.rlim_max.min(10240) } else { lim.rlim_max };
-        if lim.rlim_cur < target {
-            lim.rlim_cur = target;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-        }
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else { return };
+    let target = if cfg!(target_os = "macos") { hard.min(10240) } else { hard };
+    if soft < target {
+        let _ = setrlimit(Resource::RLIMIT_NOFILE, target, hard);
     }
 }
 

@@ -5,15 +5,22 @@
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
-use argus_proto::msg::{AttachRequest, HolderRequest, HolderResponse, Request, Response, ScreenMode};
-use argus_proto::{PROTOCOL_VERSION, paths};
+use argus_proto::msg::{
+    AttachRequest, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request, Response, ScreenMode,
+};
+use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
+use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+use nix::unistd::isatty;
+use signal_hook::SigId;
+use signal_hook::consts::SIGWINCH;
 
 use crate::client::Conn;
 
@@ -39,6 +46,7 @@ pub struct Options {
     pub readonly: bool,
     pub steal: bool,
     pub replay: bool,
+    pub allow_clipboard_replay: bool,
 }
 
 pub struct Target {
@@ -56,20 +64,8 @@ enum Ending {
     Lost,
 }
 
-static WINCH_PIPE: AtomicI32 = AtomicI32::new(-1);
-
-extern "C" fn on_winch(_: libc::c_int) {
-    let fd = WINCH_PIPE.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let byte = 1u8;
-        // SAFETY: write is async-signal-safe.
-        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
-    }
-}
-
 pub fn attach(target: &Target, opts: Options) -> Result<()> {
-    // SAFETY: isatty has no preconditions.
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+    if !isatty(io::stdin().as_raw_fd())? {
         bail!("attach needs a terminal on stdin");
     }
     let (rows, cols) = crate::client::terminal_size();
@@ -77,12 +73,15 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
 
     let mut stream = UnixStream::connect(&target.socket)
         .with_context(|| format!("{} is not reachable (has it exited?)", target.name))?;
-    call(&mut stream, &HolderRequest::Hello { version: PROTOCOL_VERSION })?;
+    let hello = call(
+        &mut stream,
+        &HolderRequest::Hello { version: HOLDER_PROTOCOL_VERSION, capabilities: HOLDER_CAPABILITIES.to_vec() },
+    )?;
+    validate_holder_hello(hello)?;
     // A Snapshot or Replay reply gives an offset to pick up from; the
     // manager already fed the bytes before that offset into it (Snapshot)
     // or they are being drawn locally from the ring buffer (Replay).
-    let from_offset =
-        restore.as_ref().filter(|r| !matches!(r.mode, ScreenMode::Unavailable)).map(|r| r.offset);
+    let from_offset = restore.as_ref().filter(|r| !matches!(r.mode, ScreenMode::Unavailable)).map(|r| r.offset);
     call(
         &mut stream,
         &HolderRequest::Attach(AttachRequest {
@@ -91,6 +90,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
             readonly: opts.readonly,
             steal: opts.steal,
             replay: opts.replay,
+            allow_clipboard_replay: opts.allow_clipboard_replay,
             from_offset,
         }),
     )?;
@@ -102,9 +102,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
             // Only worth drawing if it is a real redraw of the size we are
             // about to show it at; otherwise the holder will resize the PTY
             // for real and the agent redraws itself for the new dimensions.
-            Some(r) if r.mode == ScreenMode::Snapshot && (r.rows, r.cols) == (rows, cols) => {
-                print_raw_bytes(&r.bytes)
-            }
+            Some(r) if r.mode == ScreenMode::Snapshot && (r.rows, r.cols) == (rows, cols) => print_raw_bytes(&r.bytes),
             _ => print_raw(CLEAR),
         }
         let ending = pump(stream, opts.readonly);
@@ -153,6 +151,16 @@ pub fn call(stream: &mut UnixStream, req: &HolderRequest) -> Result<HolderRespon
     }
 }
 
+pub fn validate_holder_hello(response: HolderResponse) -> Result<()> {
+    match response {
+        HolderResponse::Hello { version, .. } if version == HOLDER_PROTOCOL_VERSION => Ok(()),
+        HolderResponse::Hello { version, .. } => {
+            bail!("holder speaks protocol v{version}, this argus speaks v{HOLDER_PROTOCOL_VERSION}")
+        }
+        other => bail!("unexpected holder handshake reply: {other:?}"),
+    }
+}
+
 fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let detached = Arc::new(AtomicBool::new(false));
@@ -166,10 +174,11 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
         let detached = detached.clone();
         std::thread::spawn(move || forward_input(writer, detached, readonly));
     }
-    // Window size changes → holder.
+    // Window size changes → holder. Keep the registration in this function's
+    // scope: dropping it unregisters SIGWINCH and closes the pipe writer.
+    let (winch, _winch_registration) = winch_pipe()?;
     {
         let writer = writer.clone();
-        let winch = install_winch()?;
         std::thread::spawn(move || forward_resizes(winch, writer));
     }
 
@@ -314,7 +323,7 @@ fn only_mouse_reports(mut data: &[u8]) -> bool {
     true
 }
 
-fn forward_resizes(winch: std::fs::File, writer: Arc<Mutex<UnixStream>>) {
+fn forward_resizes(winch: UnixStream, writer: Arc<Mutex<UnixStream>>) {
     let mut winch = winch;
     let mut buf = [0u8; 64];
     while matches!(winch.read(&mut buf), Ok(n) if n > 0) {
@@ -328,52 +337,43 @@ fn forward_resizes(winch: std::fs::File, writer: Arc<Mutex<UnixStream>>) {
     }
 }
 
-/// Returns the read end of a pipe that receives a byte on every SIGWINCH.
-fn install_winch() -> Result<std::fs::File> {
-    use std::os::fd::FromRawFd;
-    let mut fds = [0; 2];
-    // SAFETY: fds is a valid 2-element buffer; the handler only calls write.
-    unsafe {
-        if libc::pipe(fds.as_mut_ptr()) < 0 {
-            return Err(io::Error::last_os_error()).context("pipe");
-        }
-        WINCH_PIPE.store(fds[1], Ordering::Relaxed);
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_winch as extern "C" fn(libc::c_int) as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
-        Ok(std::fs::File::from_raw_fd(fds[0]))
+/// A self-pipe registered with signal-hook. Dropping it unregisters the
+/// handler and closes the writer, waking the reader thread cleanly.
+struct SignalRegistration {
+    registration: SigId,
+}
+
+fn winch_pipe() -> Result<(UnixStream, SignalRegistration)> {
+    let (reader, writer) = UnixStream::pair()?;
+    let registration = signal_hook::low_level::pipe::register(SIGWINCH, writer)?;
+    Ok((reader, SignalRegistration { registration }))
+}
+
+impl Drop for SignalRegistration {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.registration);
     }
 }
 
 /// Puts the terminal in raw mode and restores it on drop, including on panic.
 struct RawMode {
-    saved: libc::termios,
+    saved: Termios,
 }
 
 impl RawMode {
     fn enter() -> Result<RawMode> {
-        // SAFETY: tcgetattr/tcsetattr on stdin with a local termios.
-        unsafe {
-            let mut saved: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut saved) != 0 {
-                return Err(io::Error::last_os_error()).context("reading terminal settings");
-            }
-            let mut raw = saved;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
-                return Err(io::Error::last_os_error()).context("entering raw mode");
-            }
-            Ok(RawMode { saved })
-        }
+        let stdin = io::stdin();
+        let saved = tcgetattr(stdin.as_fd()).context("reading terminal settings")?;
+        let mut raw = saved.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw).context("entering raw mode")?;
+        Ok(RawMode { saved })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        // SAFETY: restoring the settings captured in `enter`.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
+        let _ = tcsetattr(io::stdin().as_fd(), SetArg::TCSANOW, &self.saved);
     }
 }
 
@@ -417,7 +417,10 @@ pub fn resolve(target: &str, from_manager: Option<(u64, String)>) -> Result<Targ
 
 #[cfg(test)]
 mod tests {
-    use super::{find_detach, only_mouse_reports};
+    use std::io::Read;
+    use std::time::Duration;
+
+    use super::{find_detach, only_mouse_reports, winch_pipe};
 
     #[test]
     fn detach_key_in_every_encoding() {
@@ -442,5 +445,16 @@ mod tests {
         assert!(!only_mouse_reports(b"\x1b[A"), "arrow keys are input");
         assert!(!only_mouse_reports(b"\x1b"), "a lone Esc is input");
         assert!(!only_mouse_reports(b""));
+    }
+
+    #[test]
+    fn winch_registration_stays_live_until_its_guard_drops() {
+        let (mut reader, registration) = winch_pipe().unwrap();
+        reader.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
+
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        drop(registration);
     }
 }

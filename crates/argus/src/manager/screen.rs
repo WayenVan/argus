@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use argus_proto::msg::{HolderEvent, ScreenMode};
+use argus_proto::msg::{HolderEvent, PreviewColor, PreviewLine, PreviewSpan, ScreenMode};
 
 use super::holder;
 
@@ -95,16 +95,194 @@ impl Screens {
         // alternate-screen switch itself is not part of it.
         let mut bytes = b"\x1b[?1049h".to_vec();
         bytes.extend(screen.state_formatted());
+        // vt100 represents blank styled cells with ECH/EL. Some nested
+        // terminals (notably editor terminals) erase with their default
+        // background instead of the active SGR background. Paint those cells
+        // again as literal spaces so input boxes and other filled regions
+        // survive a synthetic attach restore everywhere.
+        append_styled_blanks(screen, &mut bytes);
+        bytes.extend(screen.cursor_state_formatted());
+        bytes.extend(screen.attributes_formatted());
         ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes }
     }
 
-    /// A plain-text crop of `id`'s screen to `rows`x`cols`, left-aligned from
-    /// its top-left corner. Empty when nothing is tracked for it yet.
-    pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<String> {
+    /// A styled crop of `id`'s screen to `rows`x`cols`, left-aligned from its
+    /// top-left corner. Empty when nothing is tracked for it yet.
+    pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<PreviewLine> {
         let states = self.states.lock().unwrap();
         let Some(state) = states.get(&id) else { return vec![] };
-        state.parser.screen().rows(0, cols).take(rows as usize).collect()
+        let screen = state.parser.screen();
+        let (screen_rows, screen_cols) = screen.size();
+        let rows = rows.min(screen_rows);
+        let cols = cols.min(screen_cols);
+        (0..rows)
+            .map(|row| {
+                let mut spans: PreviewLine = Vec::new();
+                for col in 0..cols {
+                    let Some(cell) = screen.cell(row, col) else { continue };
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    let text = if cell.has_contents() { cell.contents() } else { " " };
+                    let span = PreviewSpan {
+                        text: text.to_owned(),
+                        fg: preview_color(cell.fgcolor()),
+                        bg: preview_color(cell.bgcolor()),
+                        bold: cell.bold(),
+                        dim: cell.dim(),
+                        italic: cell.italic(),
+                        underline: cell.underline(),
+                        inverse: cell.inverse(),
+                    };
+                    if let Some(last) = spans.last_mut().filter(|last| same_style(last, &span)) {
+                        last.text.push_str(text);
+                    } else {
+                        spans.push(span);
+                    }
+                }
+                while spans.last().is_some_and(|span| span.text.chars().all(|c| c == ' ') && is_default(span)) {
+                    spans.pop();
+                }
+                spans
+            })
+            .collect()
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CellStyle {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl CellStyle {
+    fn from_cell(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    fn is_default(self) -> bool {
+        self.fg == vt100::Color::Default
+            && self.bg == vt100::Color::Default
+            && !self.bold
+            && !self.dim
+            && !self.italic
+            && !self.underline
+            && !self.inverse
+    }
+}
+
+fn append_styled_blanks(screen: &vt100::Screen, bytes: &mut Vec<u8>) {
+    let (rows, cols) = screen.size();
+    for row in 0..rows {
+        let mut col = 0;
+        while col < cols {
+            let Some(cell) = screen.cell(row, col) else { break };
+            let style = CellStyle::from_cell(cell);
+            if cell.has_contents() || cell.is_wide_continuation() || style.is_default() {
+                col += 1;
+                continue;
+            }
+
+            let start = col;
+            col += 1;
+            while col < cols {
+                let Some(next) = screen.cell(row, col) else { break };
+                if next.has_contents() || next.is_wide_continuation() || CellStyle::from_cell(next) != style {
+                    break;
+                }
+                col += 1;
+            }
+
+            bytes.extend(format!("\x1b[{};{}H", row + 1, start + 1).as_bytes());
+            append_sgr(style, bytes);
+            bytes.extend(std::iter::repeat_n(b' ', usize::from(col - start)));
+        }
+    }
+}
+
+fn append_sgr(style: CellStyle, bytes: &mut Vec<u8>) {
+    let mut params = vec![0];
+    if style.bold {
+        params.push(1);
+    }
+    if style.dim {
+        params.push(2);
+    }
+    if style.italic {
+        params.push(3);
+    }
+    if style.underline {
+        params.push(4);
+    }
+    if style.inverse {
+        params.push(7);
+    }
+    append_color_params(style.fg, false, &mut params);
+    append_color_params(style.bg, true, &mut params);
+    bytes.extend(b"\x1b[");
+    for (i, param) in params.iter().enumerate() {
+        if i != 0 {
+            bytes.push(b';');
+        }
+        bytes.extend(param.to_string().as_bytes());
+    }
+    bytes.push(b'm');
+}
+
+fn append_color_params(color: vt100::Color, background: bool, params: &mut Vec<u16>) {
+    let base = if background { 40 } else { 30 };
+    let bright = if background { 100 } else { 90 };
+    let extended = if background { 48 } else { 38 };
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(index @ 0..=7) => params.push(base + u16::from(index)),
+        vt100::Color::Idx(index @ 8..=15) => params.push(bright + u16::from(index - 8)),
+        vt100::Color::Idx(index) => params.extend([extended, 5, u16::from(index)]),
+        vt100::Color::Rgb(r, g, b) => {
+            params.extend([extended, 2, u16::from(r), u16::from(g), u16::from(b)]);
+        }
+    }
+}
+
+fn preview_color(color: vt100::Color) -> PreviewColor {
+    match color {
+        vt100::Color::Default => PreviewColor::Default,
+        vt100::Color::Idx(index) => PreviewColor::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => PreviewColor::Rgb([r, g, b]),
+    }
+}
+
+fn same_style(a: &PreviewSpan, b: &PreviewSpan) -> bool {
+    a.fg == b.fg
+        && a.bg == b.bg
+        && a.bold == b.bold
+        && a.dim == b.dim
+        && a.italic == b.italic
+        && a.underline == b.underline
+        && a.inverse == b.inverse
+}
+
+fn is_default(span: &PreviewSpan) -> bool {
+    span.fg == PreviewColor::Default
+        && span.bg == PreviewColor::Default
+        && !span.bold
+        && !span.dim
+        && !span.italic
+        && !span.underline
+        && !span.inverse
 }
 
 #[cfg(test)]
@@ -157,6 +335,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_writes_styled_blanks_as_literal_spaces() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 3, cols: 12 });
+        let input = b"\x1b[?1049h\x1b[2;3H\x1b[48;2;10;20;30m\x1b[5X";
+        s.on_data(1, 0, input);
+
+        let r = s.get(1, None);
+        assert!(r.bytes.windows(5).any(|window| window == b"     "));
+
+        let mut restored = vt100::Parser::new(3, 12, 0);
+        restored.process(&r.bytes);
+        for col in 2..7 {
+            assert_eq!(restored.screen().cell(1, col).unwrap().bgcolor(), vt100::Color::Rgb(10, 20, 30));
+        }
+        assert_eq!(restored.screen().cursor_position(), (1, 2));
+        assert_eq!(restored.screen().bgcolor(), vt100::Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
     fn since_offset_dedupes_an_unchanged_snapshot() {
         let s = screens();
         s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
@@ -186,5 +383,19 @@ mod tests {
         // Agent 2 has never been heard from.
         assert_eq!(s.get(2, None).mode, ScreenMode::Unavailable);
         assert_eq!(s.get(1, None).mode, ScreenMode::Snapshot);
+    }
+
+    #[test]
+    fn preview_preserves_terminal_styles() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 2, cols: 20 });
+        s.on_data(1, 0, b"plain \x1b[1;38;2;10;20;30mbright\x1b[0m");
+
+        let lines = s.preview(1, 1, 20);
+        assert_eq!(lines[0][0].text, "plain ");
+        assert_eq!(lines[0][0].fg, PreviewColor::Default);
+        assert_eq!(lines[0][1].text, "bright");
+        assert_eq!(lines[0][1].fg, PreviewColor::Rgb([10, 20, 30]));
+        assert!(lines[0][1].bold);
     }
 }

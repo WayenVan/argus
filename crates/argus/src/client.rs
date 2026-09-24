@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -10,8 +11,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
-use argus_proto::msg::{AgentInfo, Request, Response, RunRequest, now_secs};
-use argus_proto::{PROTOCOL_VERSION, paths};
+use argus_proto::msg::{AgentInfo, Capability, MANAGER_CAPABILITIES, Request, Response, RunRequest, now_secs};
+use argus_proto::{MANAGER_PROTOCOL_VERSION, paths};
+use nix::sys::signal::kill as signal_process;
+use nix::unistd::{Pid, setsid};
 
 use crate::{attach, naming, stream};
 
@@ -19,6 +22,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Conn {
     stream: UnixStream,
+    capabilities: Vec<Capability>,
 }
 
 impl Conn {
@@ -33,11 +37,14 @@ impl Conn {
             }
             Err(_) => return Ok(None),
         };
-        let mut conn = Conn { stream };
-        match conn.request(&Request::Hello { version: PROTOCOL_VERSION })? {
-            Response::Hello { version, .. } if version == PROTOCOL_VERSION => Ok(Some(conn)),
+        let mut conn = Conn { stream, capabilities: Vec::new() };
+        match conn.request(&hello_request())? {
+            Response::Hello { version, capabilities, .. } if version == MANAGER_PROTOCOL_VERSION => {
+                conn.capabilities = capabilities;
+                Ok(Some(conn))
+            }
             Response::Hello { version, .. } => bail!(
-                "manager speaks protocol v{version}, this argus speaks v{PROTOCOL_VERSION}; run `argus manager stop` and retry"
+                "manager speaks protocol v{version}, this argus speaks v{MANAGER_PROTOCOL_VERSION}; run `argus manager stop` and retry"
             ),
             other => bail!("unexpected handshake reply: {other:?}"),
         }
@@ -45,6 +52,10 @@ impl Conn {
 
     pub fn connect() -> Result<Conn> {
         Ok(Conn::open(true)?.expect("autostart always yields a connection"))
+    }
+
+    pub fn supports(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
     }
 
     pub fn request(&mut self, req: &Request) -> Result<Response> {
@@ -91,7 +102,7 @@ fn spawn_manager() -> Result<()> {
     // SAFETY: setsid is async-signal-safe; it detaches the manager from our terminal.
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            setsid().map_err(io::Error::other)?;
             Ok(())
         });
     }
@@ -151,8 +162,12 @@ pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
     }
     match reply {
         Response::Agent { agent, .. } if opts.attach => {
-            let target = attach::Target { socket: paths::holder_socket(agent.id), name: agent.name, id: Some(agent.id) };
-            attach::attach(&target, attach::Options { readonly: false, steal: false, replay: false })
+            let target =
+                attach::Target { socket: paths::holder_socket(agent.id), name: agent.name, id: Some(agent.id) };
+            attach::attach(
+                &target,
+                attach::Options { readonly: false, steal: false, replay: false, allow_clipboard_replay: false },
+            )
         }
         Response::Agent { agent, .. } => {
             println!("{}\t{}", agent.id, agent.name);
@@ -379,14 +394,13 @@ pub fn manager_stop(kill_agents: bool) -> Result<()> {
 /// upgrade. Agents keep running; the new manager reconnects to their holders.
 pub fn manager_restart() -> Result<()> {
     if let Some(mut conn) = Conn::open(false)? {
-        let Response::Hello { pid, .. } = conn.request(&Request::Hello { version: PROTOCOL_VERSION })? else {
+        let Response::Hello { pid, .. } = conn.request(&hello_request())? else {
             bail!("unexpected reply to Hello");
         };
         conn.request(&Request::Shutdown { kill_agents: false })?;
         // The old manager holds the single-instance lock until it exits.
         let deadline = Instant::now() + Duration::from_secs(5);
-        // SAFETY: kill with signal 0 only checks whether the process exists.
-        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+        while signal_process(Pid::from_raw(pid as i32), None).is_ok() {
             if Instant::now() > deadline {
                 bail!("the old manager (pid {pid}) did not exit");
             }
@@ -402,14 +416,19 @@ pub fn manager_status() -> Result<()> {
         println!("manager is not running");
         return Ok(());
     };
-    let Response::Hello { pid, version } = conn.request(&Request::Hello { version: PROTOCOL_VERSION })? else {
+    let Response::Hello { pid, version, capabilities } = conn.request(&hello_request())? else {
         bail!("unexpected reply to Hello");
     };
     let agents = conn.list(true)?;
     let running = agents.iter().filter(|a| a.status.is_live()).count();
     println!("manager running (pid {pid}, protocol v{version}), {running} running / {} total agents", agents.len());
+    println!("capabilities: {}", capabilities.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", "));
     println!("socket: {}", paths::manager_socket().display());
     Ok(())
+}
+
+fn hello_request() -> Request {
+    Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: MANAGER_CAPABILITIES.to_vec() }
 }
 
 pub fn terminal_size() -> (u16, u16) {

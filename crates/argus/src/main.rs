@@ -82,6 +82,9 @@ enum Command {
         /// Keep printing new output until the agent exits
         #[arg(short, long)]
         follow: bool,
+        /// Write control sequences verbatim, including OSC 52 clipboard writes
+        #[arg(long)]
+        raw: bool,
     },
     /// Type text into an agent without attaching (Enter is pressed after it)
     Send {
@@ -137,6 +140,9 @@ enum Command {
         /// Print recent output before live output
         #[arg(long)]
         replay: bool,
+        /// Allow historical OSC 52 sequences to overwrite the clipboard
+        #[arg(long, requires = "replay")]
+        allow_clipboard_replay: bool,
     },
     /// Stop an agent (SIGTERM, then SIGKILL after 5s)
     Kill {
@@ -202,14 +208,14 @@ fn main() -> ExitCode {
         Command::Run { name, group, cwd, attach, label, kind, program, args } => {
             client::run(client::RunOptions { name, group, cwd, labels: label, kind, attach }, program, args)
         }
-        Command::Attach { target, ro, steal, replay } => {
-            client::attach(target, attach::Options { readonly: ro, steal, replay })
+        Command::Attach { target, ro, steal, replay, allow_clipboard_replay } => {
+            client::attach(target, attach::Options { readonly: ro, steal, replay, allow_clipboard_replay })
         }
         Command::Ps { prefix, all, label, watch, json } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
         }
         Command::View { prefix, label } => view::run(prefix, label),
-        Command::Logs { target, bytes, follow } => stream::logs(target, bytes, follow),
+        Command::Logs { target, bytes, follow, raw } => stream::logs(target, bytes, follow, raw),
         Command::Send { target, text, no_enter } => client::send(target, text, !no_enter),
         Command::Rename { target, name } => client::rename(target, name),
         Command::Mv { target, group } => client::mv(target, group),

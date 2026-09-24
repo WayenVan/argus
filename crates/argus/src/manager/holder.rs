@@ -9,10 +9,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{aio, ty};
 use argus_proto::msg::{
-    AgentStatus, ExitRecord, HolderEvent, HolderReady, HolderRequest, HolderResponse, HolderSpec, RunRequest,
-    SubscribeLevel,
+    AgentStatus, ExitRecord, HOLDER_CAPABILITIES, HolderEvent, HolderReady, HolderRequest, HolderResponse, HolderSpec,
+    RunRequest, SubscribeLevel,
 };
-use argus_proto::{PROTOCOL_VERSION, paths};
+use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -67,7 +67,18 @@ pub async fn start(holder_exe: &Path, id: u64, req: &RunRequest, command: Vec<St
 
 async fn connect(id: u64) -> Result<UnixStream> {
     let mut stream = UnixStream::connect(paths::holder_socket(id)).await?;
-    call(&mut stream, &HolderRequest::Hello { version: PROTOCOL_VERSION }).await?;
+    let hello = call(
+        &mut stream,
+        &HolderRequest::Hello { version: HOLDER_PROTOCOL_VERSION, capabilities: HOLDER_CAPABILITIES.to_vec() },
+    )
+    .await?;
+    match hello {
+        HolderResponse::Hello { version, .. } if version == HOLDER_PROTOCOL_VERSION => {}
+        HolderResponse::Hello { version, .. } => {
+            anyhow::bail!("holder speaks protocol v{version}, manager expects v{HOLDER_PROTOCOL_VERSION}")
+        }
+        other => anyhow::bail!("unexpected holder handshake reply: {other:?}"),
+    }
     Ok(stream)
 }
 

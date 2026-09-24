@@ -77,11 +77,24 @@ fn unknown() -> String {
 // client ↔ manager
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    ScreenRestore,
+    StyledPreview,
+    OffsetReplay,
+}
+
+pub const MANAGER_CAPABILITIES: &[Capability] = &[Capability::ScreenRestore, Capability::StyledPreview];
+pub const HOLDER_CAPABILITIES: &[Capability] = &[Capability::OffsetReplay];
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum Request {
     Hello {
         version: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
     },
     Run(RunRequest),
     List {
@@ -154,10 +167,10 @@ pub enum Request {
         #[serde(default)]
         since_offset: Option<u64>,
     },
-    /// A plain-text crop of the agent's current screen to `rows`x`cols`, for
-    /// dashboard thumbnails. Unlike `Screen`, this is never meant to control
-    /// a real terminal (no escape codes, no absolute cursor positions) so it
-    /// can be placed inside a caller-drawn layout instead of painting one.
+    /// A styled crop of the agent's current screen to `rows`x`cols`, for
+    /// dashboard thumbnails. Unlike `Screen`, it contains structured spans,
+    /// not escape codes or absolute cursor positions, so it can be safely
+    /// placed inside a caller-drawn layout.
     ScreenPreview {
         target: String,
         rows: u16,
@@ -192,6 +205,8 @@ pub enum Response {
     Hello {
         version: u32,
         pid: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
     },
     Agent {
         agent: AgentInfo,
@@ -243,8 +258,36 @@ pub enum Response {
     /// this agent yet (just started, or the manager lost its holder
     /// connection); the caller shows the box empty rather than erroring.
     ScreenPreview {
-        lines: Vec<String>,
+        lines: Vec<PreviewLine>,
     },
+}
+
+/// One styled terminal row used by `argus view` thumbnails.
+pub type PreviewLine = Vec<PreviewSpan>;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PreviewSpan {
+    pub text: String,
+    pub fg: PreviewColor,
+    pub bg: PreviewColor,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub dim: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub inverse: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+pub enum PreviewColor {
+    Default,
+    Indexed(u8),
+    Rgb([u8; 3]),
 }
 
 /// How a client should restore an agent's screen.
@@ -333,6 +376,8 @@ pub enum SubscribeLevel {
 pub enum HolderRequest {
     Hello {
         version: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
     },
     Info,
     /// With `from_offset`, output subscribers first get the ring buffer from
@@ -366,6 +411,10 @@ pub struct AttachRequest {
     /// Sends the ring buffer before live output.
     #[serde(default)]
     pub replay: bool,
+    /// Allows historical OSC 52 sequences to modify the attaching terminal's
+    /// clipboard. Live output is always passed through unchanged.
+    #[serde(default)]
+    pub allow_clipboard_replay: bool,
     /// Sends the ring buffer from this offset (or its oldest byte) before
     /// live output, instead of the whole thing. Takes priority over `replay`
     /// when both are set. Used to pick up right after a manager-provided
@@ -394,10 +443,17 @@ pub enum HolderEvent {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum HolderResponse {
-    Hello { version: u32, pid: u32 },
+    Hello {
+        version: u32,
+        pid: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
+    },
     Info(HolderInfo),
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -422,4 +478,18 @@ pub struct ExitRecord {
 
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn hello_capabilities_are_optional_for_older_peers() {
+        let request: Request = serde_json::from_str(r#"{"type":"Hello","version":1}"#).unwrap();
+        assert!(matches!(request, Request::Hello { capabilities, .. } if capabilities.is_empty()));
+
+        let holder: HolderResponse = serde_json::from_str(r#"{"type":"Hello","version":1,"pid":42}"#).unwrap();
+        assert!(matches!(holder, HolderResponse::Hello { capabilities, .. } if capabilities.is_empty()));
+    }
 }

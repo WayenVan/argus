@@ -12,3 +12,4 @@ anyhow.workspace = true
 libc.workspace = true
 nix.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true

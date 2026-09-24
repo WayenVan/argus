@@ -10,21 +10,24 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use argus_proto::frame::{self, ty};
 use argus_proto::msg::{
-    AttachRequest, ExitRecord, HolderEvent, HolderInfo, HolderRequest, HolderResponse, HolderSpec, SubscribeLevel,
-    now_secs,
+    AttachRequest, ExitRecord, HOLDER_CAPABILITIES, HolderEvent, HolderInfo, HolderRequest, HolderResponse, HolderSpec,
+    SubscribeLevel, now_secs,
 };
-use argus_proto::{PROTOCOL_VERSION, paths};
+use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
+use signal_hook::SigId;
+use signal_hook::consts::SIGCHLD;
 
 use crate::conn::{Conn, Role};
 use crate::ring::Ring;
@@ -35,17 +38,9 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 const LINGER: Duration = Duration::from_secs(60);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const INPUT_EVENT_INTERVAL: Duration = Duration::from_secs(1);
-
-static SIGCHLD_PIPE: AtomicI32 = AtomicI32::new(-1);
-
-extern "C" fn on_sigchld(_: libc::c_int) {
-    let fd = SIGCHLD_PIPE.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let byte = 1u8;
-        // SAFETY: write is async-signal-safe; the pipe is non-blocking.
-        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
-    }
-}
+const TERMINAL_QUERY_GRACE: Duration = Duration::from_millis(250);
+const OSC_FOREGROUND_QUERY: &[u8] = b"\x1b]10;?\x1b\\";
+const OSC_BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 
 pub struct Holder {
     spec: HolderSpec,
@@ -55,7 +50,7 @@ pub struct Holder {
     master_out: Vec<u8>,
     child: Pid,
     sigchld: OwnedFd,
-    _sigchld_w: OwnedFd,
+    _sigchld_registration: SigId,
     conns: Vec<Conn>,
     next_conn_id: u64,
     ring: Ring,
@@ -66,6 +61,65 @@ pub struct Holder {
     /// Last `(attached, focused)` counts sent to subscribers.
     attached_reported: (u32, u32),
     last_input_event: Option<Instant>,
+    terminal_queries: TerminalQueries,
+}
+
+#[derive(Default)]
+struct TerminalQueries {
+    tail: Vec<u8>,
+    foreground: bool,
+    background: bool,
+    deadline: Option<Instant>,
+}
+
+impl TerminalQueries {
+    fn observe(&mut self, bytes: &[u8]) {
+        let mut combined = Vec::with_capacity(self.tail.len() + bytes.len());
+        combined.extend_from_slice(&self.tail);
+        combined.extend_from_slice(bytes);
+        self.foreground |= contains(&combined, OSC_FOREGROUND_QUERY);
+        self.background |= contains(&combined, OSC_BACKGROUND_QUERY);
+        if (self.foreground || self.background) && self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + TERMINAL_QUERY_GRACE);
+        }
+        let keep = OSC_BACKGROUND_QUERY.len().saturating_sub(1).min(combined.len());
+        self.tail.clear();
+        self.tail.extend_from_slice(&combined[combined.len() - keep..]);
+    }
+
+    fn take_requests(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if self.foreground {
+            bytes.extend_from_slice(OSC_FOREGROUND_QUERY);
+        }
+        if self.background {
+            bytes.extend_from_slice(OSC_BACKGROUND_QUERY);
+        }
+        self.clear_pending();
+        bytes
+    }
+
+    fn take_fallback_responses(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if self.foreground {
+            bytes.extend_from_slice(b"\x1b]10;rgb:e5e5/e5e5/e5e5\x1b\\");
+        }
+        if self.background {
+            bytes.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+        }
+        self.clear_pending();
+        bytes
+    }
+
+    fn clear_pending(&mut self) {
+        self.foreground = false;
+        self.background = false;
+        self.deadline = None;
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
 }
 
 /// PTY size and who decides it.
@@ -96,15 +150,7 @@ impl Holder {
         let (sigchld, sigchld_w) = cloexec_pipe()?;
         set_nonblocking(sigchld.as_raw_fd());
         set_nonblocking(sigchld_w.as_raw_fd());
-        SIGCHLD_PIPE.store(sigchld_w.as_raw_fd(), Ordering::Relaxed);
-        // SAFETY: the handler only calls write(2).
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_sigchld as extern "C" fn(libc::c_int) as usize;
-            sa.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
-        }
+        let sigchld_registration = signal_hook::low_level::pipe::register(SIGCHLD, sigchld_w)?;
 
         let spawned = match spawn::spawn_agent(&spec) {
             Ok(s) => s,
@@ -123,7 +169,7 @@ impl Holder {
             master_out: Vec::new(),
             child: spawned.pid,
             sigchld,
-            _sigchld_w: sigchld_w,
+            _sigchld_registration: sigchld_registration,
             conns: Vec::new(),
             next_conn_id: 1,
             ring: Ring::new(),
@@ -133,6 +179,7 @@ impl Holder {
             size: Size { current, owner: None, history: Vec::new(), last_change: None, pending: None },
             attached_reported: (0, 0),
             last_input_event: None,
+            terminal_queries: TerminalQueries::default(),
         })
     }
 
@@ -153,59 +200,63 @@ impl Holder {
     }
 
     fn poll_once(&mut self) {
-        let master_fd = self.master.as_ref().map_or(-1, |m| m.as_raw_fd());
-        let mut master_events = libc::POLLIN;
+        let mut master_events = PollFlags::POLLIN;
         if !self.master_out.is_empty() {
-            master_events |= libc::POLLOUT;
+            master_events |= PollFlags::POLLOUT;
         }
+        let master_fd = self.master.as_ref().map_or(self.sigchld.as_fd(), AsFd::as_fd);
         let mut fds = vec![
-            pollfd(self.sigchld.as_raw_fd(), libc::POLLIN),
-            pollfd(self.listener.as_raw_fd(), libc::POLLIN),
-            pollfd(master_fd, master_events),
+            PollFd::new(self.sigchld.as_fd(), PollFlags::POLLIN),
+            PollFd::new(self.listener.as_fd(), PollFlags::POLLIN),
+            PollFd::new(master_fd, if self.master.is_some() { master_events } else { PollFlags::empty() }),
         ];
         for c in &self.conns {
-            let mut events = libc::POLLIN;
+            let mut events = PollFlags::POLLIN;
             if c.has_pending() {
-                events |= libc::POLLOUT;
+                events |= PollFlags::POLLOUT;
             }
-            fds.push(pollfd(c.stream.as_raw_fd(), events));
+            fds.push(PollFd::new(c.stream.as_fd(), events));
         }
 
-        // SAFETY: fds is a valid, correctly sized pollfd array.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, self.next_timeout()) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
+        if let Err(err) = poll(&mut fds, self.next_timeout()) {
+            if err != nix::errno::Errno::EINTR {
                 eprintln!("argus-holder: poll: {err}");
             }
             return;
         }
 
-        if fds[0].revents != 0 {
+        let sigchld_ready = !fds[0].revents().unwrap_or_else(PollFlags::empty).is_empty();
+        let listener_ready = !fds[1].revents().unwrap_or_else(PollFlags::empty).is_empty();
+        let master_ready = fds[2].revents().unwrap_or_else(PollFlags::empty);
+        let conn_ready: Vec<PollFlags> =
+            fds[3..].iter().map(|fd| fd.revents().unwrap_or_else(PollFlags::empty)).collect();
+        drop(fds);
+
+        if sigchld_ready {
             drain(self.sigchld.as_raw_fd());
             self.reap();
         }
 
         // Clients first: their input must never wait behind agent output.
-        for (i, pfd) in fds[3..].iter().enumerate() {
-            if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        for (i, ready) in conn_ready.into_iter().enumerate() {
+            if ready.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
                 for (t, payload) in self.conns[i].read_frames() {
                     self.handle_frame(i, t, &payload);
                 }
             }
-            if pfd.revents & libc::POLLOUT != 0 {
+            if ready.contains(PollFlags::POLLOUT) {
                 self.conns[i].flush();
             }
         }
 
-        if fds[2].revents & libc::POLLOUT != 0 {
+        if master_ready.contains(PollFlags::POLLOUT) {
             self.write_master();
         }
-        if fds[2].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if master_ready.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
             self.read_master();
         }
 
-        if fds[1].revents != 0 {
+        if listener_ready {
             self.accept();
         }
 
@@ -213,11 +264,14 @@ impl Holder {
         self.run_timers();
     }
 
-    fn next_timeout(&self) -> i32 {
-        let deadline = [self.kill_deadline, self.linger_deadline, self.size.pending].into_iter().flatten().min();
+    fn next_timeout(&self) -> PollTimeout {
+        let deadline = [self.kill_deadline, self.linger_deadline, self.size.pending, self.terminal_queries.deadline]
+            .into_iter()
+            .flatten()
+            .min();
         match deadline {
-            None => -1,
-            Some(d) => d.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32,
+            None => PollTimeout::NONE,
+            Some(d) => PollTimeout::try_from(d.saturating_duration_since(Instant::now())).unwrap_or(PollTimeout::MAX),
         }
     }
 
@@ -232,6 +286,11 @@ impl Holder {
         if self.size.pending.is_some_and(|d| now >= d) {
             self.size.pending = None;
             self.apply_owner_size();
+        }
+        if self.terminal_queries.deadline.is_some_and(|d| now >= d) {
+            let responses = self.terminal_queries.take_fallback_responses();
+            self.master_out.extend_from_slice(&responses);
+            self.write_master();
         }
     }
 
@@ -311,9 +370,11 @@ impl Holder {
     fn handle_control(&mut self, i: usize, payload: &[u8]) {
         let response = match serde_json::from_slice::<HolderRequest>(payload) {
             Err(e) => HolderResponse::Error { message: format!("bad request: {e}") },
-            Ok(HolderRequest::Hello { .. }) => {
-                HolderResponse::Hello { version: PROTOCOL_VERSION, pid: std::process::id() }
-            }
+            Ok(HolderRequest::Hello { .. }) => HolderResponse::Hello {
+                version: HOLDER_PROTOCOL_VERSION,
+                pid: std::process::id(),
+                capabilities: HOLDER_CAPABILITIES.to_vec(),
+            },
             Ok(HolderRequest::Info) => HolderResponse::Info(HolderInfo {
                 id: self.spec.id,
                 holder_pid: std::process::id(),
@@ -388,17 +449,27 @@ impl Holder {
                 c.dead = true;
             }
         }
+        // If the agent queried terminal colours before anyone attached, give
+        // the real terminal one chance to answer. The control reply must stay
+        // first so the attach handshake remains framed correctly.
+        let pending_terminal_queries = if req.readonly { Vec::new() } else { self.terminal_queries.take_requests() };
         let conn = &mut self.conns[i];
         conn.role = Role::Attach { readonly: req.readonly };
         conn.size = (req.rows.max(1), req.cols.max(1));
         conn.push(frame::encode_json(&HolderResponse::Ok));
+        if !pending_terminal_queries.is_empty() {
+            conn.push(frame::encode(ty::DATA, &pending_terminal_queries));
+        }
         if let Some(offset) = req.from_offset {
             let (_, bytes) = self.ring.since(offset);
+            let bytes = if req.allow_clipboard_replay { bytes } else { argus_proto::ansi::strip_osc52(&bytes) };
             for chunk in bytes.chunks(READ_CHUNK) {
                 conn.push(frame::encode(ty::DATA, chunk));
             }
         } else if req.replay {
             let contents = self.ring.contents();
+            let contents =
+                if req.allow_clipboard_replay { contents } else { argus_proto::ansi::strip_osc52(&contents) };
             for chunk in contents.chunks(READ_CHUNK) {
                 conn.push(frame::encode(ty::DATA, chunk));
             }
@@ -520,8 +591,9 @@ impl Holder {
 
     fn signal_agent(&self, signal: i32) {
         // The agent is a session leader, so its pid is also its process group.
-        // SAFETY: kill(2) with a negative pid signals that process group.
-        unsafe { libc::kill(-self.child.as_raw(), signal) };
+        if let Ok(signal) = Signal::try_from(signal) {
+            let _ = killpg(self.child, signal);
+        }
     }
 
     fn write_master(&mut self) {
@@ -566,7 +638,13 @@ impl Holder {
             break;
         }
         if filled > 0 {
+            self.terminal_queries.observe(&buf[..filled]);
             self.publish(&buf[..filled]);
+            // An attached real terminal receives live queries and supplies
+            // the answer through its normal input stream.
+            if self.attached_count() > 0 {
+                self.terminal_queries.clear_pending();
+            }
         }
         if closed {
             self.master = None;
@@ -656,10 +734,6 @@ impl Holder {
     }
 }
 
-fn pollfd(fd: RawFd, events: i16) -> libc::pollfd {
-    libc::pollfd { fd, events, revents: 0 }
-}
-
 fn drain(fd: RawFd) {
     let mut buf = [0u8; 64];
     // SAFETY: reading into a local buffer from a non-blocking pipe.
@@ -680,7 +754,15 @@ mod tests {
     use super::*;
 
     fn req(from_offset: Option<u64>, replay: bool) -> AttachRequest {
-        AttachRequest { rows: 24, cols: 80, readonly: false, steal: false, replay, from_offset }
+        AttachRequest {
+            rows: 24,
+            cols: 80,
+            readonly: false,
+            steal: false,
+            replay,
+            allow_clipboard_replay: false,
+            from_offset,
+        }
     }
 
     #[test]
@@ -696,5 +778,30 @@ mod tests {
     #[test]
     fn skips_the_jiggle_for_a_ring_buffer_replay() {
         assert!(!needs_jiggle(&req(None, true)));
+    }
+
+    #[test]
+    fn detects_terminal_colour_queries_across_reads() {
+        let mut queries = TerminalQueries::default();
+        queries.observe(b"before\x1b]10;?\x1b\\\x1b]11;");
+        queries.observe(b"?\x1b\\after");
+
+        assert!(queries.foreground);
+        assert!(queries.background);
+        assert!(queries.deadline.is_some());
+        assert_eq!(queries.take_requests(), b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        assert!(queries.deadline.is_none());
+    }
+
+    #[test]
+    fn answers_unattended_terminal_colour_queries() {
+        let mut queries = TerminalQueries::default();
+        queries.observe(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+
+        assert_eq!(
+            queries.take_fallback_responses(),
+            b"\x1b]10;rgb:e5e5/e5e5/e5e5\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\"
+        );
+        assert!(!queries.foreground && !queries.background);
     }
 }

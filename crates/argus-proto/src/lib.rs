@@ -6,9 +6,14 @@
 //! Compatibility rule: the holder protocol only ever grows. A newer manager
 //! must be able to talk to every holder that is still running.
 
+pub mod ansi;
 pub mod frame;
 pub mod msg;
 pub mod paths;
 
-/// Bumped only when a change cannot be expressed as an added optional field.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Client ↔ manager protocol. Bumped for incompatible request/response changes.
+pub const MANAGER_PROTOCOL_VERSION: u32 = 2;
+
+/// Manager/client ↔ holder protocol. Kept independent so a new manager can
+/// reconnect to holders left running by an older installation.
+pub const HOLDER_PROTOCOL_VERSION: u32 = 1;

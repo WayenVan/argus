@@ -91,9 +91,11 @@ dependencies = [
  "clap",
  "crossterm",
  "libc",
+ "nix",
  "ratatui",
  "serde",
  "serde_json",
+ "signal-hook",
  "tokio",
  "vt100",
 ]
@@ -107,6 +109,7 @@ dependencies = [
  "libc",
  "nix",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

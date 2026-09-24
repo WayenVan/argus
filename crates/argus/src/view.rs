@@ -9,12 +9,12 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use argus_proto::msg::{AgentInfo, Request, Response};
+use argus_proto::msg::{AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::text::Text;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::attach;
@@ -25,6 +25,9 @@ const TICK: Duration = Duration::from_millis(500);
 pub fn run(prefix: Option<String>, labels: Vec<(String, String)>) -> Result<()> {
     let opts = PsOptions { prefix, all: false, labels, json: false, watch: false };
     let mut conn = Conn::connect()?;
+    if !conn.supports(Capability::StyledPreview) {
+        anyhow::bail!("the running manager does not support styled previews; restart it with `argus manager restart`");
+    }
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut conn, &opts);
     ratatui::restore();
@@ -33,7 +36,7 @@ pub fn run(prefix: Option<String>, labels: Vec<(String, String)>) -> Result<()> 
 
 struct Tile {
     info: AgentInfo,
-    lines: Vec<String>,
+    lines: Vec<PreviewLine>,
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, conn: &mut Conn, opts: &PsOptions) -> Result<()> {
@@ -81,7 +84,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, conn: &mut Conn, opts: &P
                     // Give the real terminal back to `attach` for the
                     // duration of the session, then reclaim it.
                     ratatui::restore();
-                    let opts = attach::Options { readonly: false, steal: false, replay: false };
+                    let opts =
+                        attach::Options { readonly: false, steal: false, replay: false, allow_clipboard_replay: false };
                     let _ = attach::attach(&target, opts);
                     *terminal = ratatui::init();
                     last_tick = Instant::now() - TICK; // Refresh right away.
@@ -129,8 +133,7 @@ fn draw(frame: &mut Frame, tiles: &[Tile], selected: usize) {
     }
     let cols = grid_cols(tiles.len());
     let rows = tiles.len().div_ceil(cols);
-    let row_areas =
-        Layout::default().direction(Direction::Vertical).constraints(row_constraints(rows)).split(area);
+    let row_areas = Layout::default().direction(Direction::Vertical).constraints(row_constraints(rows)).split(area);
 
     for (r, row_area) in row_areas.iter().enumerate() {
         let start = r * cols;
@@ -148,9 +151,42 @@ fn draw(frame: &mut Frame, tiles: &[Tile], selected: usize) {
             if idx == selected {
                 block = block.border_style(Style::default().fg(Color::Cyan));
             }
-            let text = Text::from(tile.lines.join("\n"));
+            let text = Text::from(tile.lines.iter().map(render_line).collect::<Vec<_>>());
             frame.render_widget(Paragraph::new(text).block(block), *cell_area);
         }
+    }
+}
+
+fn render_line(line: &PreviewLine) -> Line<'static> {
+    Line::from(line.iter().map(render_span).collect::<Vec<_>>())
+}
+
+fn render_span(span: &PreviewSpan) -> Span<'static> {
+    let mut modifiers = Modifier::empty();
+    if span.bold {
+        modifiers.insert(Modifier::BOLD);
+    }
+    if span.dim {
+        modifiers.insert(Modifier::DIM);
+    }
+    if span.italic {
+        modifiers.insert(Modifier::ITALIC);
+    }
+    if span.underline {
+        modifiers.insert(Modifier::UNDERLINED);
+    }
+    if span.inverse {
+        modifiers.insert(Modifier::REVERSED);
+    }
+    let style = Style::default().fg(render_color(span.fg)).bg(render_color(span.bg)).add_modifier(modifiers);
+    Span::styled(span.text.clone(), style)
+}
+
+fn render_color(color: PreviewColor) -> Color {
+    match color {
+        PreviewColor::Default => Color::Reset,
+        PreviewColor::Indexed(index) => Color::Indexed(index),
+        PreviewColor::Rgb([r, g, b]) => Color::Rgb(r, g, b),
     }
 }
 
