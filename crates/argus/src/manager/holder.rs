@@ -113,7 +113,12 @@ pub async fn follow_screen(
     mut on_data: impl FnMut(u64, &[u8]),
 ) -> Result<Option<i32>> {
     let mut stream = connect(id).await?;
-    call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Output, from_offset: None }).await?;
+    // `from_offset: Some(0)` backfills everything the ring buffer still has:
+    // without it, a `Screens` tracker that subscribes after the agent's
+    // first burst of output (plausible — it races the manager spawning this
+    // task at all) would start from an empty, wrongly-not-in-alternate-
+    // screen parser and never catch up.
+    call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Output, from_offset: Some(0) }).await?;
     while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
         match t {
             ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),

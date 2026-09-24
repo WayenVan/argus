@@ -8,6 +8,7 @@ mod client;
 mod manager;
 mod naming;
 mod stream;
+mod view;
 
 use std::process::ExitCode;
 
@@ -63,6 +64,14 @@ enum Command {
         watch: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Full-screen dashboard: a live thumbnail grid of every agent's screen
+    View {
+        /// Only agents whose name starts with this group prefix
+        prefix: Option<String>,
+        /// Only agents with this label (repeatable; all must match)
+        #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
+        label: Vec<(String, String)>,
     },
     /// Print an agent's recent output
     Logs {
@@ -199,6 +208,7 @@ fn main() -> ExitCode {
         Command::Ps { prefix, all, label, watch, json } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
         }
+        Command::View { prefix, label } => view::run(prefix, label),
         Command::Logs { target, bytes, follow } => stream::logs(target, bytes, follow),
         Command::Send { target, text, no_enter } => client::send(target, text, !no_enter),
         Command::Rename { target, name } => client::rename(target, name),

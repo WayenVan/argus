@@ -146,13 +146,22 @@ pub enum Request {
         target: String,
     },
     /// The manager's own idea of the agent's current screen, for `attach` to
-    /// restore without depending on the agent redrawing itself, and for
-    /// screen-preview TUIs to poll. `since_offset` lets a caller that already
-    /// has the screen at that offset skip the bytes.
+    /// restore without depending on the agent redrawing itself. `since_offset`
+    /// lets a caller that already has the screen at that offset skip the
+    /// bytes.
     Screen {
         target: String,
         #[serde(default)]
         since_offset: Option<u64>,
+    },
+    /// A plain-text crop of the agent's current screen to `rows`x`cols`, for
+    /// dashboard thumbnails. Unlike `Screen`, this is never meant to control
+    /// a real terminal (no escape codes, no absolute cursor positions) so it
+    /// can be placed inside a caller-drawn layout instead of painting one.
+    ScreenPreview {
+        target: String,
+        rows: u16,
+        cols: u16,
     },
 }
 
@@ -229,6 +238,12 @@ pub enum Response {
         /// fetched separately).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         bytes: Vec<u8>,
+    },
+    /// Reply to `ScreenPreview`. Empty `lines` means nothing is tracked for
+    /// this agent yet (just started, or the manager lost its holder
+    /// connection); the caller shows the box empty rather than erroring.
+    ScreenPreview {
+        lines: Vec<String>,
     },
 }
 

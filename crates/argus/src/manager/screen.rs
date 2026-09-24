@@ -97,6 +97,14 @@ impl Screens {
         bytes.extend(screen.state_formatted());
         ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes }
     }
+
+    /// A plain-text crop of `id`'s screen to `rows`x`cols`, left-aligned from
+    /// its top-left corner. Empty when nothing is tracked for it yet.
+    pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<String> {
+        let states = self.states.lock().unwrap();
+        let Some(state) = states.get(&id) else { return vec![] };
+        state.parser.screen().rows(0, cols).take(rows as usize).collect()
+    }
 }
 
 #[cfg(test)]

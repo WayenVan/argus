@@ -1,0 +1,180 @@
+//! `argus view`: a full-screen live thumbnail grid of every agent's screen.
+//!
+//! One process takes over the whole terminal (like `htop`), the same as
+//! `attach` does — nothing here nests a terminal inside another; it paints
+//! standard widgets into whichever real terminal (or tmux pane) is running
+//! it. Agent data is polled rather than pushed: a list refresh plus one
+//! `ScreenPreview` request per visible tile, every tick.
+
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use argus_proto::msg::{AgentInfo, Request, Response};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::Text;
+use ratatui::widgets::{Block, Borders, Paragraph};
+
+use crate::attach;
+use crate::client::{Conn, PsOptions};
+
+const TICK: Duration = Duration::from_millis(500);
+
+pub fn run(prefix: Option<String>, labels: Vec<(String, String)>) -> Result<()> {
+    let opts = PsOptions { prefix, all: false, labels, json: false, watch: false };
+    let mut conn = Conn::connect()?;
+    let mut terminal = ratatui::init();
+    let result = event_loop(&mut terminal, &mut conn, &opts);
+    ratatui::restore();
+    result
+}
+
+struct Tile {
+    info: AgentInfo,
+    lines: Vec<String>,
+}
+
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, conn: &mut Conn, opts: &PsOptions) -> Result<()> {
+    let mut selected = 0usize;
+    let mut tiles: Vec<Tile> = Vec::new();
+    // Due immediately, so the first frame is not empty.
+    let mut last_tick = Instant::now() - TICK;
+
+    loop {
+        if last_tick.elapsed() >= TICK {
+            let area = terminal.size()?;
+            tiles = refresh(conn, opts, area.into()).unwrap_or_default();
+            selected = selected.min(tiles.len().saturating_sub(1));
+            last_tick = Instant::now();
+        }
+        terminal.draw(|frame| draw(frame, &tiles, selected))?;
+
+        let timeout = TICK.saturating_sub(last_tick.elapsed());
+        if !event::poll(timeout)? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let cols = grid_cols(tiles.len());
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+            KeyCode::Left | KeyCode::Char('h') => selected = selected.saturating_sub(1),
+            KeyCode::Right | KeyCode::Char('l') if !tiles.is_empty() => {
+                selected = (selected + 1).min(tiles.len() - 1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(cols),
+            KeyCode::Down | KeyCode::Char('j') if !tiles.is_empty() => {
+                selected = (selected + cols).min(tiles.len() - 1);
+            }
+            KeyCode::Enter => {
+                if let Some(tile) = tiles.get(selected) {
+                    let target = attach::Target {
+                        socket: argus_proto::paths::holder_socket(tile.info.id),
+                        name: tile.info.name.clone(),
+                        id: Some(tile.info.id),
+                    };
+                    // Give the real terminal back to `attach` for the
+                    // duration of the session, then reclaim it.
+                    ratatui::restore();
+                    let opts = attach::Options { readonly: false, steal: false, replay: false };
+                    let _ = attach::attach(&target, opts);
+                    *terminal = ratatui::init();
+                    last_tick = Instant::now() - TICK; // Refresh right away.
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One list request plus one `ScreenPreview` per visible tile, sized to
+/// whatever the grid layout works out to for the current terminal size.
+fn refresh(conn: &mut Conn, opts: &PsOptions, area: Rect) -> Result<Vec<Tile>> {
+    let agents: Vec<AgentInfo> = conn.list(true)?.into_iter().filter(|a| opts.keeps(a)).collect();
+    if agents.is_empty() {
+        return Ok(vec![]);
+    }
+    let cols = grid_cols(agents.len());
+    let rows = agents.len().div_ceil(cols);
+    // Inside the border (2 cols) and title line (1 row) of each cell.
+    let cell_cols = (area.width as usize / cols).saturating_sub(2).max(1) as u16;
+    let cell_rows = (area.height as usize / rows).saturating_sub(3).max(1) as u16;
+
+    let mut tiles = Vec::with_capacity(agents.len());
+    for info in agents {
+        let lines = match conn.request(&Request::ScreenPreview {
+            target: info.id.to_string(),
+            rows: cell_rows,
+            cols: cell_cols,
+        })? {
+            Response::ScreenPreview { lines } => lines,
+            _ => vec![],
+        };
+        tiles.push(Tile { info, lines });
+    }
+    Ok(tiles)
+}
+
+fn draw(frame: &mut Frame, tiles: &[Tile], selected: usize) {
+    let area = frame.area();
+    if tiles.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title(" argus view — no running agents ");
+        frame.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+    let cols = grid_cols(tiles.len());
+    let rows = tiles.len().div_ceil(cols);
+    let row_areas =
+        Layout::default().direction(Direction::Vertical).constraints(row_constraints(rows)).split(area);
+
+    for (r, row_area) in row_areas.iter().enumerate() {
+        let start = r * cols;
+        let n = (tiles.len() - start).min(cols);
+        if n == 0 {
+            continue;
+        }
+        let col_areas =
+            Layout::default().direction(Direction::Horizontal).constraints(row_constraints(n)).split(*row_area);
+        for (c, cell_area) in col_areas.iter().enumerate() {
+            let idx = start + c;
+            let tile = &tiles[idx];
+            let title = format!(" {} · {} ", tile.info.name, tile.info.activity);
+            let mut block = Block::default().borders(Borders::ALL).title(title);
+            if idx == selected {
+                block = block.border_style(Style::default().fg(Color::Cyan));
+            }
+            let text = Text::from(tile.lines.join("\n"));
+            frame.render_widget(Paragraph::new(text).block(block), *cell_area);
+        }
+    }
+}
+
+fn row_constraints(n: usize) -> Vec<Constraint> {
+    vec![Constraint::Ratio(1, n as u32); n]
+}
+
+/// Columns for a roughly-square grid of `n` tiles.
+fn grid_cols(n: usize) -> usize {
+    if n == 0 { 1 } else { (n as f64).sqrt().ceil() as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_stays_roughly_square() {
+        assert_eq!(grid_cols(0), 1);
+        assert_eq!(grid_cols(1), 1);
+        assert_eq!(grid_cols(2), 2);
+        assert_eq!(grid_cols(4), 2);
+        assert_eq!(grid_cols(5), 3);
+        assert_eq!(grid_cols(9), 3);
+        assert_eq!(grid_cols(10), 4);
+    }
+}

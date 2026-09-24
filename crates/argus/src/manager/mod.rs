@@ -285,6 +285,10 @@ impl Manager {
                 let screen::ScreenReply { mode, rows, cols, offset, bytes } = self.screens.get(id, since_offset);
                 Ok(Response::Screen { mode, rows, cols, offset, bytes })
             }
+            Request::ScreenPreview { target, rows, cols } => {
+                let id = resolve_one(&self.registry.lock().unwrap(), &target, "screen")?;
+                Ok(Response::ScreenPreview { lines: self.screens.preview(id, rows, cols) })
+            }
             Request::Watch { .. } | Request::Report { .. } => bail!("handled by the connection loop"),
         }
     }
