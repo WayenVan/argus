@@ -29,6 +29,8 @@ use tokio::sync::Notify;
 use crate::naming;
 
 const HOLDER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longer than the holder's SIGTERM → SIGKILL grace period.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
 
 pub fn run() -> Result<()> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(serve())
@@ -181,11 +183,12 @@ impl Manager {
                         let reg = self.registry.lock().unwrap();
                         reg.agents.values().filter(|a| a.status.is_live()).map(|a| a.id).collect()
                     };
-                    for id in live {
+                    for &id in &live {
                         if let Err(e) = signal_holder(id, libc::SIGTERM).await {
                             log(&format!("stopping agent {id}: {e:#}"));
                         }
                     }
+                    self.wait_until_stopped(&live).await;
                 }
                 Ok(Response::Ok)
             }
@@ -259,6 +262,26 @@ impl Manager {
                 let _ = fs::remove_dir_all(paths::agent_dir(info.id));
                 Err(e)
             }
+        }
+    }
+
+    /// Waits for the watch tasks to record every agent's exit, so the registry
+    /// and name links are final before the manager goes away. Holders escalate
+    /// to SIGKILL after 5s, so this normally ends well before the deadline.
+    async fn wait_until_stopped(&self, ids: &[u64]) {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+        loop {
+            let pending = {
+                let reg = self.registry.lock().unwrap();
+                ids.iter().filter(|id| reg.agents.get(id).is_some_and(|a| a.status.is_live())).count()
+            };
+            if pending == 0 {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return log(&format!("{pending} agents still running at shutdown"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
