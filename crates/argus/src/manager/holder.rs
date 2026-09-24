@@ -104,6 +104,40 @@ pub async fn follow(id: u64, on_event: impl Fn(HolderEvent)) -> Result<Option<i3
     Ok(None)
 }
 
+/// Like [`follow`], but at [`SubscribeLevel::Output`]: also passes output
+/// bytes to `on_data` as `(offset_of_first_byte, bytes)`, for the manager's
+/// virtual-terminal tracking.
+pub async fn follow_screen(
+    id: u64,
+    on_event: impl Fn(HolderEvent),
+    mut on_data: impl FnMut(u64, &[u8]),
+) -> Result<Option<i32>> {
+    let mut stream = connect(id).await?;
+    call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Output, from_offset: None }).await?;
+    while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
+        match t {
+            ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),
+            ty::CONTROL => {
+                if let Ok(event) = serde_json::from_slice(&payload) {
+                    on_event(event);
+                }
+            }
+            // Output subscribers get every DATA frame tagged with the offset
+            // of its first byte (see argus-holder's `publish`).
+            ty::DATA if payload.len() >= 8 => {
+                let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+                on_data(offset, &payload[8..]);
+            }
+            ty::SKIPPED if payload.len() == 16 => {
+                let to = u64::from_be_bytes(payload[8..16].try_into().unwrap());
+                on_data(to, &[]); // Resyncs the tracked offset; the gap is lived with.
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// How many bytes of output the agent has produced so far.
 pub async fn output_offset(id: u64) -> Result<u64> {
     match call(&mut connect(id).await?, &HolderRequest::Info).await? {

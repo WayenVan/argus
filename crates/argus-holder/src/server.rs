@@ -331,6 +331,10 @@ impl Holder {
                 self.conns[i].push(frame::encode_json(&HolderResponse::Ok));
                 let (count, focused) = self.attached_counts();
                 self.conns[i].push(frame::encode_json(&HolderEvent::Attached { count, focused }));
+                if level == SubscribeLevel::Output {
+                    let (rows, cols) = self.size.current;
+                    self.conns[i].push(frame::encode_json(&HolderEvent::Resized { rows, cols }));
+                }
                 if let (SubscribeLevel::Output, Some(offset)) = (level, from_offset) {
                     let (start, bytes) = self.ring.since(offset);
                     let mut at = start;
@@ -388,7 +392,12 @@ impl Holder {
         conn.role = Role::Attach { readonly: req.readonly };
         conn.size = (req.rows.max(1), req.cols.max(1));
         conn.push(frame::encode_json(&HolderResponse::Ok));
-        if req.replay {
+        if let Some(offset) = req.from_offset {
+            let (_, bytes) = self.ring.since(offset);
+            for chunk in bytes.chunks(READ_CHUNK) {
+                conn.push(frame::encode(ty::DATA, chunk));
+            }
+        } else if req.replay {
             let contents = self.ring.contents();
             for chunk in contents.chunks(READ_CHUNK) {
                 conn.push(frame::encode(ty::DATA, chunk));
@@ -396,10 +405,15 @@ impl Holder {
         }
         if !req.readonly {
             self.make_owner(i);
-            // Attaching always redraws: the new terminal starts out blank.
             let size = self.conns[i].size;
             if size == self.size.current {
-                self.jiggle();
+                // A client with backfill already has a picture (a manager
+                // snapshot, or a raw replay now streaming to it); jiggling
+                // for a redraw would only add a flicker on top of it. A
+                // client with neither starts out blank and needs one.
+                if req.from_offset.is_none() && !req.replay {
+                    self.jiggle();
+                }
             } else {
                 self.apply_size(size);
             }
@@ -450,6 +464,7 @@ impl Holder {
         self.size.current = (rows, cols);
         self.size.last_change = Some(Instant::now());
         self.size.pending = None;
+        self.notify_subscribers(&HolderEvent::Resized { rows, cols });
     }
 
     /// Changes the size and back so the agent gets SIGWINCH and redraws.

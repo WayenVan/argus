@@ -12,8 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
-use argus_proto::msg::{AttachRequest, HolderRequest, HolderResponse};
+use argus_proto::msg::{AttachRequest, HolderRequest, HolderResponse, Request, Response, ScreenMode};
 use argus_proto::{PROTOCOL_VERSION, paths};
+
+use crate::client::Conn;
 
 /// Ctrl-\ (FS). In raw mode it arrives as a byte instead of SIGQUIT, unless
 /// the agent turned on an extended keyboard mode: see [`find_detach`].
@@ -21,12 +23,17 @@ const DETACH_KEY: u8 = 0x1c;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
-const ENTER: &str = "\x1b[?1004h\x1b[H\x1b[2J";
-/// Leaves the agent's terminal modes behind: kitty keyboard flags (popped
-/// before leaving the alternate screen, which has its own stack),
-/// modifyOtherKeys, focus reporting, alternate screen, mouse modes, bracketed
-/// paste, colour scheme reports, hidden cursor, colours.
-const RESET: &str = "\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m";
+/// Turns on focus reporting; sent unconditionally on attach.
+const FOCUS_REPORT: &str = "\x1b[?1004h";
+/// Home + clear, for when there is no screen restore to draw instead.
+const CLEAR: &str = "\x1b[H\x1b[2J";
+/// Leaves the agent's terminal modes behind: synchronized-output hold
+/// (released first, so the rest of this actually reaches the screen instead
+/// of sitting in a buffered frame until the terminal's own timeout), kitty
+/// keyboard flags (popped before leaving the alternate screen, which has its
+/// own stack), modifyOtherKeys, focus reporting, alternate screen, mouse
+/// modes, bracketed paste, colour scheme reports, hidden cursor, colours.
+const RESET: &str = "\x1b[?2026l\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m";
 
 pub struct Options {
     pub readonly: bool,
@@ -37,6 +44,9 @@ pub struct Options {
 pub struct Target {
     pub socket: PathBuf,
     pub name: String,
+    /// Known when resolved through the manager (or given as a bare ID); lets
+    /// `attach` ask the manager for a screen to restore.
+    pub id: Option<u64>,
 }
 
 enum Ending {
@@ -62,10 +72,17 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
         bail!("attach needs a terminal on stdin");
     }
+    let (rows, cols) = crate::client::terminal_size();
+    let restore = target.id.and_then(|id| fetch_screen(id));
+
     let mut stream = UnixStream::connect(&target.socket)
         .with_context(|| format!("{} is not reachable (has it exited?)", target.name))?;
     call(&mut stream, &HolderRequest::Hello { version: PROTOCOL_VERSION })?;
-    let (rows, cols) = crate::client::terminal_size();
+    // A Snapshot or Replay reply gives an offset to pick up from; the
+    // manager already fed the bytes before that offset into it (Snapshot)
+    // or they are being drawn locally from the ring buffer (Replay).
+    let from_offset =
+        restore.as_ref().filter(|r| !matches!(r.mode, ScreenMode::Unavailable)).map(|r| r.offset);
     call(
         &mut stream,
         &HolderRequest::Attach(AttachRequest {
@@ -74,12 +91,22 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
             readonly: opts.readonly,
             steal: opts.steal,
             replay: opts.replay,
+            from_offset,
         }),
     )?;
 
     let ending = {
         let _raw = RawMode::enter()?;
-        print_raw(ENTER);
+        print_raw(FOCUS_REPORT);
+        match &restore {
+            // Only worth drawing if it is a real redraw of the size we are
+            // about to show it at; otherwise the holder will resize the PTY
+            // for real and the agent redraws itself for the new dimensions.
+            Some(r) if r.mode == ScreenMode::Snapshot && (r.rows, r.cols) == (rows, cols) => {
+                print_raw_bytes(&r.bytes)
+            }
+            _ => print_raw(CLEAR),
+        }
         let ending = pump(stream, opts.readonly);
         print_raw(RESET);
         ending
@@ -92,6 +119,25 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
         Ending::Lost => eprintln!("[connection to {} lost]", target.name),
     }
     Ok(())
+}
+
+struct Restore {
+    mode: ScreenMode,
+    rows: u16,
+    cols: u16,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// Asks the manager for a screen to restore `id` with. `None` if the manager
+/// is unreachable or the reply is not a screen; either way `attach` falls
+/// back to the first-stage clear-and-resize dance.
+fn fetch_screen(id: u64) -> Option<Restore> {
+    let mut conn = Conn::open(false).ok().flatten()?;
+    match conn.request(&Request::Screen { target: id.to_string(), since_offset: None }).ok()? {
+        Response::Screen { mode, rows, cols, offset, bytes } => Some(Restore { mode, rows, cols, offset, bytes }),
+        _ => None,
+    }
 }
 
 /// One request/response exchange with a holder, before any stream frames.
@@ -332,8 +378,12 @@ impl Drop for RawMode {
 }
 
 fn print_raw(s: &str) {
+    print_raw_bytes(s.as_bytes());
+}
+
+fn print_raw_bytes(bytes: &[u8]) {
     let mut out = io::stdout().lock();
-    let _ = out.write_all(s.as_bytes());
+    let _ = out.write_all(bytes);
     let _ = out.flush();
 }
 
@@ -350,14 +400,17 @@ fn human_bytes(n: u64) -> String {
 /// when the manager is not running.
 pub fn resolve(target: &str, from_manager: Option<(u64, String)>) -> Result<Target> {
     if let Some((id, name)) = from_manager {
-        return Ok(Target { socket: paths::holder_socket(id), name });
+        return Ok(Target { socket: paths::holder_socket(id), name, id: Some(id) });
     }
     if !target.is_empty() && target.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(Target { socket: paths::holder_socket(target.parse()?), name: format!("agent {target}") });
+        let id: u64 = target.parse()?;
+        return Ok(Target { socket: paths::holder_socket(id), name: format!("agent {target}"), id: Some(id) });
     }
     let link = paths::name_socket(target);
     if link.exists() {
-        return Ok(Target { socket: link, name: target.to_string() });
+        // The manager is unreachable (else `from_manager` would be set), so
+        // there is no id to ask it for a screen with.
+        return Ok(Target { socket: link, name: target.to_string(), id: None });
     }
     bail!("no running agent named {target} (the manager is not running, so use an ID or the full name)")
 }

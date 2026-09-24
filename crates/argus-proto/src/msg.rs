@@ -145,6 +145,15 @@ pub enum Request {
     Ack {
         target: String,
     },
+    /// The manager's own idea of the agent's current screen, for `attach` to
+    /// restore without depending on the agent redrawing itself, and for
+    /// screen-preview TUIs to poll. `since_offset` lets a caller that already
+    /// has the screen at that offset skip the bytes.
+    Screen {
+        target: String,
+        #[serde(default)]
+        since_offset: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -207,6 +216,38 @@ pub enum Response {
         seq: u64,
         event: AgentEvent,
     },
+    /// Reply to `Screen`. `offset` is the output offset the screen
+    /// corresponds to; a caller restoring a live attach passes it to the
+    /// holder as `AttachRequest.from_offset` to pick up from exactly there.
+    Screen {
+        mode: ScreenMode,
+        rows: u16,
+        cols: u16,
+        offset: u64,
+        /// Empty when the caller's `since_offset` already matches, or when
+        /// `mode` is `Replay` (the bytes live in the holder's ring buffer,
+        /// fetched separately).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bytes: Vec<u8>,
+    },
+}
+
+/// How a client should restore an agent's screen.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenMode {
+    /// The agent is in the alternate screen: `bytes` is a manager-rendered
+    /// redraw of the current screen and terminal modes. Apply it only if the
+    /// caller's terminal size matches `rows`/`cols`.
+    Snapshot,
+    /// The agent has never entered the alternate screen: recovering earlier
+    /// output means replaying the holder's ring buffer from `offset`
+    /// (usually its oldest retained byte) instead of a synthetic redraw.
+    Replay,
+    /// The manager has no screen state for this agent yet (just started) or
+    /// isn't reachable; the caller should fall back to the first-stage
+    /// clear-and-resize dance.
+    Unavailable,
 }
 
 /// Watch events carry the agent's whole current record, so a client simply
@@ -310,6 +351,12 @@ pub struct AttachRequest {
     /// Sends the ring buffer before live output.
     #[serde(default)]
     pub replay: bool,
+    /// Sends the ring buffer from this offset (or its oldest byte) before
+    /// live output, instead of the whole thing. Takes priority over `replay`
+    /// when both are set. Used to pick up right after a manager-provided
+    /// screen snapshot or replay.
+    #[serde(default)]
+    pub from_offset: Option<u64>,
 }
 
 /// Pushed by the holder to subscribers as control frames.
@@ -324,6 +371,9 @@ pub enum HolderEvent {
     },
     /// Someone typed into the agent. At most one per second.
     Input,
+    /// The PTY's size actually changed. Not sent for a jiggle (resize and
+    /// back) that leaves the size unchanged, since nothing to track moved.
+    Resized { rows: u16, cols: u16 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

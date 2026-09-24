@@ -13,3 +13,4 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+vt100 = "0.16"

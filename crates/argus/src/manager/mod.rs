@@ -8,6 +8,7 @@ mod activity;
 pub(crate) mod driver;
 mod holder;
 mod registry;
+mod screen;
 mod watch;
 
 use std::fs::{self, File, OpenOptions};
@@ -28,6 +29,7 @@ use tokio::sync::Notify;
 use crate::naming;
 use activity::Fact;
 use registry::{AgentRecord, Registry};
+use screen::Screens;
 
 /// Longer than the holder's SIGTERM → SIGKILL grace period.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
@@ -43,6 +45,7 @@ pub struct Manager {
     shutdown: Notify,
     /// Identifies this manager instance to watchers; changes on restart.
     epoch: u64,
+    screens: Arc<Screens>,
 }
 
 async fn serve() -> Result<()> {
@@ -74,6 +77,7 @@ async fn serve() -> Result<()> {
         drivers,
         shutdown: Notify::new(),
         epoch,
+        screens: Screens::new(),
     });
     manager.recover();
 
@@ -276,6 +280,11 @@ impl Manager {
                 }
                 Ok(Response::Ok)
             }
+            Request::Screen { target, since_offset } => {
+                let id = resolve_one(&self.registry.lock().unwrap(), &target, "screen")?;
+                let screen::ScreenReply { mode, rows, cols, offset, bytes } = self.screens.get(id, since_offset);
+                Ok(Response::Screen { mode, rows, cols, offset, bytes })
+            }
             Request::Watch { .. } | Request::Report { .. } => bail!("handled by the connection loop"),
         }
     }
@@ -458,11 +467,14 @@ impl Manager {
         if hookless {
             self.poll_output(id);
         }
+        self.screens.track(id);
         let manager = self.clone();
         tokio::spawn(async move {
             let on_event = |event: HolderEvent| match event {
                 HolderEvent::Attached { count, focused } => manager.on_fact(id, Fact::Attached { count, focused }),
                 HolderEvent::Input => manager.on_fact(id, Fact::Input),
+                // Only the screen-tracking subscription cares about this.
+                HolderEvent::Resized { .. } => {}
             };
             let (status, code, exited_at) = match holder::follow(id, on_event).await {
                 Ok(Some(code)) => (AgentStatus::Exited, Some(code), Some(now_secs())),
