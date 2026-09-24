@@ -176,6 +176,13 @@ pub enum Request {
         rows: u16,
         cols: u16,
     },
+    /// A one-shot escape-code rendering of the agent's current screen,
+    /// alternate or primary, for `argus logs --screen`. Unlike `Screen`,
+    /// this is a plain readback, not an attach-restore hint: it never
+    /// signals entering the alternate screen.
+    ScreenDump {
+        target: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -259,6 +266,12 @@ pub enum Response {
     /// connection); the caller shows the box empty rather than erroring.
     ScreenPreview {
         lines: Vec<PreviewLine>,
+    },
+    /// Reply to `ScreenDump`.
+    ScreenDump {
+        rows: u16,
+        cols: u16,
+        bytes: Vec<u8>,
     },
 }
 

@@ -296,6 +296,13 @@ impl Manager {
                 let id = resolve_one(&self.registry.lock().unwrap(), &target, "screen")?;
                 Ok(Response::ScreenPreview { lines: self.screens.preview(id, rows, cols) })
             }
+            Request::ScreenDump { target } => {
+                let id = resolve_one(&self.registry.lock().unwrap(), &target, "screen")?;
+                let Some((rows, cols, bytes)) = self.screens.dump(id) else {
+                    bail!("no screen recorded yet for {target}");
+                };
+                Ok(Response::ScreenDump { rows, cols, bytes })
+            }
             Request::Watch { .. } | Request::Report { .. } => bail!("handled by the connection loop"),
         }
     }

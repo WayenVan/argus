@@ -1,7 +1,7 @@
 //! Long-running commands: `logs`, `ps -w`, `events`, `wait`.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -16,13 +16,20 @@ use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 use crate::attach;
 use crate::client::{self, Conn, PsOptions};
 
+/// Ends passive log rendering at a clean shell boundary. The allowlist means
+/// only SGR state can remain. This is never written into redirected data.
+const LOG_TERMINAL_END: &[u8] = b"\x1b[0m\r\n";
+
 // ---------------------------------------------------------------------------
 // logs
 // ---------------------------------------------------------------------------
 
 /// Prints recent output. Running agents are read from their holder (at most
 /// the 1 MiB ring buffer); exited agents from the `output.log` it left.
-pub fn logs(target: String, bytes: Option<u64>, follow: bool, raw: bool) -> Result<()> {
+pub fn logs(target: String, bytes: Option<u64>, follow: bool, raw: bool, screen: bool) -> Result<()> {
+    if screen {
+        return logs_screen(&target);
+    }
     let agent = Conn::connect()?.find(&target)?;
     // A connect failure means it exited just now; its log is on disk.
     if agent.status.is_live()
@@ -33,12 +40,40 @@ pub fn logs(target: String, bytes: Option<u64>, follow: bool, raw: bool) -> Resu
     let path = paths::output_log(&paths::agent_dir(agent.id));
     let data = std::fs::read(&path).with_context(|| format!("no output recorded for {}", agent.name))?;
     let start = bytes.map_or(0, |n| data.len().saturating_sub(n as usize));
-    let output = if raw { data[start..].to_vec() } else { argus_proto::ansi::strip_osc52(&data[start..]) };
-    io::stdout().write_all(&output)?;
+    let output = if raw { data[start..].to_vec() } else { argus_proto::ansi::filter_logs(&data[start..]) };
+    let restore_terminal = !raw && io::stdout().is_terminal();
+    let mut out = io::stdout().lock();
+    out.write_all(&output)?;
+    if restore_terminal {
+        out.write_all(LOG_TERMINAL_END)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// The manager's virtual-terminal rendering of the agent's current screen: a
+/// point-in-time snapshot of a moment, not a stream, so it takes its own path
+/// through the manager rather than the holder ring buffer `logs` otherwise
+/// reads. The bytes are entirely manager-synthesized (the same escape-code
+/// generator `attach` restore uses), never a verbatim copy of agent output,
+/// so this stays safe to print without the `LogFilter` allowlist.
+fn logs_screen(target: &str) -> Result<()> {
+    let mut conn = Conn::connect()?;
+    let Response::ScreenDump { bytes, .. } = conn.request(&Request::ScreenDump { target: target.to_string() })? else {
+        bail!("unexpected reply to ScreenDump");
+    };
+    let restore_terminal = io::stdout().is_terminal();
+    let mut out = io::stdout().lock();
+    out.write_all(&bytes)?;
+    if restore_terminal {
+        out.write_all(LOG_TERMINAL_END)?;
+    }
+    out.flush()?;
     Ok(())
 }
 
 fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, follow: bool, raw: bool) -> Result<()> {
+    let restore_terminal = !raw && io::stdout().is_terminal();
     let hello = attach::call(
         &mut stream,
         &HolderRequest::Hello { version: HOLDER_PROTOCOL_VERSION, capabilities: HOLDER_CAPABILITIES.to_vec() },
@@ -56,20 +91,20 @@ fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, foll
     attach::call(&mut stream, &subscribe)?;
 
     let mut out = io::stdout().lock();
-    let mut clipboard_filter = (!raw).then(argus_proto::ansi::Osc52Filter::default);
+    let mut log_filter = (!raw).then(argus_proto::ansi::LogFilter::default);
     while let Some((t, payload)) = frame::read_frame(&mut stream)? {
         match t {
             ty::DATA if payload.len() >= 8 => {
                 let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
                 let data = &payload[8..];
                 if follow {
-                    write_log_bytes(&mut out, &mut clipboard_filter, data)?;
+                    write_log_bytes(&mut out, &mut log_filter, data)?;
                     out.flush()?;
                     continue;
                 }
                 // Without --follow, stop at the end offset seen when we started.
                 let keep = end.saturating_sub(offset).min(data.len() as u64) as usize;
-                write_log_bytes(&mut out, &mut clipboard_filter, &data[..keep])?;
+                write_log_bytes(&mut out, &mut log_filter, &data[..keep])?;
                 if offset + data.len() as u64 >= end {
                     break;
                 }
@@ -84,10 +119,13 @@ fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, foll
             _ => {}
         }
     }
-    if let Some(filter) = &mut clipboard_filter {
+    if let Some(filter) = &mut log_filter {
         let mut tail = Vec::new();
         filter.finish(&mut tail);
         out.write_all(&tail)?;
+    }
+    if restore_terminal {
+        out.write_all(LOG_TERMINAL_END)?;
     }
     out.flush()?;
     Ok(())
@@ -95,7 +133,7 @@ fn logs_live(mut stream: UnixStream, agent: &AgentInfo, bytes: Option<u64>, foll
 
 fn write_log_bytes(
     out: &mut impl Write,
-    filter: &mut Option<argus_proto::ansi::Osc52Filter>,
+    filter: &mut Option<argus_proto::ansi::LogFilter>,
     bytes: &[u8],
 ) -> io::Result<()> {
     if let Some(filter) = filter {

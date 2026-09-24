@@ -210,13 +210,14 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let now = now_secs();
     let with_labels = agents.iter().any(|a| !a.labels.is_empty());
-    let mut header = vec!["ID", "NAME", "KIND", "STATUS", "ACTIVITY", "AGE", "ATTACHED", "CWD"];
+    let mut header = vec!["ID", "GROUP", "NAME", "KIND", "STATUS", "ACTIVITY", "AGE", "ATTACHED", "CWD"];
     if with_labels {
         header.push("LABELS");
     }
     let rows: Vec<Vec<String>> = agents
         .iter()
         .map(|a| {
+            let (group, name) = split_name(&a.name);
             let status = match (a.status.as_str(), a.exit_code) {
                 ("exited", Some(code)) => format!("exited({code})"),
                 (s, _) => s.to_string(),
@@ -228,7 +229,8 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
             let attached = if a.status.is_live() { a.attached.to_string() } else { "-".into() };
             let mut row = vec![
                 a.id.to_string(),
-                a.name.clone(),
+                group.to_string(),
+                name.to_string(),
                 a.kind.clone(),
                 status,
                 activity(a, now),
@@ -256,6 +258,12 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Splits the canonical path-shaped name for human table output. Nested
+/// groups remain intact; an ungrouped agent gets an explicit marker.
+fn split_name(name: &str) -> (&str, &str) {
+    name.rsplit_once('/').unwrap_or(("-", name))
 }
 
 /// `done 3m` — how long a result has been waiting is what matters most.
@@ -440,4 +448,16 @@ pub fn terminal_size() -> (u16, u16) {
         }
     }
     (24, 80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_name;
+
+    #[test]
+    fn table_separates_group_from_final_name() {
+        assert_eq!(split_name("codex-1"), ("-", "codex-1"));
+        assert_eq!(split_name("frontend/codex-1"), ("frontend", "codex-1"));
+        assert_eq!(split_name("company/frontend/codex-1"), ("company/frontend", "codex-1"));
+    }
 }

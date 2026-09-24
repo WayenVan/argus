@@ -106,6 +106,22 @@ impl Screens {
         ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes }
     }
 
+    /// A one-shot rendering of `id`'s current screen — alternate or primary
+    /// — for `argus logs --screen`. Unlike `get`, this never enters the
+    /// alternate screen itself: it is a readback, not an attach restore
+    /// hint, so the caller's own screen (whatever it is) is left alone.
+    pub fn dump(&self, id: u64) -> Option<(u16, u16, Vec<u8>)> {
+        let states = self.states.lock().unwrap();
+        let state = states.get(&id)?;
+        let screen = state.parser.screen();
+        let (rows, cols) = screen.size();
+        let mut bytes = screen.state_formatted();
+        append_styled_blanks(screen, &mut bytes);
+        bytes.extend(screen.cursor_state_formatted());
+        bytes.extend(screen.attributes_formatted());
+        Some((rows, cols, bytes))
+    }
+
     /// A styled crop of `id`'s screen to `rows`x`cols`, left-aligned from its
     /// top-left corner. Empty when nothing is tracked for it yet.
     pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<PreviewLine> {
@@ -397,5 +413,37 @@ mod tests {
         assert_eq!(lines[0][1].text, "bright");
         assert_eq!(lines[0][1].fg, PreviewColor::Rgb([10, 20, 30]));
         assert!(lines[0][1].bold);
+    }
+
+    #[test]
+    fn dump_is_none_before_any_state() {
+        let s = screens();
+        assert!(s.dump(1).is_none());
+    }
+
+    #[test]
+    fn dump_never_enters_the_alternate_screen() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_data(1, 0, b"\x1b[?1049hHELLO");
+        let (rows, cols, bytes) = s.dump(1).unwrap();
+        assert_eq!((rows, cols), (24, 80));
+        assert!(!bytes.starts_with(b"\x1b[?1049h"), "a readback must not toggle the caller's own screen: {bytes:?}");
+
+        let mut restored = vt100::Parser::new(24, 80, 0);
+        restored.process(&bytes);
+        assert_eq!(restored.screen().contents(), "HELLO");
+    }
+
+    #[test]
+    fn dump_works_on_the_primary_screen_too() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        s.on_data(1, 0, b"conversation line\r\n");
+        let (_, _, bytes) = s.dump(1).unwrap();
+
+        let mut restored = vt100::Parser::new(24, 80, 0);
+        restored.process(&bytes);
+        assert_eq!(restored.screen().contents().trim_end(), "conversation line");
     }
 }

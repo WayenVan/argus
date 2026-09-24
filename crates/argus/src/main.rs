@@ -77,14 +77,19 @@ enum Command {
     Logs {
         target: String,
         /// Only the last N bytes
-        #[arg(short = 'n', long, value_name = "BYTES")]
+        #[arg(short = 'n', long, value_name = "BYTES", conflicts_with = "screen")]
         bytes: Option<u64>,
         /// Keep printing new output until the agent exits
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "screen")]
         follow: bool,
         /// Write control sequences verbatim, including OSC 52 clipboard writes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "screen")]
         raw: bool,
+        /// Print the manager's virtual-terminal rendering of the agent's
+        /// current screen instead of the output stream (a point-in-time
+        /// snapshot; requires a running agent)
+        #[arg(long)]
+        screen: bool,
     },
     /// Type text into an agent without attaching (Enter is pressed after it)
     Send {
@@ -129,7 +134,7 @@ enum Command {
     },
     /// Take over an agent's terminal (detach with Ctrl-\)
     Attach {
-        /// ID or name
+        /// ID, full group/name, or a globally unique final name
         target: String,
         /// Watch only: send no input and never resize the agent
         #[arg(long)]
@@ -215,7 +220,7 @@ fn main() -> ExitCode {
             client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
         }
         Command::View { prefix, label } => view::run(prefix, label),
-        Command::Logs { target, bytes, follow, raw } => stream::logs(target, bytes, follow, raw),
+        Command::Logs { target, bytes, follow, raw, screen } => stream::logs(target, bytes, follow, raw, screen),
         Command::Send { target, text, no_enter } => client::send(target, text, !no_enter),
         Command::Rename { target, name } => client::rename(target, name),
         Command::Mv { target, group } => client::mv(target, group),
