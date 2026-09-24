@@ -1,0 +1,15 @@
+[package]
+name = "argus"
+description = "Lightweight manager for long-running terminal agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argus-proto = { workspace = true, features = ["tokio"] }
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

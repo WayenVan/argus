@@ -1,0 +1,14 @@
+[package]
+name = "argus-holder"
+description = "Per-agent PTY holder process spawned by the argus manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Keep this list short: the holder must stay small and boring. No tokio.
+[dependencies]
+argus-proto.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+nix.workspace = true
+serde_json.workspace = true

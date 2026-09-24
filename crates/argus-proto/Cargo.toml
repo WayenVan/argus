@@ -1,0 +1,16 @@
+[package]
+name = "argus-proto"
+description = "Wire protocol shared by argus, the manager and argus-holder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Async frame helpers for the manager. argus-holder must not enable this.
+tokio = ["dep:tokio"]
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, optional = true }
