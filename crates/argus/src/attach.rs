@@ -30,8 +30,11 @@ const DETACH_KEY: u8 = 0x1c;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
-/// Turns on focus reporting; sent unconditionally on attach.
-const FOCUS_REPORT: &str = "\x1b[?1004h";
+/// Argus owns an alternate screen for the whole attachment. Some agents
+/// (notably Codex) draw on the normal screen, so relying on the child to enter
+/// one leaves its last frame in the caller's scrollback after detach.
+const ENTER: &str = "\x1b[?1049h\x1b[?1004h";
+const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 /// Home + clear, for when there is no screen restore to draw instead.
 const CLEAR: &str = "\x1b[H\x1b[2J";
 /// Leaves the agent's terminal modes behind: synchronized-output hold
@@ -97,17 +100,17 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
 
     let ending = {
         let _raw = RawMode::enter()?;
-        print_raw(FOCUS_REPORT);
+        let _display = DisplaySession::enter();
         match &restore {
             // Only worth drawing if it is a real redraw of the size we are
             // about to show it at; otherwise the holder will resize the PTY
             // for real and the agent redraws itself for the new dimensions.
-            Some(r) if r.mode == ScreenMode::Snapshot && (r.rows, r.cols) == (rows, cols) => print_raw_bytes(&r.bytes),
+            Some(r) if r.mode == ScreenMode::Snapshot && (r.rows, r.cols) == (rows, cols) => {
+                print_raw_bytes(snapshot_body(&r.bytes))
+            }
             _ => print_raw(CLEAR),
         }
-        let ending = pump(stream, opts.readonly);
-        print_raw(RESET);
-        ending
+        pump(stream, opts.readonly)
     };
 
     match ending? {
@@ -377,6 +380,30 @@ impl Drop for RawMode {
     }
 }
 
+/// Keeps the agent's drawing off the caller's normal screen and restores all
+/// terminal modes even when attaching returns with an error or unwinds.
+struct DisplaySession;
+
+impl DisplaySession {
+    fn enter() -> Self {
+        print_raw(ENTER);
+        Self
+    }
+}
+
+impl Drop for DisplaySession {
+    fn drop(&mut self) {
+        print_raw(RESET);
+    }
+}
+
+/// Manager snapshots already begin by selecting the alternate screen. Attach
+/// has selected its own above, so repeating 1049h could overwrite the
+/// terminal's saved normal-screen cursor/state on some emulators.
+fn snapshot_body(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(ALT_SCREEN_ENTER).unwrap_or(bytes)
+}
+
 fn print_raw(s: &str) {
     print_raw_bytes(s.as_bytes());
 }
@@ -420,7 +447,7 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
-    use super::{find_detach, only_mouse_reports, winch_pipe};
+    use super::{find_detach, only_mouse_reports, snapshot_body, winch_pipe};
 
     #[test]
     fn detach_key_in_every_encoding() {
@@ -445,6 +472,12 @@ mod tests {
         assert!(!only_mouse_reports(b"\x1b[A"), "arrow keys are input");
         assert!(!only_mouse_reports(b"\x1b"), "a lone Esc is input");
         assert!(!only_mouse_reports(b""));
+    }
+
+    #[test]
+    fn snapshot_does_not_enter_the_attach_screen_twice() {
+        assert_eq!(snapshot_body(b"\x1b[?1049h\x1b[Hframe"), b"\x1b[Hframe");
+        assert_eq!(snapshot_body(b"\x1b[Hframe"), b"\x1b[Hframe");
     }
 
     #[test]
