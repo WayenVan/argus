@@ -45,19 +45,14 @@ pub fn normalize_group(group: &str) -> Result<Option<String>> {
 /// Derives the kind from the program name: `/usr/bin/Claude` → `claude`.
 pub fn kind_of(program: &str) -> String {
     let base = program.rsplit('/').next().unwrap_or(program).to_ascii_lowercase();
-    let kind: String = base
-        .chars()
-        .map(|c| if matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-') { c } else { '-' })
-        .collect();
+    let kind: String =
+        base.chars().map(|c| if matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-') { c } else { '-' }).collect();
     if validate_segment(&kind).is_ok() { kind } else { "agent".into() }
 }
 
 /// Picks `<group>/<kind>-<n>` with the smallest free `n` in that group.
 pub fn default_name(group: Option<&str>, kind: &str, taken: impl Fn(&str) -> bool) -> String {
-    (1..)
-        .map(|n| join(group, &format!("{kind}-{n}")))
-        .find(|name| !taken(name))
-        .expect("unbounded range")
+    (1..).map(|n| join(group, &format!("{kind}-{n}"))).find(|name| !taken(name)).expect("unbounded range")
 }
 
 pub fn join(group: Option<&str>, leaf: &str) -> String {

@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{aio, ty};
 use argus_proto::msg::{
-    AgentInfo, AgentStatus, ExitRecord, HolderReady, HolderRequest, HolderResponse, HolderSpec, Request,
+    AgentInfo, AgentStatus, ExitRecord, HolderEvent, HolderReady, HolderRequest, HolderResponse, HolderSpec, Request,
     Response, RunRequest, SubscribeLevel, now_secs,
 };
 use argus_proto::{PROTOCOL_VERSION, paths};
@@ -247,6 +247,7 @@ impl Manager {
                     reg.save()?;
                     info
                 };
+                link_name(&info.name, info.id);
                 self.watch(info.id);
                 log(&format!("started {} (id {}, holder {holder_pid}, agent {agent_pid})", info.name, info.id));
                 Ok(info)
@@ -307,12 +308,13 @@ impl Manager {
 
     /// Re-attaches to holders after a manager restart.
     fn recover(self: &Arc<Self>) {
-        let live: Vec<u64> = {
+        let live: Vec<(u64, String)> = {
             let reg = self.registry.lock().unwrap();
-            reg.agents.values().filter(|a| a.status.is_live()).map(|a| a.id).collect()
+            reg.agents.values().filter(|a| a.status.is_live()).map(|a| (a.id, a.name.clone())).collect()
         };
         log(&format!("recovering {} live agents", live.len()));
-        for id in live {
+        for (id, name) in live {
+            link_name(&name, id);
             self.watch(id);
         }
     }
@@ -321,7 +323,12 @@ impl Manager {
     fn watch(self: &Arc<Self>, id: u64) {
         let manager = self.clone();
         tokio::spawn(async move {
-            let (status, code, exited_at) = match follow_holder(id).await {
+            let on_attached = |count: u32| {
+                if let Some(agent) = manager.registry.lock().unwrap().agents.get_mut(&id) {
+                    agent.attached = count;
+                }
+            };
+            let (status, code, exited_at) = match follow_holder(id, on_attached).await {
                 Ok(Some(code)) => (AgentStatus::Exited, Some(code), Some(now_secs())),
                 Ok(None) | Err(_) => exit_from_disk(id),
             };
@@ -332,6 +339,8 @@ impl Manager {
                 agent.status = status;
                 agent.exit_code = code;
                 agent.exited_at = exited_at;
+                agent.attached = 0;
+                unlink_name(&agent.name);
                 log(&format!("{} (id {id}) is {}", agent.name, status.as_str()));
                 if let Err(e) = reg.save() {
                     log(&format!("saving registry: {e:#}"));
@@ -361,15 +370,39 @@ async fn holder_call(stream: &mut UnixStream, req: &HolderRequest) -> Result<Hol
 }
 
 /// Returns the exit code once the holder reports it, or `None` on EOF.
-async fn follow_holder(id: u64) -> Result<Option<i32>> {
+async fn follow_holder(id: u64, on_attached: impl Fn(u32)) -> Result<Option<i32>> {
     let mut stream = holder_conn(id).await?;
     holder_call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Events }).await?;
     while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
-        if t == ty::EXIT && payload.len() == 4 {
-            return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap())));
+        match t {
+            ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),
+            ty::CONTROL => match serde_json::from_slice(&payload) {
+                Ok(HolderEvent::Attached { count }) => on_attached(count),
+                Err(_) => {} // Newer holder events this manager does not know.
+            },
+            _ => {}
         }
     }
     Ok(None)
+}
+
+/// Points `holders/by-name/<name>.sock` at the holder socket so attach works
+/// by name without the manager. The holder never learns its name.
+fn link_name(name: &str, id: u64) {
+    let link = paths::name_socket(name);
+    if let Some(dir) = link.parent()
+        && let Err(e) = paths::ensure_private_dir(dir)
+    {
+        return log(&format!("creating {}: {e}", dir.display()));
+    }
+    let _ = fs::remove_file(&link);
+    if let Err(e) = std::os::unix::fs::symlink(paths::holder_socket(id), &link) {
+        log(&format!("linking {}: {e}", link.display()));
+    }
+}
+
+fn unlink_name(name: &str) {
+    let _ = fs::remove_file(paths::name_socket(name));
 }
 
 async fn signal_holder(id: u64, signal: i32) -> Result<()> {

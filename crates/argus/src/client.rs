@@ -12,6 +12,8 @@ use argus_proto::frame::{self, ty};
 use argus_proto::msg::{AgentInfo, Request, Response, RunRequest, now_secs};
 use argus_proto::{PROTOCOL_VERSION, paths};
 
+use crate::{attach, naming};
+
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Conn {
@@ -65,10 +67,7 @@ fn spawn_manager() -> Result<()> {
     let log = OpenOptions::new().create(true).append(true).open(paths::manager_log())?;
     let exe = std::env::current_exe().context("locating the argus binary")?;
     let mut cmd = Command::new(exe);
-    cmd.args(["manager", "run"])
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
+    cmd.args(["manager", "run"]).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: setsid is async-signal-safe; it detaches the manager from our terminal.
     unsafe {
         cmd.pre_exec(|| {
@@ -87,9 +86,8 @@ fn wait_for_socket(socket: &PathBuf) -> Result<UnixStream> {
         match UnixStream::connect(socket) {
             Ok(s) => return Ok(s),
             Err(e) if started.elapsed() > START_TIMEOUT => {
-                return Err(e).with_context(|| {
-                    format!("manager did not start; see {}", paths::manager_log().display())
-                });
+                return Err(e)
+                    .with_context(|| format!("manager did not start; see {}", paths::manager_log().display()));
             }
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }
@@ -100,6 +98,7 @@ pub fn run(
     name: Option<String>,
     group: Option<String>,
     cwd: Option<PathBuf>,
+    attach_after: bool,
     kind: String,
     args: Vec<String>,
 ) -> Result<()> {
@@ -121,6 +120,10 @@ pub fn run(
         cols,
     };
     match Conn::connect()?.request(&Request::Run(req))? {
+        Response::Agent { agent } if attach_after => {
+            let target = attach::Target { socket: paths::holder_socket(agent.id), name: agent.name };
+            attach::attach(&target, attach::Options { readonly: false, steal: false, replay: false })
+        }
         Response::Agent { agent } => {
             println!("{}\t{}", agent.id, agent.name);
             Ok(())
@@ -144,7 +147,7 @@ pub fn ps(prefix: Option<String>, all: bool, json: bool) -> Result<()> {
 fn print_table(agents: &[AgentInfo]) {
     let home = std::env::var("HOME").unwrap_or_default();
     let now = now_secs();
-    let rows: Vec<[String; 6]> = agents
+    let rows: Vec<[String; 7]> = agents
         .iter()
         .map(|a| {
             let status = match (a.status.as_str(), a.exit_code) {
@@ -155,10 +158,19 @@ fn print_table(agents: &[AgentInfo]) {
                 Some(rest) if !home.is_empty() => format!("~{rest}"),
                 _ => a.cwd.clone(),
             };
-            [a.id.to_string(), a.name.clone(), a.kind.clone(), status, age(now.saturating_sub(a.created_at)), cwd]
+            let attached = if a.status.is_live() { a.attached.to_string() } else { "-".into() };
+            [
+                a.id.to_string(),
+                a.name.clone(),
+                a.kind.clone(),
+                status,
+                age(now.saturating_sub(a.created_at)),
+                attached,
+                cwd,
+            ]
         })
         .collect();
-    let header = ["ID", "NAME", "KIND", "STATUS", "AGE", "CWD"].map(String::from);
+    let header = ["ID", "NAME", "KIND", "STATUS", "AGE", "ATTACHED", "CWD"].map(String::from);
     let mut widths = header.clone().map(|h| h.len());
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
@@ -178,6 +190,25 @@ fn age(secs: u64) -> String {
         s if s < 86400 => format!("{}h", s / 3600),
         s => format!("{}d", s / 86400),
     }
+}
+
+pub fn attach(target: String, opts: attach::Options) -> Result<()> {
+    let from_manager = match Conn::open(false)? {
+        Some(mut conn) => {
+            let Response::Agents { agents } = conn.request(&Request::List { all: true, prefix: None })? else {
+                bail!("unexpected reply to List");
+            };
+            let ids = naming::resolve(&target, agents.iter())?;
+            let [id] = ids[..] else { bail!("{target} matches {} agents; attach takes one", ids.len()) };
+            let agent = agents.iter().find(|a| a.id == id).expect("resolved from this list");
+            if !agent.status.is_live() {
+                bail!("{} has {}", agent.name, agent.status.as_str());
+            }
+            Some((id, agent.name.clone()))
+        }
+        None => None,
+    };
+    attach::attach(&attach::resolve(&target, from_manager)?, opts)
 }
 
 pub fn kill(target: String, signal: Option<i32>) -> Result<()> {
@@ -230,7 +261,7 @@ pub fn manager_status() -> Result<()> {
     Ok(())
 }
 
-fn terminal_size() -> (u16, u16) {
+pub fn terminal_size() -> (u16, u16) {
     // SAFETY: TIOCGWINSZ fills a winsize struct; failure leaves it zeroed.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO] {

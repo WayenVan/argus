@@ -166,10 +166,40 @@ pub enum SubscribeLevel {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum HolderRequest {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Info,
-    Subscribe { level: SubscribeLevel },
-    Signal { signal: i32 },
+    Subscribe {
+        level: SubscribeLevel,
+    },
+    Signal {
+        signal: i32,
+    },
+    /// Switches the connection to stream mode after `Ok`.
+    Attach(AttachRequest),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AttachRequest {
+    pub rows: u16,
+    pub cols: u16,
+    /// Never forwards input and never decides the PTY size.
+    #[serde(default)]
+    pub readonly: bool,
+    /// Disconnects every other attached client first.
+    #[serde(default)]
+    pub steal: bool,
+    /// Sends the ring buffer before live output.
+    #[serde(default)]
+    pub replay: bool,
+}
+
+/// Pushed by the holder to subscribers as control frames.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum HolderEvent {
+    Attached { count: u32 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -190,6 +220,8 @@ pub struct HolderInfo {
     #[serde(default)]
     pub exit_code: Option<i32>,
     pub output_offset: u64,
+    #[serde(default)]
+    pub attached: u32,
 }
 
 /// `agents/<id>/exit.json`, written by the holder when the agent exits.
@@ -200,8 +232,5 @@ pub struct ExitRecord {
 }
 
 pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }

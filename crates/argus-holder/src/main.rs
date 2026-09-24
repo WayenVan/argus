@@ -8,6 +8,8 @@
 //! The holder forks once at startup so that it is adopted by init and never
 //! becomes the manager's child: the manager can die or be upgraded freely.
 
+mod conn;
+mod ring;
 mod server;
 mod spawn;
 

@@ -3,6 +3,7 @@
 //! This binary is both the client (every user-facing subcommand) and the
 //! manager (`argus manager run`, started automatically by the first client).
 
+mod attach;
 mod client;
 mod manager;
 mod naming;
@@ -31,6 +32,9 @@ enum Command {
         /// Working directory (default: current directory)
         #[arg(long)]
         cwd: Option<std::path::PathBuf>,
+        /// Attach right after starting
+        #[arg(short, long)]
+        attach: bool,
         /// Program to run; its name becomes the agent kind
         kind: String,
         /// Arguments passed to the program
@@ -46,6 +50,20 @@ enum Command {
         all: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Take over an agent's terminal (detach with Ctrl-\)
+    Attach {
+        /// ID or name
+        target: String,
+        /// Watch only: send no input and never resize the agent
+        #[arg(long)]
+        ro: bool,
+        /// Disconnect every other attached terminal first
+        #[arg(long)]
+        steal: bool,
+        /// Print recent output before live output
+        #[arg(long)]
+        replay: bool,
     },
     /// Stop an agent (SIGTERM, then SIGKILL after 5s)
     Kill {
@@ -84,7 +102,10 @@ enum ManagerAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Run { name, group, cwd, kind, args } => client::run(name, group, cwd, kind, args),
+        Command::Run { name, group, cwd, attach, kind, args } => client::run(name, group, cwd, attach, kind, args),
+        Command::Attach { target, ro, steal, replay } => {
+            client::attach(target, attach::Options { readonly: ro, steal, replay })
+        }
         Command::Ps { prefix, all, json } => client::ps(prefix, all, json),
         Command::Kill { target, signal } => client::kill(target, signal),
         Command::Rm { target } => client::rm(target),

@@ -55,6 +55,12 @@ pub fn holder_socket(id: u64) -> PathBuf {
     holders_dir().join(format!("{id}.sock"))
 }
 
+/// Symlink to the holder socket, maintained by the manager so that `attach`
+/// works by name without asking it. Nested names become nested directories.
+pub fn name_socket(name: &str) -> PathBuf {
+    holders_dir().join("by-name").join(format!("{name}.sock"))
+}
+
 pub fn registry_file() -> PathBuf {
     state_dir().join("agents.json")
 }
