@@ -9,6 +9,7 @@ pub(crate) mod driver;
 mod holder;
 mod registry;
 mod screen;
+mod send;
 mod watch;
 
 use std::fs::{self, File, OpenOptions};
@@ -233,19 +234,7 @@ impl Manager {
                 reg.save()?;
                 Ok(Response::Pruned { agents })
             }
-            Request::Send { target, text } => {
-                let id = {
-                    let reg = self.registry.lock().unwrap();
-                    let id = resolve_one(&reg, &target, "send")?;
-                    if !reg.info(id).status.is_live() {
-                        bail!("{} is not running", reg.info(id).name);
-                    }
-                    id
-                };
-                holder::write(id, text).await?;
-                self.on_fact(id, Fact::Input);
-                Ok(Response::Ok)
-            }
+            Request::Send { target, text, enter, force } => self.send(&target, text, enter, force).await,
             Request::Rename { target, name } => {
                 Ok(Response::Agent { agent: self.rename(&target, &name)?, warnings: vec![] })
             }

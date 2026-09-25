@@ -123,10 +123,19 @@ pub enum Request {
         #[serde(default)]
         kill_agents: bool,
     },
-    /// Writes input to the agent without attaching.
+    /// Types `text` into the agent without attaching, then presses Enter if
+    /// `enter` is set. Refused with code `not_ready` unless the agent is
+    /// waiting for a prompt (`idle` or `done`), nobody attached has typed
+    /// recently, and no earlier send is still being submitted. `force` skips
+    /// those checks, except that a `blocked` agent is always refused: a
+    /// keypress there answers its permission prompt.
     Send {
         target: String,
         text: String,
+        #[serde(default)]
+        enter: bool,
+        #[serde(default)]
+        force: bool,
     },
     Rename {
         target: String,
@@ -519,6 +528,13 @@ pub struct HolderInfo {
 pub struct ExitRecord {
     pub code: i32,
     pub exited_at: u64,
+}
+
+/// Whether an agent with this activity is waiting for a prompt, so typing
+/// one (`argus send`) is safe. `done` counts: it is `idle` that nobody has
+/// looked at yet.
+pub fn awaits_prompt(activity: &str) -> bool {
+    matches!(activity, "idle" | "done")
 }
 
 pub fn now_secs() -> u64 {

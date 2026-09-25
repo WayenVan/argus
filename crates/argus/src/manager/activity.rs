@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argus_proto::msg::now_secs;
+use argus_proto::msg::{awaits_prompt, now_secs};
 use serde_json::Value;
 
 use super::driver::{self, Hint};
@@ -82,16 +82,19 @@ impl Manager {
                 let seen = gained_focus && rec.info.activity == "done" && set(rec, "idle");
                 attach_changed || seen
             }
-            Fact::Input => match rec.info.activity.as_str() {
-                "done" => set(rec, "idle"),
-                // Answering a permission prompt takes a keypress; the tool
-                // that asked now runs.
-                "blocked" => {
-                    let next = rec.runtime.last_tool.as_ref().map_or("working".into(), |t| format!("tool:{t}"));
-                    set(rec, &next)
+            Fact::Input => {
+                rec.runtime.last_input = Some(Instant::now());
+                match rec.info.activity.as_str() {
+                    "done" => set(rec, "idle"),
+                    // Answering a permission prompt takes a keypress; the
+                    // tool that asked now runs.
+                    "blocked" => {
+                        let next = rec.runtime.last_tool.as_ref().map_or("working".into(), |t| format!("tool:{t}"));
+                        set(rec, &next)
+                    }
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             Fact::Ack => rec.info.activity == "done" && set(rec, "idle"),
         };
         if changed {
@@ -231,6 +234,9 @@ fn set(rec: &mut AgentRecord, activity: &str) -> bool {
     }
     rec.info.activity = activity.to_string();
     rec.info.activity_since = Some(now_secs());
+    if !awaits_prompt(activity) {
+        rec.runtime.submitting = None; // The sent prompt went through.
+    }
     true
 }
 

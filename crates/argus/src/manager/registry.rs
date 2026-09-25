@@ -38,6 +38,12 @@ pub struct AgentRuntime {
     /// Bumped each time the agent enters `working`, so the watchdog takes a
     /// fresh output baseline for every working period.
     pub working_gen: u64,
+    /// When an attached terminal last typed into the agent.
+    pub last_input: Option<Instant>,
+    /// Set by `argus send` until the agent leaves `idle`/`done` (the prompt
+    /// was submitted) or this deadline passes, so a second send cannot land
+    /// on top of the first.
+    pub submitting: Option<Instant>,
 }
 
 impl AgentRecord {

@@ -122,6 +122,12 @@ impl Screens {
         Some((rows, cols, bytes))
     }
 
+    /// Whether `id` has turned on bracketed paste; `None` when nothing is
+    /// tracked for it yet.
+    pub fn bracketed_paste(&self, id: u64) -> Option<bool> {
+        self.states.lock().unwrap().get(&id).map(|s| s.parser.screen().bracketed_paste())
+    }
+
     /// A styled crop of `id`'s screen to `rows`x`cols`, left-aligned from its
     /// top-left corner. Empty when nothing is tracked for it yet.
     pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<PreviewLine> {

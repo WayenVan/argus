@@ -70,7 +70,7 @@ impl Conn {
             bail!("unexpected frame type {t:#x} from manager");
         }
         match serde_json::from_slice(&payload)? {
-            Response::Error { message, .. } => bail!(message),
+            Response::Error { code, message } => Err(ManagerError { code, message }.into()),
             resp => Ok(Some(resp)),
         }
     }
@@ -89,6 +89,28 @@ impl Conn {
         let [id] = ids[..] else { bail!("{target} matches {} agents", ids.len()) };
         let idx = agents.iter().position(|a| a.id == id).expect("resolved from this list");
         Ok(agents.swap_remove(idx))
+    }
+}
+
+/// An error reply from the manager, kept typed so callers can tell a refusal
+/// they can wait out (`not_ready`) from a failure.
+#[derive(Debug)]
+pub struct ManagerError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ManagerError {}
+
+impl ManagerError {
+    pub fn has_code(e: &anyhow::Error, code: &str) -> bool {
+        e.downcast_ref::<ManagerError>().is_some_and(|m| m.code == code)
     }
 }
 
@@ -328,20 +350,6 @@ pub fn prune(prefix: Option<String>, older_than: Option<u64>) -> Result<()> {
         println!("{}\t{}", a.id, a.name);
     }
     eprintln!("removed {} exited agent{}", agents.len(), if agents.len() == 1 { "" } else { "s" });
-    Ok(())
-}
-
-/// Types `text` into the agent. Enter is sent as a separate write so TUIs
-/// see a keypress rather than a pasted line ending.
-pub fn send(target: String, text: String, enter: bool) -> Result<()> {
-    let mut conn = Conn::connect()?;
-    if !text.is_empty() {
-        conn.request(&Request::Send { target: target.clone(), text })?;
-    }
-    if enter {
-        std::thread::sleep(Duration::from_millis(30));
-        conn.request(&Request::Send { target, text: "\r".into() })?;
-    }
     Ok(())
 }
 

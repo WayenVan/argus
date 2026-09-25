@@ -14,7 +14,7 @@ use argus_proto::msg::{
 use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 
 use crate::attach;
-use crate::client::{self, Conn, PsOptions};
+use crate::client::{self, Conn, ManagerError, PsOptions};
 
 /// Ends passive log rendering at a clean shell boundary. The allowlist means
 /// only SGR state can remain. This is never written into redirected data.
@@ -330,4 +330,126 @@ pub fn wait(target: String, until: String, timeout: Option<u64>) -> Result<()> {
             Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => bail!("lost connection to the manager"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// send
+// ---------------------------------------------------------------------------
+
+/// Exit code when the agent is not waiting for a prompt (`EX_TEMPFAIL`).
+const NOT_READY: i32 = 75;
+/// How long `--then-wait` gives a sent prompt to show up as activity.
+const PICKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct SendOptions {
+    /// The prompt; `-` reads it from stdin.
+    pub text: String,
+    pub enter: bool,
+    pub force: bool,
+    /// Wait until the agent can take the prompt instead of failing.
+    pub wait: bool,
+    /// After sending, block until the agent is waiting on someone again.
+    pub then_wait: bool,
+    pub timeout: Option<u64>,
+}
+
+/// Types a prompt into an agent, but only while it waits for one; the
+/// manager decides, so the check and the typing cannot race.
+pub fn send(target: String, opts: SendOptions) -> Result<()> {
+    let text = if opts.text == "-" {
+        let mut text = String::new();
+        io::Read::read_to_string(&mut io::stdin(), &mut text).context("reading the prompt from stdin")?;
+        let trimmed = text.trim_end_matches(['\n', '\r']).len();
+        text.truncate(trimmed);
+        text
+    } else {
+        opts.text
+    };
+    let deadline = opts.timeout.map(|s| Instant::now() + Duration::from_secs(s));
+    let mut conn = Conn::connect()?;
+    if !opts.wait && !opts.then_wait {
+        let request = Request::Send { target, text, enter: opts.enter, force: opts.force };
+        return conn.request(&request).map(drop).map_err(exit_if_not_ready);
+    }
+
+    // Watch before sending, so no activity change after the send is missed.
+    let agent = conn.find(&target)?;
+    let (agents, rx) = start_watch(Some(vec![agent.id]), true)?;
+    let mut current = agents.into_iter().next().unwrap_or(agent);
+    let request = Request::Send { target: current.id.to_string(), text, enter: opts.enter, force: opts.force };
+    loop {
+        if opts.force || argus_proto::msg::awaits_prompt(&current.activity) {
+            match conn.request(&request) {
+                Ok(_) => break,
+                Err(e) if opts.wait && ManagerError::has_code(&e, "not_ready") => {}
+                Err(e) => return Err(exit_if_not_ready(e)),
+            }
+        } else if !opts.wait {
+            return Err(exit_if_not_ready(anyhow::anyhow!(ManagerError {
+                code: "not_ready".into(),
+                message: format!("{} is {}, not waiting for a prompt", current.name, current.activity),
+            })));
+        }
+        // Someone typing clears without an activity change, so poll too.
+        next_update(&rx, &mut current, deadline, Duration::from_secs(1))?;
+    }
+    if !opts.then_wait {
+        return Ok(());
+    }
+
+    let sent = current.clone();
+    let sent_at = Instant::now();
+    let mut picked_up = false;
+    loop {
+        // A quick turn can go idle → working → done between two updates.
+        picked_up |= current.activity != sent.activity || current.activity_since != sent.activity_since;
+        if picked_up && (argus_proto::msg::awaits_prompt(&current.activity) || is_stuck(&current.activity)) {
+            println!("{}", current.activity);
+            std::process::exit(if is_stuck(&current.activity) { 1 } else { 0 });
+        }
+        if !picked_up && sent_at.elapsed() > PICKUP_TIMEOUT {
+            bail!("{} has not picked up the prompt", current.name);
+        }
+        next_update(&rx, &mut current, deadline, Duration::from_secs(1))?;
+    }
+}
+
+/// Activities in which the agent waits on a person but not with a result.
+fn is_stuck(activity: &str) -> bool {
+    matches!(activity, "blocked" | "error" | "unknown")
+}
+
+fn exit_if_not_ready(e: anyhow::Error) -> anyhow::Error {
+    if ManagerError::has_code(&e, "not_ready") {
+        eprintln!("argus: {e}");
+        std::process::exit(NOT_READY);
+    }
+    e
+}
+
+/// Waits at most `poll` for the next change to `current`. Exits 124 once
+/// `deadline` passes; fails if the agent stops running.
+fn next_update(rx: &Messages, current: &mut AgentInfo, deadline: Option<Instant>, poll: Duration) -> Result<()> {
+    let wait_for = deadline.map_or(poll, |d| d.saturating_duration_since(Instant::now()).min(poll));
+    match rx.recv_timeout(wait_for) {
+        Ok(Ok(Some(msg))) => {
+            let mut table = BTreeMap::from([(current.id, current.clone())]);
+            apply(&mut table, &msg);
+            match table.remove(&current.id) {
+                Some(a) => *current = a,
+                None => bail!("{} was removed", current.name),
+            }
+        }
+        Err(RecvTimeoutError::Timeout) => {}
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => bail!("lost connection to the manager"),
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        eprintln!("timed out waiting for {}", current.name);
+        std::process::exit(124);
+    }
+    if !current.status.is_live() {
+        bail!("{} {}", current.name, current.status.as_str());
+    }
+    Ok(())
 }

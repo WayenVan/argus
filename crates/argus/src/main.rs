@@ -101,13 +101,29 @@ enum Command {
         #[arg(long)]
         screen: bool,
     },
-    /// Type text into an agent without attaching (Enter is pressed after it)
+    /// Type a prompt into an agent and press Enter, only while it is idle
+    /// (or done); otherwise exit 75
     Send {
         target: String,
+        /// The prompt; `-` reads it from stdin. Multi-line text is pasted
         text: String,
         /// Do not press Enter after the text
         #[arg(short = 'n', long)]
         no_enter: bool,
+        /// Send even if the agent is not idle (never while it is blocked on
+        /// a permission prompt)
+        #[arg(long)]
+        force: bool,
+        /// Wait until the agent is idle instead of failing
+        #[arg(short, long)]
+        wait: bool,
+        /// After sending, block until the agent finishes the turn; prints
+        /// the activity it ends in (exit 1 if blocked, error or unknown)
+        #[arg(long, conflicts_with = "no_enter")]
+        then_wait: bool,
+        /// Give up after this many seconds, counting both waits (exit 124)
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
     },
     /// Rename an agent: a new last segment, a full path, or `group/`
     Rename { target: String, name: String },
@@ -232,7 +248,9 @@ fn main() -> ExitCode {
         Command::Grid { prefix, label } => tui::run(tui::Mode::Grid, prefix, label),
         Command::Tree { prefix, label } => tui::run(tui::Mode::Tree, prefix, label),
         Command::Logs { target, bytes, follow, raw, screen } => stream::logs(target, bytes, follow, raw, screen),
-        Command::Send { target, text, no_enter } => client::send(target, text, !no_enter),
+        Command::Send { target, text, no_enter, force, wait, then_wait, timeout } => {
+            stream::send(target, stream::SendOptions { text, enter: !no_enter, force, wait, then_wait, timeout })
+        }
         Command::Rename { target, name } => client::rename(target, name),
         Command::Mv { target, group } => client::mv(target, group),
         Command::Label { target, changes } => client::label(target, changes),
