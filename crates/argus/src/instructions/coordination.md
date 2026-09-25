@@ -55,3 +55,13 @@ Decide on availability. Unless the user says otherwise:
 - A named agent that exits before becoming free fails the wait (error code exited).
 - Programs without hooks (any kind but claude, codex, opencode, pi and omp) count as free
   once they stop printing, even while still working; wait for them with --until exited.
+
+## Sending, only when the user asks
+
+  argus send <id> '<prompt>' --then-wait --timeout <secs>
+                                   type a prompt and wait for the turn it starts;
+                                   --wait first waits until the agent can take one
+
+- A refusal says why (active, blocked, unknown). Do not retry with --force unless the user
+  says so or `argus inspect <id> --screen` shows it at an empty prompt; argus never types
+  into a blocked agent.

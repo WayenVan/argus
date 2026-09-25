@@ -8,8 +8,14 @@ argus send --wait --then-wait fix-bug "Fix the failing test"
 argus logs --screen fix-bug
 ```
 
-- `argus send` types only while the agent is `idle` or `done`. Otherwise it
-  exits with code 75. Use `--wait` to wait instead.
+- `argus send` types only while the agent is at its prompt: `idle`, `done`
+  or `error`. Otherwise it exits with code 75 and says why, e.g. `fix-bug is
+  active (tool:Bash), not waiting for a prompt`. Use `--wait` to wait instead.
+  `--force` types anyway (for `quiet`, `unknown` or a busy agent you know is
+  at its prompt), except into a `blocked` agent, where a keypress would answer
+  the permission prompt.
+- Prompts go in as a bracketed paste when the agent accepts pastes, then
+  Enter, so the agent cannot take the Enter for part of the text.
 - `argus wait <agent>...` blocks until every agent named is `free`: its turn
   is over (`idle`, `done` or `quiet`). `--until` takes another availability,
   e.g. `--until exited` for the process to end, which passes on the exit code

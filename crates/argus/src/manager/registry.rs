@@ -9,7 +9,7 @@ use std::fs;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use argus_proto::msg::AgentInfo;
+use argus_proto::msg::{Activity, AgentInfo};
 use argus_proto::paths;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -55,6 +55,9 @@ impl AgentRecord {
 pub struct Registry {
     pub next_id: u64,
     pub agents: BTreeMap<u64, AgentRecord>,
+    /// Activities the previous manager left agents in, for `recover` to
+    /// restore if the agent printed nothing since (see [`Settled`]).
+    pub restore: BTreeMap<u64, Restore>,
     /// Bumped on every change; watch events carry it.
     pub seq: u64,
     changes: broadcast::Sender<u64>,
@@ -64,6 +67,39 @@ pub struct Registry {
 struct RegistryFile {
     next_id: u64,
     agents: Vec<AgentInfo>,
+    /// Written only by a manager stopping cleanly: the output offset of each
+    /// agent it left at its prompt. Any later save drops it, so a manager
+    /// that crashes afterwards leaves nothing stale behind.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    settled: Settled,
+}
+
+/// Agent ID → how many bytes of output it had produced when the manager
+/// stopped with the agent at its prompt.
+pub type Settled = BTreeMap<u64, u64>;
+
+/// An activity to restore once the holder confirms `offset` is still where
+/// output ends: an agent that printed nothing cannot have moved on.
+pub struct Restore {
+    pub activity: Activity,
+    pub since: Option<u64>,
+    pub offset: u64,
+}
+
+/// Clears what a new manager cannot trust in a loaded agent: holders report
+/// the real attach count on subscribe, and hook state from before the restart
+/// may be stale. Returns the activity to restore if the agent was left at its
+/// prompt by a manager that stopped cleanly.
+fn reset(info: &mut AgentInfo, settled: &Settled) -> Option<Restore> {
+    info.attached = 0;
+    info.tmux_locations.clear();
+    if !info.status.is_live() {
+        return None;
+    }
+    let activity = std::mem::replace(&mut info.activity, Activity::Unknown);
+    let since = info.activity_since.take();
+    let &offset = settled.get(&info.id)?;
+    activity.awaits_prompt().then_some(Restore { activity, since, offset })
 }
 
 impl Registry {
@@ -71,20 +107,18 @@ impl Registry {
         let path = paths::registry_file();
         let file: RegistryFile = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegistryFile { next_id: 1, agents: vec![] },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                RegistryFile { next_id: 1, agents: vec![], settled: Settled::new() }
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        let mut restore = BTreeMap::new();
         let agents: BTreeMap<u64, AgentRecord> = file
             .agents
             .into_iter()
             .map(|mut info| {
-                // Holders report the real attach count on subscribe, and hook
-                // state from before the restart can no longer be trusted.
-                info.attached = 0;
-                info.tmux_locations.clear();
-                if info.status.is_live() {
-                    info.activity = "unknown".into();
-                    info.activity_since = None;
+                if let Some(r) = reset(&mut info, &file.settled) {
+                    restore.insert(info.id, r);
                 }
                 (info.id, AgentRecord::new(info))
             })
@@ -92,10 +126,19 @@ impl Registry {
         // Never hand out an ID twice, even if the counter was lost.
         let next_id = file.next_id.max(agents.keys().max().map_or(1, |m| m + 1));
         let (changes, _) = broadcast::channel(CHANGE_BACKLOG);
-        Ok(Registry { next_id, agents, seq: 0, changes })
+        Ok(Registry { next_id, agents, restore, seq: 0, changes })
     }
 
     pub fn save(&self) -> Result<()> {
+        self.save_with(Settled::new())
+    }
+
+    /// The last save of a manager stopping cleanly; see [`RegistryFile::settled`].
+    pub fn save_settled(&self, settled: Settled) -> Result<()> {
+        self.save_with(settled)
+    }
+
+    fn save_with(&self, settled: Settled) -> Result<()> {
         let path = paths::registry_file();
         let tmp = path.with_extension("json.tmp");
         let agents = self
@@ -106,7 +149,7 @@ impl Registry {
                 info
             })
             .collect();
-        let file = RegistryFile { next_id: self.next_id, agents };
+        let file = RegistryFile { next_id: self.next_id, agents, settled };
         fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
         fs::rename(&tmp, &path)?;
         Ok(())
@@ -173,6 +216,7 @@ mod tests {
         Registry {
             next_id: agents.iter().map(|a| a.id + 1).max().unwrap_or(1),
             agents: agents.into_iter().map(|a| (a.id, AgentRecord::new(a))).collect(),
+            restore: BTreeMap::new(),
             seq: 0,
             changes,
         }
@@ -182,6 +226,22 @@ mod tests {
     fn an_exited_agents_name_is_free_again() {
         let reg = registry(vec![agent(1, "codex-1", AgentStatus::Exited)]);
         assert!(!reg.name_taken("codex-1"));
+    }
+
+    #[test]
+    fn a_clean_stop_restores_agents_left_at_their_prompt() {
+        let settled = Settled::from([(1, 500)]);
+        let mut done =
+            AgentInfo { activity: "done".into(), activity_since: Some(7), ..agent(1, "a", AgentStatus::Running) };
+        let r = reset(&mut done, &settled).unwrap();
+        assert_eq!((r.activity, r.since, r.offset), (Activity::Done, Some(7), 500));
+        assert_eq!((done.activity, done.activity_since), (Activity::Unknown, None), "unknown until confirmed");
+
+        let mut working = AgentInfo { activity: "working".into(), ..agent(1, "a", AgentStatus::Running) };
+        assert!(reset(&mut working, &settled).is_none(), "mid-turn");
+        let mut unsettled = AgentInfo { activity: "idle".into(), ..agent(2, "b", AgentStatus::Running) };
+        assert!(reset(&mut unsettled, &settled).is_none(), "crashed manager: no offset");
+        assert_eq!(unsettled.activity, Activity::Unknown);
     }
 
     #[test]

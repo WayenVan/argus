@@ -380,10 +380,8 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
                 Err(e) => return Err(e),
             }
         } else if !opts.wait {
-            return Err(coded(
-                NOT_READY,
-                format!("{} is {}, not waiting for a prompt", current.name, current.activity),
-            ));
+            let why = current.activity.send_refusal().unwrap_or_default();
+            return Err(coded(NOT_READY, format!("{} {why}", current.name)));
         }
         // Someone typing clears without an activity change, so poll too.
         next_update(&rx, &mut current, deadline, Duration::from_secs(1))?;

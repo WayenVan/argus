@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{aio, ty};
 use argus_proto::msg::{
-    AgentInfo, AgentStatus, HolderEvent, MANAGER_CAPABILITIES, Request, Response, RunRequest, now_secs,
+    Activity, AgentInfo, AgentStatus, HolderEvent, MANAGER_CAPABILITIES, Request, Response, RunRequest, now_secs,
 };
 use argus_proto::{MANAGER_PROTOCOL_VERSION, paths};
 use nix::fcntl::{Flock, FlockArg};
@@ -32,11 +32,13 @@ use tokio::sync::Notify;
 
 use crate::naming;
 use activity::Fact;
-use registry::{AgentRecord, Registry};
+use registry::{AgentRecord, Registry, Restore, Settled};
 use screen::Screens;
 
 /// Longer than the holder's SIGTERM → SIGKILL grace period.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
+/// How long a stopping manager waits for each holder's output offset.
+const SETTLE_QUERY: Duration = Duration::from_millis(500);
 
 pub fn run() -> Result<()> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(serve())
@@ -112,6 +114,7 @@ async fn serve() -> Result<()> {
         }
     }
 
+    manager.record_settled().await;
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(paths::manager_pid());
     log("manager stopped");
@@ -457,15 +460,67 @@ impl Manager {
 
     /// Re-attaches to holders after a manager restart.
     fn recover(self: &Arc<Self>) {
-        let live: Vec<(u64, String)> = {
-            let reg = self.registry.lock().unwrap();
-            reg.infos().filter(|a| a.status.is_live()).map(|a| (a.id, a.name.clone())).collect()
+        let (live, restore) = {
+            let mut reg = self.registry.lock().unwrap();
+            let live: Vec<(u64, String)> =
+                reg.infos().filter(|a| a.status.is_live()).map(|a| (a.id, a.name.clone())).collect();
+            (live, std::mem::take(&mut reg.restore))
         };
         log(&format!("recovering {} live agents", live.len()));
         for (id, name) in live {
             holder::link_name(&name, id);
             // Not `ready_on_cursor`: a recovered agent may be mid-turn.
             self.follow(id, false);
+        }
+        for (id, restore) in restore {
+            tokio::spawn(self.clone().restore(id, restore));
+        }
+    }
+
+    /// Gives an agent back the activity the previous manager left it in, if
+    /// it has printed nothing since: the only sign of it moving on we have
+    /// while no hook could reach a manager.
+    async fn restore(self: Arc<Self>, id: u64, restore: Restore) {
+        let offset = holder::output_offset(id).await.ok();
+        let mut reg = self.registry.lock().unwrap();
+        let Some(rec) = reg.agents.get_mut(&id) else { return };
+        // A hook may have reported something newer meanwhile.
+        if !rec.info.status.is_live() || rec.info.activity != Activity::Unknown {
+            return;
+        }
+        if offset != Some(restore.offset) {
+            let name = rec.info.name.clone();
+            return log(&format!("{name} printed output while the manager was down; its activity stays unknown"));
+        }
+        rec.info.activity = restore.activity;
+        rec.info.activity_since = restore.since;
+        reg.changed(id);
+    }
+
+    /// On a clean stop, notes the output offset of each agent at its prompt,
+    /// so the next manager can restore it (see `restore`).
+    async fn record_settled(&self) {
+        let candidates: Vec<(u64, Option<u64>)> = {
+            let reg = self.registry.lock().unwrap();
+            reg.infos()
+                .filter(|a| a.status.is_live() && a.activity.awaits_prompt())
+                .map(|a| (a.id, a.activity_since))
+                .collect()
+        };
+        let mut settled = Settled::new();
+        for &(id, _) in &candidates {
+            if let Ok(Ok(offset)) = tokio::time::timeout(SETTLE_QUERY, holder::output_offset(id)).await {
+                settled.insert(id, offset);
+            }
+        }
+        let reg = self.registry.lock().unwrap();
+        // A hook that landed while we asked means the agent moved on.
+        let unchanged = |id: &u64, since: Option<u64>| {
+            reg.agents.get(id).is_some_and(|r| r.info.activity.awaits_prompt() && r.info.activity_since == since)
+        };
+        settled.retain(|id, _| candidates.iter().any(|&(c, since)| c == *id && unchanged(id, since)));
+        if let Err(e) = reg.save_settled(settled) {
+            log(&format!("saving the registry: {e:#}"));
         }
     }
 

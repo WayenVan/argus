@@ -79,10 +79,28 @@ pub enum Availability {
 
 impl Activity {
     /// Whether typing a prompt (`argus send`) is safe. `done` counts: it is
-    /// `idle` that nobody has looked at yet. `quiet` does not: a hook-less
-    /// agent may just be thinking.
+    /// `idle` that nobody has looked at yet, and so does `error`: the turn
+    /// ended and the agent is back at its prompt. `quiet` does not: a
+    /// hook-less agent may just be thinking.
     pub fn awaits_prompt(&self) -> bool {
-        matches!(self, Activity::Idle | Activity::Done)
+        matches!(self, Activity::Idle | Activity::Done | Activity::Error)
+    }
+
+    /// Why `argus send` will not type into an agent doing this, in words
+    /// that follow its name; `None` when it will. `blocked` is refused even
+    /// with `--force`, the rest only without it.
+    pub fn send_refusal(&self) -> Option<String> {
+        Some(match self {
+            _ if self.awaits_prompt() => return None,
+            Activity::Blocked => "needs attention (blocked on a permission prompt); attach to answer it".into(),
+            Activity::Quiet => {
+                "is quiet (no hooks, so it may still be working); use --force if it is at its prompt".into()
+            }
+            Activity::Unknown => "is unknown (e.g. interrupted, or the manager restarted mid-turn); \
+                                  use --force if it is at its prompt"
+                .into(),
+            other => format!("is {} ({other}), not waiting for a prompt", other.availability()),
+        })
     }
 
     /// The one mapping from activity to availability. `quiet` counts as free
@@ -737,6 +755,20 @@ mod compatibility_tests {
         ] {
             assert_eq!(Activity::from(text).availability(), expected, "{text}");
         }
+    }
+
+    #[test]
+    fn send_refusals() {
+        for ok in ["idle", "done", "error"] {
+            assert_eq!(Activity::from(ok).send_refusal(), None, "{ok}");
+        }
+        assert_eq!(
+            Activity::from("tool:Bash").send_refusal().unwrap(),
+            "is active (tool:Bash), not waiting for a prompt"
+        );
+        assert!(Activity::Blocked.send_refusal().unwrap().starts_with("needs attention (blocked"));
+        assert!(Activity::Quiet.send_refusal().unwrap().contains("--force"));
+        assert!(Activity::Unknown.send_refusal().unwrap().contains("the manager restarted mid-turn); use --force"));
     }
 
     #[test]

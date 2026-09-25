@@ -55,6 +55,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `argus send` also types into an agent in `error`: the turn is over and the
+  agent is back at its prompt. Refusals name the availability, e.g. `is active
+  (tool:Bash)` or `needs attention (blocked …)`, and say when `--force` helps.
+- A manager that stops cleanly notes the output offset of each agent at its
+  prompt; the next one gives such an agent its activity back if it printed
+  nothing since, instead of leaving it `unknown` until its next hook.
+- The instruction argus adds to agents explains `argus send`, and when not to
+  use `--force`.
+
 - `--json` output follows one convention. Every object carries `"schema": 1`,
   and agents gain `group`, `availability` (`free`, `active`, `attention`,
   `unknown`, `exited`) and `activity_age_secs`. Under `--json`, errors go to

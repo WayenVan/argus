@@ -86,16 +86,13 @@ impl Manager {
 
 /// Why typing into `rec` now would be unsafe, if it would.
 fn refusal(rec: &AgentRecord, force: bool, now: Instant) -> Option<String> {
-    let activity = &rec.info.activity;
-    if *activity == Activity::Blocked {
-        // Even forced: the keypress would answer the permission prompt.
-        return Some("is waiting for a permission answer; attach to answer it".into());
+    let refusal = rec.info.activity.send_refusal();
+    // Even forced: the keypress would answer the permission prompt.
+    if rec.info.activity == Activity::Blocked || (refusal.is_some() && !force) {
+        return refusal;
     }
     if force {
         return None;
-    }
-    if !activity.awaits_prompt() {
-        return Some(format!("is {activity}, not waiting for a prompt"));
     }
     if rec.info.attached > 0 && rec.runtime.last_input.is_some_and(|t| now < t + TYPING_GRACE) {
         return Some("has someone typing in an attached terminal".into());
@@ -134,12 +131,12 @@ mod tests {
     }
 
     #[test]
-    fn only_idle_or_done() {
+    fn only_at_a_prompt() {
         let now = Instant::now();
-        for ok in ["idle", "done"] {
+        for ok in ["idle", "done", "error"] {
             assert_eq!(refusal(&record(ok), false, now), None, "{ok}");
         }
-        for busy in ["working", "tool:Bash", "unknown", "error", "starting", "busy", "quiet"] {
+        for busy in ["working", "tool:Bash", "unknown", "starting", "busy", "quiet"] {
             assert!(refusal(&record(busy), false, now).is_some(), "{busy}");
             assert_eq!(refusal(&record(busy), true, now), None, "--force {busy}");
         }
