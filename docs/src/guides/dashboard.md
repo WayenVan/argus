@@ -12,6 +12,7 @@ Both take a group prefix and `-l key=value` filters.
 | arrows / `hjkl` | Move |
 | `Enter` | Attach (detach with `Ctrl-\`) |
 | `o` | Jump to an existing tmux attachment |
+| `e` | Tree: widen the tree over the detail pane, or restore it |
 | `Tab` / `[` `]`, `1` `2` | Switch between grid and tree |
 | `a` | New agent |
 | `r` | Rename |

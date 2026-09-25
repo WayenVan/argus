@@ -107,6 +107,8 @@ struct TreeState {
     collapsed: HashSet<String>,
     selected: usize,
     preview: Vec<PreviewLine>,
+    /// Show the tree across the whole content area instead of beside details.
+    expanded: bool,
 }
 
 /// One flattened, orderable line of the tree: either a group heading or a
@@ -403,8 +405,10 @@ fn event_loop(
                     grid.selected = grid.selected.min(grid.tiles.len().saturating_sub(1));
                 }
                 Mode::Tree => {
-                    tree.preview =
-                        refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(area)).unwrap_or_default();
+                    if !tree.expanded {
+                        tree.preview = refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(area))
+                            .unwrap_or_default();
+                    }
                 }
             }
             last_tick = Instant::now();
@@ -518,6 +522,12 @@ fn event_loop(
                     }
                 }
                 Mode::Tree => match code {
+                    KeyCode::Char('e') => {
+                        tree.expanded = !tree.expanded;
+                        if !tree.expanded {
+                            last_tick = Instant::now() - PREVIEW_TICK; // Restore the detail pane with a fresh preview.
+                        }
+                    }
                     KeyCode::Up | KeyCode::Char('k') => tree.selected = tree.selected.saturating_sub(1),
                     KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
                         tree.selected = (tree.selected + 1).min(rows.len() - 1);
@@ -774,10 +784,12 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
             }
             spans.push(Span::raw(format!(" · {}", tile.info.activity)));
             let title = Line::from(spans);
-            let mut block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title);
-            if idx == selected {
-                block = block.border_style(Style::default().fg(ACCENT));
-            }
+            let border_color = if idx == selected { ACCENT } else { Color::DarkGray };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color))
+                .title(title);
             let text = Text::from(tile.lines.iter().map(render_line).collect::<Vec<_>>());
             frame.render_widget(Paragraph::new(text).block(block), *cell_area);
         }
@@ -852,17 +864,14 @@ fn refresh_tree_preview(conn: &mut Conn, rows: &[Row], selected: usize, area: Re
     }
 }
 
-fn draw_tree(
-    frame: &mut Frame,
-    area: Rect,
-    rows: &[Row],
-    selected: usize,
-    preview: &[PreviewLine],
-    blink: bool,
-    jump_socket: Option<&str>,
-) {
+fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, blink: bool, jump_socket: Option<&str>) {
+    let (selected, preview) = (tree.selected, &tree.preview);
+    if tree.expanded {
+        draw_tree_list(frame, area, rows, selected, blink, jump_socket, true);
+        return;
+    }
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
-    draw_tree_list(frame, cols[0], rows, selected, blink, jump_socket);
+    draw_tree_list(frame, cols[0], rows, selected, blink, jump_socket, false);
 
     let detail =
         Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(cols[1]);
@@ -878,8 +887,10 @@ fn draw_tree_list(
     selected: usize,
     blink: bool,
     jump_socket: Option<&str>,
+    expanded: bool,
 ) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" agents ");
+    let title = if expanded { " agents · expanded (e restore) " } else { " agents " };
+    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title);
     if rows.is_empty() {
         frame.render_widget(Paragraph::new("no agents").block(block), area);
         return;
@@ -973,9 +984,9 @@ fn draw(
     draw_tabs(frame, chunks[0], mode);
     match mode {
         Mode::Grid => draw_grid(frame, chunks[1], &grid.tiles, grid.selected, blink, jump_socket),
-        Mode::Tree => draw_tree(frame, chunks[1], rows, tree.selected, &tree.preview, blink, jump_socket),
+        Mode::Tree => draw_tree(frame, chunks[1], rows, tree, blink, jump_socket),
     }
-    draw_footer(frame, chunks[2], mode, status);
+    draw_footer(frame, chunks[2], mode, tree.expanded, status);
     draw_overlay(frame, area, overlay);
 }
 
@@ -993,7 +1004,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(CHROME_BG)), area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, status: Option<&str>) {
+fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, status: Option<&str>) {
     // A fresh status line (rename/kill/copy result) briefly takes over the
     // footer instead of the hint, so the user notices it without a popup.
     if let Some(msg) = status {
@@ -1005,8 +1016,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, status: Option<&str>) 
         Mode::Grid => {
             " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
+        Mode::Tree if tree_expanded => {
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e restore split   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+        }
         Mode::Tree => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e expand tree   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::Gray).bg(CHROME_BG)), area);
