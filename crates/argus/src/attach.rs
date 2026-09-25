@@ -206,7 +206,9 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
 /// Holder → screen, on the calling thread. Blocking writes to stdout push
 /// back on the holder, which drops the backlog instead of stalling the agent.
 fn forward_output(stream: &UnixStream, detached: &AtomicBool) -> Result<Ending> {
-    let mut reader = stream;
+    // Buffered: a frame's header and payload, and often several frames,
+    // then arrive in one read.
+    let mut reader = io::BufReader::with_capacity(frame::READ_BUFFER, stream);
     let mut out = io::stdout().lock();
     loop {
         let frame = match frame::read_frame(&mut reader) {

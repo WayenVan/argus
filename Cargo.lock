@@ -107,6 +107,7 @@ dependencies = [
  "anyhow",
  "argus-proto",
  "libc",
+ "memchr",
  "nix",
  "serde_json",
  "signal-hook",

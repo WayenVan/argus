@@ -12,6 +12,7 @@ argus-proto = { path = "crates/argus-proto" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+memchr = "2"
 nix = { version = "0.29", features = ["term", "process", "signal", "fs", "poll", "resource", "user"] }
 signal-hook = "0.3.18"
 serde = { version = "1", features = ["derive"] }

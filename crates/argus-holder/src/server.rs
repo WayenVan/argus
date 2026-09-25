@@ -2,7 +2,11 @@
 //!
 //! Rules from the design:
 //! - client input is handled before PTY output in every round;
-//! - at most 64 KiB of output is read per round, coalesced without timers;
+//! - at most 64 KiB of output is read per round;
+//! - output goes out at once after a quiet spell, and while it keeps coming
+//!   it is batched for up to [`COALESCE`] or 64 KiB: PTYs hand it over in
+//!   small reads (a few hundred bytes on macOS), and forwarding each one
+//!   costs every downstream hop a wakeup;
 //! - the PTY master is never left unread because of a slow client: a client
 //!   whose backlog exceeds 1 MiB gets `Skipped` instead (see [`Conn`]);
 //! - the most recently active attached client owns the PTY size, with
@@ -39,6 +43,8 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 const LINGER: Duration = Duration::from_secs(60);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const INPUT_EVENT_INTERVAL: Duration = Duration::from_secs(1);
+/// How long output that keeps coming is held to be sent in one batch.
+const COALESCE: Duration = Duration::from_millis(2);
 
 pub struct Holder {
     spec: HolderSpec,
@@ -60,6 +66,10 @@ pub struct Holder {
     attached_reported: (u32, u32),
     last_input_event: Option<Instant>,
     stand_in: StandIn,
+    /// Output read but not yet published.
+    pending: Vec<u8>,
+    /// Until when output is batched; `None` once a batch window passed quietly.
+    hold_until: Option<Instant>,
 }
 
 /// PTY size and who decides it.
@@ -121,6 +131,8 @@ impl Holder {
             attached_reported: (0, 0),
             last_input_event: None,
             stand_in,
+            pending: Vec::with_capacity(READ_CHUNK),
+            hold_until: None,
         })
     }
 
@@ -206,10 +218,16 @@ impl Holder {
     }
 
     fn next_timeout(&self) -> PollTimeout {
-        let deadline = [self.kill_deadline, self.linger_deadline, self.size.pending].into_iter().flatten().min();
+        let hold = self.hold_until.filter(|_| !self.pending.is_empty());
+        let deadline = [self.kill_deadline, self.linger_deadline, self.size.pending, hold].into_iter().flatten().min();
         match deadline {
             None => PollTimeout::NONE,
-            Some(d) => PollTimeout::try_from(d.saturating_duration_since(Instant::now())).unwrap_or(PollTimeout::MAX),
+            // Rounded up: poll counts whole milliseconds, and a timeout
+            // rounded down to 0 would spin until the deadline.
+            Some(d) => {
+                let ms = d.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000);
+                PollTimeout::try_from(ms).unwrap_or(PollTimeout::MAX)
+            }
         }
     }
 
@@ -224,6 +242,11 @@ impl Holder {
         if self.size.pending.is_some_and(|d| now >= d) {
             self.size.pending = None;
             self.apply_owner_size();
+        }
+        if self.hold_until.is_some_and(|d| now >= d) {
+            // Keep batching while output flows; a quiet window ends it.
+            self.hold_until = if self.pending.is_empty() { None } else { Some(now + COALESCE) };
+            self.flush_pending();
         }
     }
 
@@ -546,16 +569,23 @@ impl Holder {
         }
     }
 
-    fn read_master(&mut self) {
-        let Some(master) = &self.master else { return };
+    /// Reads what the agent wrote, up to 64 KiB, and returns how much.
+    fn read_master(&mut self) -> usize {
+        let Some(master) = &self.master else { return 0 };
         let fd = master.as_raw_fd();
-        let mut buf = vec![0u8; READ_CHUNK];
+        // Read straight onto the end of `pending`: no zeroed buffer, no copy.
+        let start = self.pending.len();
+        self.pending.reserve(READ_CHUNK);
         let mut filled = 0;
         let mut closed = false;
         while filled < READ_CHUNK {
-            // SAFETY: reading into the unfilled tail of buf.
-            let n = unsafe { libc::read(fd, buf[filled..].as_mut_ptr().cast(), READ_CHUNK - filled) };
+            let len = self.pending.len();
+            // SAFETY: `reserve` left at least READ_CHUNK - filled bytes of
+            // capacity past `len`; only the bytes `read` wrote become part
+            // of the vector.
+            let n = unsafe { libc::read(fd, self.pending.as_mut_ptr().add(len).cast(), READ_CHUNK - filled) };
             if n > 0 {
+                unsafe { self.pending.set_len(len + n as usize) };
                 filled += n as usize;
                 continue;
             }
@@ -570,8 +600,14 @@ impl Holder {
             break;
         }
         if filled > 0 {
-            let replies = self.stand_in.answer(&buf[..filled]);
-            self.publish(&buf[..filled]);
+            let replies = self.stand_in.answer(&self.pending[start..]);
+            let now = Instant::now();
+            if self.hold_until.is_none_or(|d| now >= d) {
+                self.hold_until = Some(now + COALESCE);
+                self.flush_pending();
+            } else if self.pending.len() >= READ_CHUNK {
+                self.flush_pending();
+            }
             // A writable terminal receives the queries with the output and
             // answers them itself, through its input.
             if !replies.is_empty() && !self.writable_attached() {
@@ -582,6 +618,17 @@ impl Holder {
         if closed {
             self.master = None;
         }
+        filled
+    }
+
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.publish(&pending);
+        self.pending = pending;
+        self.pending.clear();
     }
 
     fn publish(&mut self, bytes: &[u8]) {
@@ -638,13 +685,9 @@ impl Holder {
 
     fn on_exit(&mut self, code: i32) {
         // Collect whatever the agent wrote right before exiting.
-        while self.master.is_some() {
-            let before = self.ring.end;
-            self.read_master();
-            if self.ring.end == before {
-                break;
-            }
-        }
+        while self.master.is_some() && self.read_master() > 0 {}
+        self.flush_pending();
+        self.hold_until = None;
         self.master = None;
         self.exit_code = Some(code);
         self.kill_deadline = None;

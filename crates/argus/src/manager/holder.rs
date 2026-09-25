@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use argus_proto::frame::{aio, ty};
+use argus_proto::frame::{self, aio, ty};
 use argus_proto::msg::{
     AgentStatus, ExitRecord, HOLDER_CAPABILITIES, HolderEvent, HolderReady, HolderRequest, HolderResponse, HolderSpec,
     RunRequest, SubscribeLevel,
@@ -138,6 +138,7 @@ pub async fn follow_screen(
     // task at all) would start from an empty, wrongly-not-in-alternate-
     // screen parser and never catch up.
     call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Output, from_offset: Some(0) }).await?;
+    let mut stream = tokio::io::BufReader::with_capacity(frame::READ_BUFFER, stream);
     while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
         match t {
             ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),

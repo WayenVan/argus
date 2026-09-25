@@ -8,6 +8,10 @@ use serde::Serialize;
 
 pub const MAX_FRAME: usize = 1 << 20;
 
+/// Read buffer for a stream of output frames: the holder batches output
+/// into frames of up to 64 KiB.
+pub const READ_BUFFER: usize = 64 * 1024;
+
 /// Frame type bytes.
 pub mod ty {
     /// JSON control message.
@@ -97,17 +101,17 @@ pub fn try_decode(buf: &[u8]) -> Result<Option<Decoded<'_>>, FrameError> {
 
 /// Blocking read of one frame. `Ok(None)` means clean EOF between frames.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
-    let mut head = [0u8; 4];
+    // Length and type together: no shifting the type byte off the payload.
+    let mut head = [0u8; 5];
     match r.read_exact(&mut head) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let len = check_len(u32::from_be_bytes(head) as usize)?;
-    let mut body = vec![0u8; len];
+    let len = check_len(u32::from_be_bytes(head[..4].try_into().unwrap()) as usize)?;
+    let mut body = vec![0u8; len - 1];
     r.read_exact(&mut body)?;
-    let ty = body.remove(0);
-    Ok(Some((ty, body)))
+    Ok(Some((head[4], body)))
 }
 
 pub fn write_frame<W: Write>(w: &mut W, ty: u8, payload: &[u8]) -> io::Result<()> {
@@ -139,17 +143,16 @@ pub mod aio {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
-        let mut head = [0u8; 4];
+        let mut head = [0u8; 5];
         match r.read_exact(&mut head).await {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         }
-        let len = super::check_len(u32::from_be_bytes(head) as usize)?;
-        let mut body = vec![0u8; len];
+        let len = super::check_len(u32::from_be_bytes(head[..4].try_into().unwrap()) as usize)?;
+        let mut body = vec![0u8; len - 1];
         r.read_exact(&mut body).await?;
-        let ty = body.remove(0);
-        Ok(Some((ty, body)))
+        Ok(Some((head[4], body)))
     }
 
     pub async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {

@@ -45,32 +45,49 @@ impl StandIn {
     /// while a terminal is attached and the replies are dropped, so that the
     /// tail stays in step.
     pub fn answer(&mut self, output: &[u8]) -> Vec<u8> {
-        let combined = [self.tail.as_slice(), output].concat();
         let mut replies = Vec::new();
-        let mut at = 0;
-        while let Some(found) = find(&combined[at..], b"\x1b]") {
-            at += found;
-            let rest = &combined[at + 2..];
-            for (code, fallback) in COLOR_QUERIES {
-                let Some(query) = rest.strip_prefix(code).and_then(|r| r.strip_prefix(b";?")) else { continue };
-                let Some(st) = [b"\x07".as_slice(), b"\x1b\\"].into_iter().find(|st| query.starts_with(st)) else {
-                    continue;
-                };
-                // Wholly inside the tail: answered with the previous output.
-                if at + 2 + code.len() + 2 + st.len() <= self.tail.len() {
-                    continue;
+        // Queries that start in the previous output's tail: only the seam
+        // needs joining, not the whole output. One wholly inside the tail
+        // was answered with the previous output.
+        if !self.tail.is_empty() {
+            let seam = [self.tail.as_slice(), &output[..output.len().min(LONGEST_QUERY)]].concat();
+            for at in memchr::memmem::find_iter(&seam, b"\x1b]").take_while(|&at| at < self.tail.len()) {
+                if let Some(query) = Query::parse(&seam[at..])
+                    && at + query.len > self.tail.len()
+                {
+                    self.reply(&query, &mut replies);
                 }
-                let color = self.color(code).unwrap_or(fallback);
-                replies.extend_from_slice(b"\x1b]");
-                replies.extend_from_slice(code);
-                replies.extend_from_slice(format!(";{color}").as_bytes());
-                replies.extend_from_slice(st);
             }
-            at += 2;
         }
-        let keep = (LONGEST_QUERY - 1).min(combined.len());
-        self.tail = combined[combined.len() - keep..].to_vec();
+        for at in memchr::memmem::find_iter(output, b"\x1b]") {
+            if let Some(query) = Query::parse(&output[at..]) {
+                self.reply(&query, &mut replies);
+            }
+        }
+        self.keep_tail(output);
         replies
+    }
+
+    fn reply(&self, query: &Query, replies: &mut Vec<u8>) {
+        let color = self.color(query.code).unwrap_or(query.fallback);
+        replies.extend_from_slice(b"\x1b]");
+        replies.extend_from_slice(query.code);
+        replies.extend_from_slice(format!(";{color}").as_bytes());
+        replies.extend_from_slice(query.st);
+    }
+
+    /// Keeps the last `LONGEST_QUERY - 1` bytes seen, for a query split
+    /// across two reads.
+    fn keep_tail(&mut self, output: &[u8]) {
+        let keep = LONGEST_QUERY - 1;
+        if output.len() >= keep {
+            self.tail.clear();
+            self.tail.extend_from_slice(&output[output.len() - keep..]);
+        } else {
+            self.tail.extend_from_slice(output);
+            let excess = self.tail.len().saturating_sub(keep);
+            self.tail.drain(..excess);
+        }
     }
 
     fn color(&self, code: &[u8]) -> Option<&str> {
@@ -81,8 +98,26 @@ impl StandIn {
     }
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// A colour query we answer.
+struct Query {
+    code: &'static [u8],
+    /// The reply when the colour is unknown.
+    fallback: &'static str,
+    /// The terminator, repeated in the reply.
+    st: &'static [u8],
+    len: usize,
+}
+
+impl Query {
+    /// The query `bytes` starts with, if it is one we answer.
+    fn parse(bytes: &[u8]) -> Option<Query> {
+        let rest = bytes.strip_prefix(b"\x1b]")?;
+        COLOR_QUERIES.into_iter().find_map(|(code, fallback)| {
+            let query = rest.strip_prefix(code)?.strip_prefix(b";?")?;
+            let st: &'static [u8] = [b"\x07".as_slice(), b"\x1b\\"].into_iter().find(|st| query.starts_with(st))?;
+            Some(Query { code, fallback, st, len: 2 + code.len() + 2 + st.len() })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +167,23 @@ mod tests {
     fn ignores_what_is_not_a_colour_spec() {
         let mut stand_in = StandIn::new(TerminalColors { foreground: None, background: Some("0\x1b]52;c;x".into()) });
         assert_eq!(stand_in.answer(b"\x1b]11;?\x07"), b"\x1b]11;rgb:0000/0000/0000\x07");
+    }
+
+    #[test]
+    fn any_split_gives_the_same_replies() {
+        let stream = b"a\x1b]11;?\x07b\x1b]0;t\x07\x1b]10;?\x1b\\\x1b]11;?\x1b\\c\x1b]11;?\x07";
+        let whole = StandIn::new(known()).answer(stream);
+        assert_eq!(whole.iter().filter(|&&b| b == b']').count(), 4);
+        for cut in 0..=stream.len() {
+            let mut stand_in = StandIn::new(known());
+            let split = [stand_in.answer(&stream[..cut]), stand_in.answer(&stream[cut..])].concat();
+            assert_eq!(split, whole, "cut at {cut}");
+        }
+        for size in 1..=3 {
+            let mut stand_in = StandIn::new(known());
+            let pieces: Vec<u8> = stream.chunks(size).flat_map(|c| stand_in.answer(c)).collect();
+            assert_eq!(pieces, whole, "pieces of {size}");
+        }
     }
 
     #[test]
