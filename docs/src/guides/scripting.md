@@ -15,8 +15,46 @@ argus logs --screen fix-bug
   e.g. `--until exited` for the process to end, which passes on the exit code
   of one agent. `--until-activity` takes an exact activity such as `done`. If a
   named agent exits first, it fails with code `exited`.
+- An agent that is already free satisfies `wait` at once, even right after a
+  `send` it has not picked up yet. To wait for a turn, use turn numbers (below).
 - `argus events --json` streams every change as JSON, one object per line.
 - `--timeout` exits with code 124.
+
+## Waiting for a turn
+
+Agents with hooks count their finished turns (`turns` in `inspect` and
+`--json`). `argus send --json` prints `turn`: the count when the prompt went
+in. `argus wait <agent> --after N` waits until the agent is free *and* has
+finished a turn after turn N, so a turn that ends before the wait starts is not
+missed:
+
+```sh
+t=$(argus send fix-bug "Fix the failing test" --json | jq .turn)
+# ... other work ...
+argus wait fix-bug --after "$t" --timeout 600
+```
+
+`argus send --then-wait` does both in one command.
+
+- An agent already past turn N returns at once.
+- `--after` takes one agent, and works with `--until` and `--until-activity`,
+  but not `--until exited` or `--dir`.
+- If the turn ends in `error`, the wait fails with code `stuck`. It also
+  fails if the agent goes `unknown` (e.g. interrupted
+  with Esc, which ends a turn without a hook). An agent already `unknown` when
+  the wait starts, as all are right after `argus manager restart`, does not
+  count.
+- A `blocked` agent does not fail the wait: agents also report approvals they
+  then grant by themselves (Codex does), and argus cannot tell those from a
+  prompt waiting on a person. An agent blocked for 2 s or more gets a line on
+  stderr, `argus: NAME reports blocked (may be waiting on a person); still
+  waiting`, and another when the block ends. A `--timeout` error names the
+  activity, e.g. `timed out waiting for fix-bug (blocked)`. Plain `wait`
+  prints the same lines. Under `--json`, stderr carries only the error object,
+  so there are no such lines.
+- Programs without hooks have no turns; `--after` refuses them.
+- `send --then-wait` also fails if the agent shows no sign of taking the prompt
+  within 5 s.
 
 ## Waiting for other agents
 
@@ -62,7 +100,8 @@ line:
 - `ps`, `label` and `prune` print `{"schema":1,"agents":[...]}`.
 - `run -d`, `send`, `rename`, `mv`, `ack` and `rm` print
   `{"schema":1,"agent":{...}}`: the agent after the command (`rm`: before it
-  was removed; `run`: plus `warnings`).
+  was removed; `run`: plus `warnings`; `send`: plus `turn`, except with
+  `--then-wait`).
 - `wait` prints `agent` when waiting on one named agent, `agents` otherwise.
   `wait` and `send --then-wait` keep their exit codes.
 - `inspect` prints `agent`, plus `screen` with `--screen` (`null` once
@@ -85,4 +124,4 @@ line:
 - On failure stdout is empty and stderr gets
   `{"schema":1,"error":{"code":"...","message":"..."}}`. Codes: `not_found`,
   `ambiguous`, `not_ready` (exit 75), `timeout` (exit 124), `exited`,
-  `manager_unavailable`, `failed`. Other failures exit 1.
+  `stuck`, `manager_unavailable`, `failed`. Other failures exit 1.

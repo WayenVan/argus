@@ -42,6 +42,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every agent working there, as `argus status` counts them. A `--timeout`
   error names the agents still pending; `--timeout 0` checks once.
 - `argus ps` shows each agent's availability in an `AVAIL` column.
+- Turn numbers. Agents with hooks count finished turns (`turns` in `inspect`
+  and `--json`, kept across manager restarts), interrupted ones included where
+  the agent reports interrupts (codex, opencode, pi, omp). `argus send --json` prints
+  `turn`, the count when the prompt went in, and `argus wait <agent> --after N`
+  waits until the agent is free after finishing a later turn. Unlike a plain
+  `wait`, it cannot return early on a prompt not yet picked up, nor miss a turn
+  that ended before it started. It fails with the new code `stuck` if the turn
+  ends in an error or the agent goes unknown first. A blocked agent does not
+  fail it, since agents also report approvals they grant by themselves;
+  waits say on stderr when an agent stays blocked for 2 s and when that ends.
 
 ### Changed
 
@@ -67,12 +77,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "finished" means `free`, only "exited" means the process ended, and "agents"
   leaves out exited ones. Commands that change or message other agents still
   need the user to ask.
+- `argus send --then-wait` waits for the turn its prompt started, by turn
+  number, instead of guessing from activity changes. An errored or
+  interrupted turn now fails with code `stuck` (still exit 1) instead of
+  printing the activity; a blocked one keeps waiting.
 - The label instruction is shorter, gives examples, and tells agents to
   single-quote values on one line (`argus label self title='...'`): double
   quotes let the shell expand `$` and backticks in a recap.
 
 ### Fixed
 
+- `argus send` to Codex left the prompt in its input box instead of
+  submitting it: Codex took the fast typing for a paste and the Enter after it
+  as a new line. Single-line prompts are now sent as a bracketed paste too,
+  when the agent accepts pastes.
 - `attach` draws on the screen the agent is on. It used to always enter its
   own alternate screen, so in tmux the mouse wheel did nothing for agents that
   draw on the normal screen, such as omp — unless the agent had toggled the

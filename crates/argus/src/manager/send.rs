@@ -28,7 +28,7 @@ const PASTE_END: &str = "\x1b[201~";
 
 impl Manager {
     pub(super) async fn send(&self, target: &str, text: String, enter: bool, force: bool) -> Result<Response> {
-        let (id, name) = {
+        let (id, name, turn) = {
             let mut reg = self.registry.lock().unwrap();
             let id = resolve_one(&reg, target, "send")?;
             let rec = reg.agents.get_mut(&id).expect("resolved");
@@ -40,7 +40,7 @@ impl Manager {
                 return Ok(Response::error(crate::errors::NOT_READY, format!("{} {reason}", rec.info.name)));
             }
             rec.runtime.submitting = Some(now + SUBMIT_TIMEOUT);
-            (id, rec.info.name.clone())
+            (id, rec.info.name.clone(), rec.info.turns)
         };
         let typed = self.type_text(id, &text, enter).await;
         if typed.is_err() || !enter {
@@ -53,17 +53,22 @@ impl Manager {
         if enter {
             log(&format!("sent a prompt to {name} (id {id})"));
         }
-        Ok(Response::Ok)
+        Ok(Response::Sent { turn })
     }
 
     async fn type_text(&self, id: u64, text: &str, enter: bool) -> Result<()> {
         let multiline = text.contains(['\n', '\r']);
-        if multiline && self.screens.bracketed_paste(id) != Some(true) {
+        let paste = self.screens.bracketed_paste(id) == Some(true);
+        if multiline && !paste {
             bail!("multi-line text needs an agent that accepts pastes (bracketed paste is off)");
         }
-        if multiline {
+        let pasted = paste && !text.is_empty();
+        if pasted {
             // A line break inside the text would press Enter; pasting it
-            // keeps it as text. The end marker must not end the paste early.
+            // keeps it as text. Single lines are pasted too: typed fast, they
+            // look like a paste the agent must guess the end of (Codex takes
+            // an Enter right after one as a new line). The end marker must
+            // not end the paste early.
             let body = text.replace(PASTE_END, "");
             holder::write(id, format!("{PASTE_START}{body}{PASTE_END}")).await?;
         } else if !text.is_empty() {
@@ -71,7 +76,7 @@ impl Manager {
         }
         if enter {
             if !text.is_empty() {
-                tokio::time::sleep(if multiline { PASTE_ENTER_DELAY } else { ENTER_DELAY }).await;
+                tokio::time::sleep(if pasted { PASTE_ENTER_DELAY } else { ENTER_DELAY }).await;
             }
             holder::write(id, "\r".into()).await?;
         }
@@ -121,6 +126,7 @@ mod tests {
             exit_code: None,
             activity: activity.into(),
             activity_since: None,
+            turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
             labels: Default::default(),

@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(Pi.interpret(&e("PermissionRequest")), Hint::WaitingApproval);
         assert_eq!(Pi.interpret(&e("Stop")), Hint::Done);
         assert_eq!(Pi.interpret(&e("StopFailure")), Hint::Error);
-        assert_eq!(Pi.interpret(&e("Interrupt")), Hint::WaitingInput);
+        assert_eq!(Pi.interpret(&e("Interrupt")), Hint::Interrupted);
         assert_eq!(Pi.interpret(&json!({"v": 2, "hook_event_name": "Stop"})), Hint::Ignore);
     }
 

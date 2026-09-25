@@ -39,14 +39,19 @@ Decide on availability. Unless the user says otherwise:
                                    that start while it waits
   argus wait <id> --until-activity <activity> --timeout <secs>
                                    block until one exact activity, e.g. done
+  argus wait <id> --after <n> --timeout <secs>
+                                   block until it is free after finishing a turn past
+                                   turn n (inspect shows its turns)
 
 ## Waiting
 
 - Always pass --timeout and keep it under your shell tool's time limit; exit 124 means it
   timed out. --timeout 0 checks once. If your shell tool can run a command in the background
   and notify you when it ends, use that for long waits.
-- An agent that is free already returns at once.
-- attention waits on the user: tell them instead of waiting it out.
+- An agent that is free already returns at once, unless you pass --after.
+- A wait keeps going while an agent is blocked, since agents also report approvals they then
+  grant by themselves. If it stays blocked, the wait says so on stderr ("reports blocked") and
+  when that ends; tell the user then instead of waiting it out, as it may need them.
 - A named agent that exits before becoming free fails the wait (error code exited).
 - Programs without hooks (any kind but claude, codex, opencode, pi and omp) count as free
   once they stop printing, even while still working; wait for them with --until exited.

@@ -86,7 +86,7 @@ impl Driver for Codex {
             "PermissionRequest" => Hint::WaitingApproval,
             "Stop" => Hint::Done,
             // The user interrupted the turn and is presumably about to type.
-            "Interrupt" => Hint::WaitingInput,
+            "Interrupt" => Hint::Interrupted,
             _ => Hint::Ignore,
         }
     }
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(hint(json!({"hook_event_name":"PreToolUse","tool_name":"shell"})), Hint::Tool("shell".into()));
         assert_eq!(hint(json!({"hook_event_name":"PermissionRequest"})), Hint::WaitingApproval);
         assert_eq!(hint(json!({"hook_event_name":"Stop"})), Hint::Done);
-        assert_eq!(hint(json!({"hook_event_name":"Interrupt"})), Hint::WaitingInput);
+        assert_eq!(hint(json!({"hook_event_name":"Interrupt"})), Hint::Interrupted);
     }
 
     #[test]

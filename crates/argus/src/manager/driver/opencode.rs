@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(ev(e("PermissionReplied")), Hint::Working);
         assert_eq!(ev(e("Stop")), Hint::Done);
         assert_eq!(ev(e("StopFailure")), Hint::Error);
-        assert_eq!(ev(e("Interrupt")), Hint::WaitingInput);
+        assert_eq!(ev(e("Interrupt")), Hint::Interrupted);
         assert_eq!(ev(json!({"v": 2, "hook_event_name": "Stop"})), Hint::Ignore, "unknown format version");
     }
 

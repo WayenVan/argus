@@ -27,6 +27,9 @@ pub const NOT_READY: &str = "not_ready";
 pub const TIMEOUT: &str = "timeout";
 /// An agent being waited for exited or was removed first.
 pub const EXITED: &str = "exited";
+/// An agent being waited for with `--after` needs a person first (blocked,
+/// error), or lost track of its turn (went unknown).
+pub const STUCK: &str = "stuck";
 /// The manager could not be started or reached, or speaks another protocol.
 pub const MANAGER_UNAVAILABLE: &str = "manager_unavailable";
 /// Anything else.

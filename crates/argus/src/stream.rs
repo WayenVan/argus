@@ -9,15 +9,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
 use argus_proto::msg::{
-    Activity, AgentEvent, AgentInfo, Availability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request,
-    Response, SubscribeLevel,
+    AgentEvent, AgentInfo, Availability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request, Response,
+    SubscribeLevel,
 };
 use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 
 use crate::attach;
 use crate::client::{self, Conn, PsOptions};
-use crate::errors::{self, NOT_READY, TIMEOUT, coded};
+use crate::errors::{self, EXITED, NOT_READY, TIMEOUT, coded};
 use crate::output::{self, AgentView, OneAgent};
+use crate::wait;
 use serde::Serialize;
 
 /// Ends passive log rendering at a clean shell boundary. The allowlist means
@@ -329,9 +330,6 @@ fn print_result(json: bool, agent: &AgentInfo, text: &str) {
 // send
 // ---------------------------------------------------------------------------
 
-/// How long `--then-wait` gives a sent prompt to show up as activity.
-const PICKUP_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub struct SendOptions {
     /// The prompt; `-` reads it from stdin.
     pub text: String,
@@ -364,8 +362,8 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
             return conn.request(&Request::Send { target, text, enter: opts.enter, force: opts.force }).map(drop);
         }
         let id = conn.find(&target)?.id.to_string();
-        conn.request(&Request::Send { target: id.clone(), text, enter: opts.enter, force: opts.force })?;
-        output::print(OneAgent::new(&conn.find(&id)?));
+        let reply = conn.request(&Request::Send { target: id.clone(), text, enter: opts.enter, force: opts.force })?;
+        output::print(SentAgent { agent: AgentView::new(&conn.find(&id)?), turn: sent_turn(&reply) });
         return Ok(());
     }
 
@@ -374,10 +372,10 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
     let (agents, rx) = start_watch(Some(vec![agent.id]), true)?;
     let mut current = agents.into_iter().next().unwrap_or(agent);
     let request = Request::Send { target: current.id.to_string(), text, enter: opts.enter, force: opts.force };
-    loop {
+    let turn = loop {
         if opts.force || current.activity.awaits_prompt() {
             match conn.request(&request) {
-                Ok(_) => break,
+                Ok(reply) => break sent_turn(&reply),
                 Err(e) if opts.wait && errors::has_code(&e, NOT_READY) => {}
                 Err(e) => return Err(e),
             }
@@ -389,39 +387,42 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
         }
         // Someone typing clears without an activity change, so poll too.
         next_update(&rx, &mut current, deadline, Duration::from_secs(1))?;
-    }
+    };
     if !opts.then_wait {
         if opts.json {
-            output::print(OneAgent::new(&current));
+            output::print(SentAgent { agent: AgentView::new(&current), turn });
         }
         return Ok(());
     }
-
-    let sent = current.clone();
-    let sent_at = Instant::now();
-    let mut picked_up = false;
-    loop {
-        // A quick turn can go idle → working → done between two updates.
-        picked_up |= current.activity != sent.activity || current.activity_since != sent.activity_since;
-        if picked_up && (current.activity.awaits_prompt() || is_stuck(&current.activity)) {
-            print_result(opts.json, &current, &current.activity.to_string());
-            std::process::exit(if is_stuck(&current.activity) { 1 } else { 0 });
-        }
-        if !picked_up && sent_at.elapsed() > PICKUP_TIMEOUT {
-            bail!("{} has not picked up the prompt", current.name);
-        }
-        next_update(&rx, &mut current, deadline, Duration::from_secs(1))?;
-    }
+    let Some(turn) = turn else {
+        bail!("sent, but the manager predates turn counting and cannot wait for the turn; run `argus manager restart`");
+    };
+    let pickup = wait::Pickup { sent: current.clone(), at: Instant::now() };
+    let goal = wait::Goal::Availability(Availability::Free);
+    let agent = wait::after_turn(current, &rx, turn, &goal, deadline, Some(pickup), !opts.json)?;
+    print_result(opts.json, &agent, &agent.activity.to_string());
+    Ok(())
 }
 
-/// Activities in which the agent waits on a person but not with a result.
-fn is_stuck(activity: &Activity) -> bool {
-    matches!(activity.availability(), Availability::Attention | Availability::Unknown)
+/// `argus send --json`: the agent, and its `turns` when the prompt went in
+/// (`null` from a manager that predates turn counting).
+#[derive(Serialize)]
+struct SentAgent<'a> {
+    agent: AgentView<'a>,
+    turn: Option<u64>,
+}
+
+/// The turn a `Send` reply names; an older manager answers plain `Ok`.
+fn sent_turn(reply: &Response) -> Option<u64> {
+    match reply {
+        Response::Sent { turn } => Some(*turn),
+        _ => None,
+    }
 }
 
 /// Waits at most `poll` for the next change to `current`. Exits 124 once
 /// `deadline` passes; fails if the agent stops running.
-fn next_update(rx: &Messages, current: &mut AgentInfo, deadline: Option<Instant>, poll: Duration) -> Result<()> {
+pub fn next_update(rx: &Messages, current: &mut AgentInfo, deadline: Option<Instant>, poll: Duration) -> Result<()> {
     let wait_for = deadline.map_or(poll, |d| d.saturating_duration_since(Instant::now()).min(poll));
     match rx.recv_timeout(wait_for) {
         Ok(Ok(Some(msg))) => {
@@ -440,7 +441,7 @@ fn next_update(rx: &Messages, current: &mut AgentInfo, deadline: Option<Instant>
         return Err(coded(TIMEOUT, format!("timed out waiting for {}", current.name)));
     }
     if !current.status.is_live() {
-        bail!("{} {}", current.name, current.status.as_str());
+        return Err(coded(EXITED, format!("{} {}", current.name, current.status.as_str())));
     }
     Ok(())
 }

@@ -197,6 +197,10 @@ pub struct AgentInfo {
     /// Unix seconds when `activity` last changed.
     #[serde(default)]
     pub activity_since: Option<u64>,
+    /// Turns the agent has finished (hook `Stop` or `StopFailure`); always 0
+    /// for agents without hooks. `argus wait --after` counts on it.
+    #[serde(default)]
+    pub turns: u64,
     #[serde(default)]
     pub attached: u32,
     /// Live tmux attachments, rebuilt from the holder after a manager restart.
@@ -276,7 +280,7 @@ pub enum Request {
     /// waiting for a prompt (`idle` or `done`), nobody attached has typed
     /// recently, and no earlier send is still being submitted. `force` skips
     /// those checks, except that a `blocked` agent is always refused: a
-    /// keypress there answers its permission prompt.
+    /// keypress there answers its permission prompt. Answered with `Sent`.
     Send {
         target: String,
         text: String,
@@ -418,6 +422,11 @@ pub enum Response {
         agents: Vec<AgentInfo>,
     },
     Ok,
+    /// Reply to `Send`: the agent's `turns` when the text went in, so the
+    /// caller can wait for the turn it started (`turns > turn`).
+    Sent {
+        turn: u64,
+    },
     Error {
         code: String,
         message: String,

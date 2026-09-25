@@ -189,7 +189,7 @@ Type a prompt into an agent and press Enter, only while it is idle (or done); ot
 * `-n`, `--no-enter` — Do not press Enter after the text
 * `--force` — Send even if the agent is not idle (never while it is blocked on a permission prompt)
 * `-w`, `--wait` — Wait until the agent is idle instead of failing
-* `--then-wait` — After sending, block until the agent finishes the turn; prints the activity it ends in (exit 1 if blocked, error or unknown)
+* `--then-wait` — After sending, block until the agent finishes the turn this prompt started (like `wait --after`); prints the activity it ends in. Keeps waiting while it is blocked; fails with code `stuck` if the turn ends in an error or the agent goes unknown
 * `--timeout <SECS>` — Give up after this many seconds, counting both waits (exit 124)
 * `--json` — Print JSON (one object per line) instead of text
 
@@ -302,6 +302,7 @@ Block until agents are free (their turn is over) or reach another state; with se
 
   Default value: `free`
 * `--until-activity <ACTIVITY>` — Wait for one exact activity instead, such as `done` or `tool:Bash`
+* `--after <N>` — Only once the agent has finished a turn after turn N (its `turns` is past N), e.g. the `turn` `send --json` printed. One agent; keeps waiting while it is blocked; fails with code `stuck` if the turn ends in an error or the agent goes unknown first
 * `--timeout <SECS>` — Give up after this many seconds (exit code 124)
 * `--json` — Print JSON (one object per line) instead of text
 

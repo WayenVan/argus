@@ -203,6 +203,7 @@ mod tests {
             exit_code: None,
             activity: "unknown".into(),
             activity_since: None,
+            turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
             labels: Default::default(),

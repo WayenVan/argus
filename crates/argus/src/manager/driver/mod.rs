@@ -31,6 +31,8 @@ pub enum Hint {
     Done,
     /// Idle, waiting for input.
     WaitingInput,
+    /// The user interrupted the turn; it ended without `Done`.
+    Interrupted,
     Error,
     /// Not relevant to the main agent's activity.
     Ignore,
@@ -149,7 +151,7 @@ fn plugin_hint(event: &Value, version: u64) -> Hint {
         "Stop" => Hint::Done,
         "StopFailure" => Hint::Error,
         // The user interrupted the turn and is presumably about to type.
-        "Interrupt" => Hint::WaitingInput,
+        "Interrupt" => Hint::Interrupted,
         _ => Hint::Ignore,
     }
 }

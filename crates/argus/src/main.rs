@@ -156,8 +156,10 @@ enum Command {
         /// Wait until the agent is idle instead of failing
         #[arg(short, long)]
         wait: bool,
-        /// After sending, block until the agent finishes the turn; prints
-        /// the activity it ends in (exit 1 if blocked, error or unknown)
+        /// After sending, block until the agent finishes the turn this prompt
+        /// started (like `wait --after`); prints the activity it ends in.
+        /// Keeps waiting while it is blocked; fails with code `stuck` if the
+        /// turn ends in an error or the agent goes unknown
         #[arg(long, conflicts_with = "no_enter")]
         then_wait: bool,
         /// Give up after this many seconds, counting both waits (exit 124)
@@ -225,6 +227,12 @@ enum Command {
         /// Wait for one exact activity instead, such as `done` or `tool:Bash`
         #[arg(long, value_name = "ACTIVITY", value_parser = wait::parse_activity, conflicts_with = "until")]
         until_activity: Option<argus_proto::msg::Activity>,
+        /// Only once the agent has finished a turn after turn N (its `turns`
+        /// is past N), e.g. the `turn` `send --json` printed. One agent; keeps
+        /// waiting while it is blocked; fails with code `stuck` if the turn
+        /// ends in an error or the agent goes unknown first
+        #[arg(long, value_name = "N", conflicts_with = "dir")]
+        after: Option<u64>,
         /// Give up after this many seconds (exit code 124)
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
@@ -423,7 +431,7 @@ fn main() -> ExitCode {
         Command::Label { target, changes, output } => client::label(target, changes, output.json),
         Command::Events { output } => stream::events(output.json),
         Command::Ack { target, output } => client::ack(target, output.json),
-        Command::Wait { targets, dir, scope, label, until, until_activity, timeout, output } => {
+        Command::Wait { targets, dir, scope, label, until, until_activity, after, timeout, output } => {
             let waited = match dir {
                 Some(path) => Ok(wait::Waited::Dir {
                     path: Some(path),
@@ -434,7 +442,7 @@ fn main() -> ExitCode {
                 None => Ok(wait::Waited::Targets(targets)),
             };
             let goal = until_activity.map_or(wait::Goal::Availability(until), wait::Goal::Activity);
-            waited.and_then(|waited| wait::wait(waited, goal, timeout, output.json))
+            waited.and_then(|waited| wait::wait(waited, goal, after, timeout, output.json))
         }
         Command::Kill { target, signal, output } => client::kill(target, signal, output.json),
         Command::Rm { target, output } => client::rm(target, output.json),
@@ -529,6 +537,7 @@ mod tests {
                 .replace("<id>", "1")
                 .replace("<secs>", "5")
                 .replace("<activity>", "done")
+                .replace("<n>", "3")
                 .replace(['[', ']'], "");
             let args: Vec<&str> = command.split_whitespace().collect();
             if let Err(e) = super::Cli::try_parse_from(&args) {

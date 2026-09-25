@@ -47,7 +47,10 @@ impl Manager {
         if !bind_session(rec, event, &hint) {
             return;
         }
-        let changed = apply(rec, hint);
+        // Saved, so a caller's `--after` still means the same turn after a
+        // manager restart.
+        let finished = count_turn(rec, &hint);
+        let changed = apply(rec, hint) || finished;
         let arm = rec.info.activity == Activity::Working;
         if arm && changed {
             rec.runtime.working_gen += 1;
@@ -61,6 +64,9 @@ impl Manager {
         }
         if changed {
             reg.changed(agent_id);
+        }
+        if finished && let Err(e) = reg.save() {
+            log(&format!("saving registry: {e:#}"));
         }
         drop(reg);
         if start_watchdog {
@@ -218,11 +224,22 @@ fn bind_session(rec: &mut AgentRecord, event: &Value, hint: &Hint) -> bool {
     }
 }
 
+/// Counts a finished turn, interrupted ones included, even one that leaves
+/// the activity unchanged (a turn ending `done` while the last result is
+/// still unseen).
+fn count_turn(rec: &mut AgentRecord, hint: &Hint) -> bool {
+    let finished = matches!(hint, Hint::Done | Hint::Error | Hint::Interrupted);
+    if finished {
+        rec.info.turns += 1;
+    }
+    finished
+}
+
 fn apply(rec: &mut AgentRecord, hint: Hint) -> bool {
     match hint {
         // Unseen results stay marked until someone looks.
-        Hint::SessionStart | Hint::WaitingInput if rec.info.activity == Activity::Done => false,
-        Hint::SessionStart | Hint::WaitingInput => set(rec, Activity::Idle),
+        Hint::SessionStart | Hint::WaitingInput | Hint::Interrupted if rec.info.activity == Activity::Done => false,
+        Hint::SessionStart | Hint::WaitingInput | Hint::Interrupted => set(rec, Activity::Idle),
         Hint::Working => set(rec, Activity::Working),
         Hint::Tool(name) => {
             let changed = set(rec, Activity::Tool(name.clone()));
@@ -271,6 +288,7 @@ mod tests {
             exit_code: None,
             activity: "unknown".into(),
             activity_since: None,
+            turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
             labels: Default::default(),
@@ -291,6 +309,20 @@ mod tests {
         watched.runtime.focused = 1;
         apply(&mut watched, Hint::Done);
         assert_eq!(watched.info.activity, Activity::Idle);
+    }
+
+    #[test]
+    fn finished_turns_are_counted() {
+        let mut rec = record();
+        for hint in [Hint::Working, Hint::Tool("Bash".into()), Hint::WaitingApproval, Hint::WaitingInput] {
+            assert!(!count_turn(&mut rec, &hint), "{hint:?}");
+        }
+        assert!(count_turn(&mut rec, &Hint::Done));
+        apply(&mut rec, Hint::Done);
+        assert!(count_turn(&mut rec, &Hint::Done), "a second unseen result is still a turn");
+        assert!(count_turn(&mut rec, &Hint::Error));
+        assert!(count_turn(&mut rec, &Hint::Interrupted));
+        assert_eq!(rec.info.turns, 4);
     }
 
     #[test]

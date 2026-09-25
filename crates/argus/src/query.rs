@@ -8,6 +8,7 @@ use argus_proto::msg::{AgentInfo, Availability, Request, Response, now_secs};
 use serde::Serialize;
 
 use crate::client::{self, Conn};
+use crate::manager::driver;
 use crate::naming::self_id;
 use crate::output::{self, AgentView};
 
@@ -80,10 +81,11 @@ fn describe(a: &AgentInfo) -> String {
             },
         ),
         ("availability", a.availability().to_string()),
-        ("cwd", a.cwd.clone()),
-        ("command", a.command.join(" ")),
-        ("created", ago(a.created_at)),
     ];
+    if driver::for_kind(&a.kind).has_hooks() {
+        rows.push(("turns", a.turns.to_string()));
+    }
+    rows.extend([("cwd", a.cwd.clone()), ("command", a.command.join(" ")), ("created", ago(a.created_at))]);
     if let Some(t) = a.exited_at {
         rows.push(("exited", ago(t)));
     }
