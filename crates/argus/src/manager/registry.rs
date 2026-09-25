@@ -81,6 +81,7 @@ impl Registry {
                 // Holders report the real attach count on subscribe, and hook
                 // state from before the restart can no longer be trusted.
                 info.attached = 0;
+                info.tmux_locations.clear();
                 if info.status.is_live() {
                     info.activity = "unknown".into();
                     info.activity_since = None;
@@ -97,7 +98,15 @@ impl Registry {
     pub fn save(&self) -> Result<()> {
         let path = paths::registry_file();
         let tmp = path.with_extension("json.tmp");
-        let file = RegistryFile { next_id: self.next_id, agents: self.infos().cloned().collect() };
+        let agents = self
+            .infos()
+            .cloned()
+            .map(|mut info| {
+                info.tmux_locations.clear();
+                info
+            })
+            .collect();
+        let file = RegistryFile { next_id: self.next_id, agents };
         fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
         fs::rename(&tmp, &path)?;
         Ok(())
@@ -153,6 +162,7 @@ mod tests {
             activity: "unknown".into(),
             activity_since: None,
             attached: 0,
+            tmux_locations: Vec::new(),
             labels: Default::default(),
         }
     }

@@ -64,9 +64,19 @@ pub struct AgentInfo {
     pub activity_since: Option<u64>,
     #[serde(default)]
     pub attached: u32,
+    /// Live tmux attachments, rebuilt from the holder after a manager restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmux_locations: Vec<TmuxLocation>,
     /// Free-form `key=value` tags, orthogonal to the group path.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TmuxLocation {
+    /// The tmux server socket; pane IDs are only unique within one server.
+    pub socket: String,
+    pub pane: String,
 }
 
 fn unknown() -> String {
@@ -475,17 +485,22 @@ pub struct AttachRequest {
     /// colour queries with them once this terminal is gone again.
     #[serde(default)]
     pub colors: TerminalColors,
+    /// Supplied by the attaching terminal, if it is running inside tmux.
+    #[serde(default)]
+    pub tmux: Option<TmuxLocation>,
 }
 
 /// Pushed by the holder to subscribers as control frames.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum HolderEvent {
-    /// Attached terminals, and how many of them have focus.
+    /// Attached terminals, how many have focus, and where tmux ones live.
     Attached {
         count: u32,
         #[serde(default)]
         focused: u32,
+        #[serde(default)]
+        tmux_locations: Vec<TmuxLocation>,
     },
     /// Someone typed into the agent. At most one per second.
     Input,
@@ -552,5 +567,13 @@ mod compatibility_tests {
 
         let holder: HolderResponse = serde_json::from_str(r#"{"type":"Hello","version":1,"pid":42}"#).unwrap();
         assert!(matches!(holder, HolderResponse::Hello { capabilities, .. } if capabilities.is_empty()));
+    }
+
+    #[test]
+    fn older_attachment_events_have_no_tmux_locations() {
+        let event: HolderEvent = serde_json::from_str(r#"{"type":"Attached","count":2,"focused":1}"#).unwrap();
+        assert!(
+            matches!(event, HolderEvent::Attached { count: 2, focused: 1, tmux_locations } if tmux_locations.is_empty())
+        );
     }
 }

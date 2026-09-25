@@ -101,6 +101,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
             allow_clipboard_replay: opts.allow_clipboard_replay,
             from_offset,
             colors: profile.colors.clone(),
+            tmux: crate::tmux::current_location(),
         }),
     )?;
 

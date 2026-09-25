@@ -344,6 +344,7 @@ impl Manager {
                 activity: "unknown".into(),
                 activity_since: None,
                 attached: 0,
+                tmux_locations: Vec::new(),
                 labels: req.labels.clone(),
             };
             reg.agents.insert(id, AgentRecord::new(info.clone()));
@@ -484,7 +485,9 @@ impl Manager {
         let manager = self.clone();
         tokio::spawn(async move {
             let on_event = |event: HolderEvent| match event {
-                HolderEvent::Attached { count, focused } => manager.on_fact(id, Fact::Attached { count, focused }),
+                HolderEvent::Attached { count, focused, tmux_locations } => {
+                    manager.on_fact(id, Fact::Attached { count, focused, tmux_locations })
+                }
                 HolderEvent::Input => manager.on_fact(id, Fact::Input),
                 // Only the screen-tracking subscription cares about this.
                 HolderEvent::Resized { .. } => {}
@@ -501,6 +504,7 @@ impl Manager {
                 agent.exit_code = code;
                 agent.exited_at = exited_at;
                 agent.attached = 0;
+                agent.tmux_locations.clear();
                 holder::unlink_name(&agent.name);
                 log(&format!("{} (id {id}) is {}", agent.name, status.as_str()));
                 reg.changed(id);

@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListSt
 
 use crate::attach;
 use crate::client::{Conn, PsOptions};
-use crate::{Cli, Command, stream, term};
+use crate::{Cli, Command, stream, term, tmux};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
 /// list (pushed by Watch, applied as it arrives), preview bytes are always a
@@ -43,7 +43,7 @@ const ACCENT: Color = Color::Cyan;
 /// Color for destructive-action chrome (the kill confirm popup).
 const DANGER: Color = Color::Red;
 /// How long a one-shot status line (rename/kill/copy result) stays on screen.
-const STATUS_TTL: Duration = Duration::from_millis(800);
+const STATUS_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -122,14 +122,30 @@ enum Row {
 enum Overlay {
     #[default]
     None,
-    Edit { id: u64, kind: EditKind, input: String, cursor: usize },
-    KillConfirm { id: u64, name: String },
+    Edit {
+        id: u64,
+        kind: EditKind,
+        input: String,
+        cursor: usize,
+    },
+    KillConfirm {
+        id: u64,
+        name: String,
+    },
+    Jump {
+        targets: Vec<tmux::JumpTarget>,
+        selected: usize,
+    },
     /// The input line is whatever would follow `argus run` on a command
     /// line; submitting parses it with the same clap definition `argus run`
     /// itself uses (see `submit_new_agent`), so any flag it accepts here.
     /// `error` holds a local (pre-send) parse problem, shown inline instead
     /// of closing the overlay, so a typo doesn't lose what was typed.
-    NewAgent { input: String, cursor: usize, error: Option<String> },
+    NewAgent {
+        input: String,
+        cursor: usize,
+        error: Option<String>,
+    },
 }
 
 /// What a text-edit overlay's input means once submitted: `Rename` replaces
@@ -160,6 +176,35 @@ fn selected_agent<'a>(mode: Mode, grid: &'a GridState, rows: &'a [Row], tree_sel
             _ => None,
         },
     }
+}
+
+fn attachment_hint(info: &AgentInfo) -> String {
+    if info.attached == 0 {
+        String::new()
+    } else {
+        format!(" · attached {} · tmux {}", info.attached, info.tmux_locations.len())
+    }
+}
+
+/// Count panes in this dashboard's tmux server. The actual pane is checked
+/// again when `o` is pressed, since it can disappear between watch updates.
+fn jumpable_count(info: &AgentInfo, socket: Option<&str>) -> usize {
+    let Some(socket) = socket else { return 0 };
+    let mut panes = HashSet::new();
+    for location in &info.tmux_locations {
+        if location.socket == socket {
+            panes.insert(location.pane.as_str());
+        }
+    }
+    panes.len()
+}
+
+fn jump_marker(info: &AgentInfo, socket: Option<&str>) -> Option<Span<'static>> {
+    let count = jumpable_count(info, socket);
+    (count > 0).then(|| {
+        let label = if count == 1 { " ↗".to_string() } else { format!(" ↗{count}") };
+        Span::styled(label, Style::default().fg(ACCENT))
+    })
 }
 
 /// Byte offset of the `char_idx`-th character, for editing a `String` by
@@ -277,9 +322,7 @@ fn submit_new_agent(conn: &mut Conn, input: &str, area: Rect) -> Result<String, 
         return Err("internal error: expected a run command".to_string());
     };
     let cwd = match cwd {
-        Some(dir) => {
-            std::fs::canonicalize(&dir).map_err(|_| format!("no such directory: {}", dir.display()))?
-        }
+        Some(dir) => std::fs::canonicalize(&dir).map_err(|_| format!("no such directory: {}", dir.display()))?,
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
     let group = group.or_else(|| std::env::var("ARGUS_GROUP").ok()).filter(|g| !g.is_empty());
@@ -317,6 +360,7 @@ fn event_loop(
     let mut tree = TreeState::default();
     let mut overlay = Overlay::None;
     let mut status: Option<(String, Instant)> = None;
+    let jump_socket = tmux::current_location().map(|location| location.socket);
     // Due immediately, so the first frame is not empty.
     let mut last_tick = Instant::now() - PREVIEW_TICK;
 
@@ -367,7 +411,7 @@ fn event_loop(
         }
 
         let status_line = status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TTL).map(|(msg, _)| msg.as_str());
-        terminal.draw(|frame| draw(frame, mode, &grid, &tree, &rows, &overlay, status_line))?;
+        terminal.draw(|frame| draw(frame, mode, &grid, &tree, &rows, &overlay, status_line, jump_socket.as_deref()))?;
 
         let timeout = INPUT_POLL.min(PREVIEW_TICK.saturating_sub(last_tick.elapsed()));
         if !event::poll(timeout)? {
@@ -433,6 +477,22 @@ fn event_loop(
                         },
                         Instant::now(),
                     ));
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
+                    match tmux::choices(&info.tmux_locations) {
+                        Ok(targets) if targets.len() == 1 => {
+                            let message = match tmux::jump(&targets[0]) {
+                                Ok(()) => format!("switched to {}", targets[0].label),
+                                Err(e) => format!("jump failed: {e}"),
+                            };
+                            status = Some((message, Instant::now()));
+                        }
+                        Ok(targets) if !targets.is_empty() => overlay = Overlay::Jump { targets, selected: 0 },
+                        Ok(_) => status = Some(("no reachable tmux pane for this agent".into(), Instant::now())),
+                        Err(e) => status = Some((e, Instant::now())),
+                    }
                 }
             }
             code => match mode {
@@ -529,6 +589,28 @@ fn handle_overlay_key(
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => Overlay::None,
             _ => Overlay::KillConfirm { id, name },
+        },
+        Overlay::Jump { targets, mut selected } => match code {
+            KeyCode::Esc => Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                Overlay::Jump { targets, selected }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(targets.len().saturating_sub(1));
+                Overlay::Jump { targets, selected }
+            }
+            KeyCode::Enter => {
+                if let Some(target) = targets.get(selected) {
+                    let message = match tmux::jump(target) {
+                        Ok(()) => format!("switched to {}", target.label),
+                        Err(e) => format!("jump failed: {e}"),
+                    };
+                    *status = Some((message, Instant::now()));
+                }
+                Overlay::None
+            }
+            _ => Overlay::Jump { targets, selected },
         },
         Overlay::NewAgent { mut input, mut cursor, .. } => match code {
             KeyCode::Esc => Overlay::None,
@@ -652,7 +734,7 @@ fn refresh_grid(conn: &mut Conn, table: &BTreeMap<u64, AgentInfo>, opts: &PsOpti
     Ok(tiles)
 }
 
-fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, blink: bool) {
+fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, blink: bool, jump_socket: Option<&str>) {
     if tiles.is_empty() {
         let block =
             Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" no running agents ");
@@ -673,10 +755,15 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
         for (c, cell_area) in col_areas.iter().enumerate() {
             let idx = start + c;
             let tile = &tiles[idx];
-            let title = Line::from(vec![
+            let mut spans = vec![
                 Span::styled("● ", Style::default().fg(activity_color(&tile.info, blink))),
-                Span::raw(format!("{} · {}", tile.info.name, tile.info.activity)),
-            ]);
+                Span::raw(tile.info.name.clone()),
+            ];
+            if let Some(marker) = jump_marker(&tile.info, jump_socket) {
+                spans.push(marker);
+            }
+            spans.push(Span::raw(format!(" · {}", tile.info.activity)));
+            let title = Line::from(spans);
             let mut block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title);
             if idx == selected {
                 block = block.border_style(Style::default().fg(ACCENT));
@@ -755,9 +842,17 @@ fn refresh_tree_preview(conn: &mut Conn, rows: &[Row], selected: usize, area: Re
     }
 }
 
-fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, preview: &[PreviewLine], blink: bool) {
+fn draw_tree(
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[Row],
+    selected: usize,
+    preview: &[PreviewLine],
+    blink: bool,
+    jump_socket: Option<&str>,
+) {
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
-    draw_tree_list(frame, cols[0], rows, selected, blink);
+    draw_tree_list(frame, cols[0], rows, selected, blink, jump_socket);
 
     let detail =
         Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(cols[1]);
@@ -766,13 +861,20 @@ fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, previ
     draw_detail_label(frame, detail[2], rows, selected, "recap");
 }
 
-fn draw_tree_list(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, blink: bool) {
+fn draw_tree_list(
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[Row],
+    selected: usize,
+    blink: bool,
+    jump_socket: Option<&str>,
+) {
     let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" agents ");
     if rows.is_empty() {
         frame.render_widget(Paragraph::new("no agents").block(block), area);
         return;
     }
-    let items: Vec<ListItem> = rows.iter().map(|row| tree_row_item(row, blink)).collect();
+    let items: Vec<ListItem> = rows.iter().map(|row| tree_row_item(row, blink, jump_socket)).collect();
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD));
@@ -780,7 +882,7 @@ fn draw_tree_list(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, 
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn tree_row_item(row: &Row, blink: bool) -> ListItem<'static> {
+fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>) -> ListItem<'static> {
     match row {
         Row::Group { name, depth, count, expanded, .. } => {
             let indent = "  ".repeat(*depth);
@@ -796,20 +898,23 @@ fn tree_row_item(row: &Row, blink: bool) -> ListItem<'static> {
         Row::Agent { info, depth } => {
             let indent = "  ".repeat(depth + 1);
             let leaf = info.name.rsplit('/').next().unwrap_or(&info.name).to_string();
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::raw(indent),
                 Span::styled("● ", Style::default().fg(activity_color(info, blink))),
-                Span::raw(format!("{leaf}  ")),
-                Span::styled(info.activity.clone(), Style::default().fg(Color::DarkGray)),
-            ]);
-            ListItem::new(line)
+                Span::raw(leaf),
+            ];
+            if let Some(marker) = jump_marker(info, jump_socket) {
+                spans.push(marker);
+            }
+            spans.push(Span::styled(format!("  {}", info.activity), Style::default().fg(Color::DarkGray)));
+            ListItem::new(Line::from(spans))
         }
     }
 }
 
 fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, preview: &[PreviewLine]) {
     let title = match rows.get(selected) {
-        Some(Row::Agent { info, .. }) => format!(" {} · {} ", info.name, info.activity),
+        Some(Row::Agent { info, .. }) => format!(" {} · {}{} ", info.name, info.activity, attachment_hint(info)),
         Some(Row::Group { name, count, .. }) => format!(" {name} ({count}) — select an agent to preview its screen "),
         None => " no agents ".to_string(),
     };
@@ -842,14 +947,23 @@ fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], selected: usiz
 const CHROME_BG: Color = Color::Indexed(236);
 
 #[allow(clippy::too_many_arguments)]
-fn draw(frame: &mut Frame, mode: Mode, grid: &GridState, tree: &TreeState, rows: &[Row], overlay: &Overlay, status: Option<&str>) {
+fn draw(
+    frame: &mut Frame,
+    mode: Mode,
+    grid: &GridState,
+    tree: &TreeState,
+    rows: &[Row],
+    overlay: &Overlay,
+    status: Option<&str>,
+    jump_socket: Option<&str>,
+) {
     let area = frame.area();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(area);
     let blink = blink_on();
     draw_tabs(frame, chunks[0], mode);
     match mode {
-        Mode::Grid => draw_grid(frame, chunks[1], &grid.tiles, grid.selected, blink),
-        Mode::Tree => draw_tree(frame, chunks[1], rows, tree.selected, &tree.preview, blink),
+        Mode::Grid => draw_grid(frame, chunks[1], &grid.tiles, grid.selected, blink, jump_socket),
+        Mode::Tree => draw_tree(frame, chunks[1], rows, tree.selected, &tree.preview, blink, jump_socket),
     }
     draw_footer(frame, chunks[2], mode, status);
     draw_overlay(frame, area, overlay);
@@ -873,18 +987,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, status: Option<&str>) 
     // A fresh status line (rename/kill/copy result) briefly takes over the
     // footer instead of the hint, so the user notices it without a popup.
     if let Some(msg) = status {
-        frame.render_widget(
-            Paragraph::new(format!(" {msg}")).style(Style::default().fg(Color::Black).bg(ACCENT)),
-            area,
-        );
+        frame
+            .render_widget(Paragraph::new(format!(" {msg}")).style(Style::default().fg(Color::Black).bg(ACCENT)), area);
         return;
     }
     let hint = match mode {
         Mode::Grid => {
-            " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+            " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
         Mode::Tree => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   enter attach/toggle   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::Gray).bg(CHROME_BG)), area);
@@ -914,10 +1026,23 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
                 .border_style(Style::default().fg(DANGER))
                 .title(" kill? ");
             let text = format!("kill {name}?  y/enter confirm · n/esc cancel");
-            frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(DANGER)).block(block),
-                rect,
-            );
+            frame.render_widget(Paragraph::new(text).style(Style::default().fg(DANGER)).block(block), rect);
+        }
+        Overlay::Jump { targets, selected } => {
+            let height = (targets.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let rect = centered_rect(area, 60, height);
+            frame.render_widget(Clear, rect);
+            let items: Vec<ListItem> = targets.iter().map(|target| ListItem::new(target.label.clone())).collect();
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" jump to tmux pane "),
+                )
+                .highlight_style(Style::default().bg(ACCENT).fg(Color::Black));
+            let mut state = ListState::default().with_selected(Some(*selected));
+            frame.render_stateful_widget(list, rect, &mut state);
         }
         Overlay::NewAgent { input, cursor, error } => {
             let mut lines = vec![
@@ -951,7 +1076,10 @@ fn cursor_line(input: &str, cursor: usize) -> Line<'static> {
     let after = input.chars().skip(cursor + 1).collect::<String>();
     Line::from(vec![
         Span::raw(before),
-        Span::styled(at.map(String::from).unwrap_or_else(|| " ".into()), Style::default().add_modifier(Modifier::REVERSED)),
+        Span::styled(
+            at.map(String::from).unwrap_or_else(|| " ".into()),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ),
         Span::raw(after),
     ])
 }
@@ -1050,10 +1178,7 @@ mod tests {
     #[test]
     fn shell_split_handles_quotes_and_escapes() {
         assert_eq!(shell_split("claude --model opus").unwrap(), vec!["claude", "--model", "opus"]);
-        assert_eq!(
-            shell_split(r#"-l msg="hello world" claude"#).unwrap(),
-            vec!["-l", "msg=hello world", "claude"]
-        );
+        assert_eq!(shell_split(r#"-l msg="hello world" claude"#).unwrap(), vec!["-l", "msg=hello world", "claude"]);
         assert_eq!(shell_split("'a b' c").unwrap(), vec!["a b", "c"]);
         assert_eq!(shell_split(r"a\ b c").unwrap(), vec!["a b", "c"]);
         assert_eq!(shell_split("  ").unwrap(), Vec::<String>::new());
@@ -1077,6 +1202,7 @@ mod tests {
             activity: "working".into(),
             activity_since: None,
             attached: 0,
+            tmux_locations: Vec::new(),
             labels: BTreeMap::new(),
         }
     }

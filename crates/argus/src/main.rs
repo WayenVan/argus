@@ -9,6 +9,7 @@ mod manager;
 mod naming;
 mod stream;
 mod term;
+mod tmux;
 mod tui;
 
 use std::process::ExitCode;
@@ -295,10 +296,8 @@ mod tests {
     /// Regenerate with `ARGUS_UPDATE_DOCS=1 cargo test -p argus cli_reference`.
     #[test]
     fn cli_reference_is_current() {
-        let options = clap_markdown::MarkdownOptions::new()
-            .title("CLI".into())
-            .show_footer(false)
-            .show_table_of_contents(false);
+        let options =
+            clap_markdown::MarkdownOptions::new().title("CLI".into()).show_footer(false).show_table_of_contents(false);
         let generated = clap_markdown::help_markdown_custom::<super::Cli>(&options);
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/src/reference/cli.md");
         if std::env::var_os("ARGUS_UPDATE_DOCS").is_some() {

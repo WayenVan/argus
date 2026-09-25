@@ -62,8 +62,8 @@ pub struct Holder {
     kill_deadline: Option<Instant>,
     linger_deadline: Option<Instant>,
     size: Size,
-    /// Last `(attached, focused)` counts sent to subscribers.
-    attached_reported: (u32, u32),
+    /// Last attachment snapshot sent to subscribers.
+    attached_reported: (u32, u32, Vec<argus_proto::msg::TmuxLocation>),
     last_input_event: Option<Instant>,
     stand_in: StandIn,
     /// Output read but not yet published.
@@ -128,7 +128,7 @@ impl Holder {
             kill_deadline: None,
             linger_deadline: None,
             size: Size { current, owner: None, history: Vec::new(), last_change: None, pending: None },
-            attached_reported: (0, 0),
+            attached_reported: (0, 0, Vec::new()),
             last_input_event: None,
             stand_in,
             pending: Vec::with_capacity(READ_CHUNK),
@@ -346,8 +346,8 @@ impl Holder {
                     SubscribeLevel::Output => Role::Output,
                 };
                 self.conns[i].push(frame::encode_json(&HolderResponse::Ok));
-                let (count, focused) = self.attached_counts();
-                self.conns[i].push(frame::encode_json(&HolderEvent::Attached { count, focused }));
+                let (count, focused, tmux_locations) = self.attached_state();
+                self.conns[i].push(frame::encode_json(&HolderEvent::Attached { count, focused, tmux_locations }));
                 if level == SubscribeLevel::Output {
                     let (rows, cols) = self.size.current;
                     self.conns[i].push(frame::encode_json(&HolderEvent::Resized { rows, cols }));
@@ -411,6 +411,7 @@ impl Holder {
         let conn = &mut self.conns[i];
         conn.role = Role::Attach { readonly: req.readonly };
         conn.size = (req.rows.max(1), req.cols.max(1));
+        conn.tmux = req.tmux.clone();
         conn.push(frame::encode_json(&HolderResponse::Ok));
         if let Some(offset) = req.from_offset {
             let (_, bytes) = self.ring.since(offset);
@@ -515,14 +516,21 @@ impl Holder {
         (count, focused)
     }
 
+    fn attached_state(&self) -> (u32, u32, Vec<argus_proto::msg::TmuxLocation>) {
+        let (count, focused) = self.attached_counts();
+        let locations =
+            self.conns.iter().filter(|c| c.role.is_attach() && !c.dead).filter_map(|c| c.tmux.clone()).collect();
+        (count, focused, locations)
+    }
+
     fn report_attached(&mut self) {
-        let counts = self.attached_counts();
-        if counts == self.attached_reported {
+        let state = self.attached_state();
+        if state == self.attached_reported {
             return;
         }
-        self.attached_reported = counts;
-        let (count, focused) = counts;
-        self.notify_subscribers(&HolderEvent::Attached { count, focused });
+        self.attached_reported = state.clone();
+        let (count, focused, tmux_locations) = state;
+        self.notify_subscribers(&HolderEvent::Attached { count, focused, tmux_locations });
     }
 
     /// Tells subscribers someone typed, at most once per second.
@@ -739,6 +747,7 @@ mod tests {
             allow_clipboard_replay: false,
             from_offset,
             colors: Default::default(),
+            tmux: None,
         }
     }
 

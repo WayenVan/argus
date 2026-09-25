@@ -122,6 +122,7 @@ mod tests {
             activity: activity.into(),
             activity_since: None,
             attached: 0,
+            tmux_locations: Vec::new(),
             labels: Default::default(),
         })
     }

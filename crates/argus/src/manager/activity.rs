@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argus_proto::msg::{awaits_prompt, now_secs};
+use argus_proto::msg::{TmuxLocation, awaits_prompt, now_secs};
 use serde_json::Value;
 
 use super::driver::{self, Hint};
@@ -74,13 +74,15 @@ impl Manager {
         let mut reg = self.registry.lock().unwrap();
         let Some(rec) = reg.agents.get_mut(&id) else { return };
         let changed = match fact {
-            Fact::Attached { count, focused } => {
+            Fact::Attached { count, focused, tmux_locations } => {
                 let gained_focus = focused > rec.runtime.focused;
                 rec.runtime.focused = focused;
                 let attach_changed = rec.info.attached != count;
+                let locations_changed = rec.info.tmux_locations != tmux_locations;
                 rec.info.attached = count;
+                rec.info.tmux_locations = tmux_locations;
                 let seen = gained_focus && rec.info.activity == "done" && set(rec, "idle");
-                attach_changed || seen
+                attach_changed || locations_changed || seen
             }
             Fact::Input => {
                 rec.runtime.last_input = Some(Instant::now());
@@ -187,7 +189,11 @@ impl Manager {
 }
 
 pub enum Fact {
-    Attached { count: u32, focused: u32 },
+    Attached {
+        count: u32,
+        focused: u32,
+        tmux_locations: Vec<TmuxLocation>,
+    },
     Input,
     Ack,
     /// A freshly started agent can take input (see `Driver::ready_on_cursor`).
@@ -266,6 +272,7 @@ mod tests {
             activity: "unknown".into(),
             activity_since: None,
             attached: 0,
+            tmux_locations: Vec::new(),
             labels: Default::default(),
         })
     }

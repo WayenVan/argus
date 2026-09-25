@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
 use argus_proto::frame::{self, MAX_FRAME, ty};
+use argus_proto::msg::TmuxLocation;
 
 /// Backlog above which output is dropped in favour of a `Skipped` frame.
 const QUEUE_LIMIT: usize = 1024 * 1024;
@@ -50,6 +51,8 @@ pub struct Conn {
     pub size: (u16, u16),
     /// Whether this attached terminal reported having focus.
     pub focused: bool,
+    /// Where this particular attached terminal lives, when inside tmux.
+    pub tmux: Option<TmuxLocation>,
     pub dead: bool,
     inbuf: Vec<u8>,
     out: VecDeque<Queued>,
@@ -65,6 +68,7 @@ impl Conn {
             role: Role::New,
             size: (0, 0),
             focused: false,
+            tmux: None,
             dead: false,
             inbuf: Vec::new(),
             out: VecDeque::new(),
