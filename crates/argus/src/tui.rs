@@ -805,13 +805,18 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
             let idx = start + c;
             let tile = &tiles[idx];
             let mut spans = vec![
-                Span::styled("● ", Style::default().fg(activity_color(&tile.info, blink))),
+                Span::styled(activity_symbol(&tile.info), Style::default().fg(activity_color(&tile.info, blink))),
                 Span::raw(tile.info.name.clone()),
             ];
             if let Some(marker) = jump_marker(&tile.info, jump_socket) {
                 spans.push(marker);
             }
-            spans.push(Span::raw(format!(" · {}", tile.info.activity)));
+            let activity = format!(" · {}", tile.info.activity);
+            spans.push(if tile.info.status.is_live() && tile.info.activity == "blocked" {
+                Span::styled(activity, activity_text_style(&tile.info))
+            } else {
+                Span::raw(activity)
+            });
             let title = Line::from(spans);
             let border_color = if idx == selected { theme().mauve } else { theme().surface2 };
             let block = Block::default()
@@ -966,10 +971,11 @@ fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>, highlight: O
     match row {
         Row::Group { name, depth, count, expanded, .. } => {
             let indent = "  ".repeat(*depth);
-            let icon = if *expanded { "▾" } else { "▸" };
+            let icon = if *expanded { "⌄" } else { "❯" };
+            let icon_style = Style::default().fg(theme().overlay0).add_modifier(Modifier::BOLD);
             let line = Line::from(vec![
                 Span::raw(indent),
-                Span::styled(format!("{icon} "), Style::default().fg(theme().overlay0)),
+                Span::styled(format!("{icon} "), icon_style),
                 Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({count})"), Style::default().fg(theme().overlay0)),
             ]);
@@ -983,18 +989,22 @@ fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>, highlight: O
             let leaf = info.name.rsplit('/').next().unwrap_or(&info.name).to_string();
             let mut spans = vec![
                 Span::raw(indent),
-                Span::styled("● ", Style::default().fg(activity_color(info, blink))),
+                Span::styled(activity_symbol(info), Style::default().fg(activity_color(info, blink))),
                 Span::raw(leaf),
             ];
             if let Some(marker) = jump_marker(info, jump_socket) {
                 spans.push(marker);
             }
-            spans.push(Span::styled(format!("  {}", info.activity), Style::default().fg(theme().overlay0)));
+            spans.push(Span::styled(format!("  {}", info.activity), activity_text_style(info)));
             if let Some(style) = highlight {
                 // Skip the indent and the dot; the item style below still
                 // gives both the background.
                 for span in &mut spans[2..] {
                     span.style = span.style.patch(style);
+                }
+                if info.status.is_live() && info.activity == "blocked" {
+                    // Keep the warning color while retaining the selection background.
+                    spans.last_mut().unwrap().style = style.patch(activity_text_style(info));
                 }
                 return ListItem::new(Line::from(spans)).style(style);
             }
@@ -1191,6 +1201,20 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect { x, y, width, height }
+}
+
+/// A blocked agent needs a distinct shape as well as color: idle shares its
+/// yellow, but only blocked requires approval.
+fn activity_symbol(info: &AgentInfo) -> &'static str {
+    if info.status.is_live() && info.activity == "blocked" { "◉ " } else { "● " }
+}
+
+fn activity_text_style(info: &AgentInfo) -> Style {
+    if info.status.is_live() && info.activity == "blocked" {
+        Style::default().fg(theme().yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme().overlay0)
+    }
 }
 
 /// Status-colored dot: gray once exited, otherwise colored by `activity` —
@@ -1406,6 +1430,31 @@ mod tests {
             assert_eq!(buf[(1, 1)].bg, expected_bg, "band starts at the row's edge");
             assert_eq!(buf[(18, 1)].bg, expected_bg, "band fills the row");
         }
+    }
+
+    #[test]
+    fn blocked_agent_has_a_distinct_symbol_and_warning_text_when_selected() {
+        let mut info = agent(1, "a");
+        info.activity = "blocked".into();
+        assert_eq!(activity_symbol(&info), "◉ ");
+        assert_eq!(activity_text_style(&info).fg, Some(theme().yellow));
+
+        let rows = [Row::Agent { info, depth: 0 }];
+        let tree = TreeState { expanded: true, ..TreeState::default() };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 3)).unwrap();
+        terminal.draw(|frame| draw_tree_list(frame, frame.area(), &rows, &tree, true, None)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(3, 1)].symbol(), "◉");
+        assert_eq!(buf[(3, 1)].fg, theme().yellow);
+        assert_eq!(buf[(8, 1)].symbol(), "b");
+        assert_eq!(buf[(8, 1)].fg, theme().yellow);
+        assert_eq!(buf[(8, 1)].bg, theme().surface1);
+        assert!(buf[(8, 1)].modifier.contains(Modifier::BOLD));
+
+        let mut idle = agent(2, "b");
+        idle.activity = "idle".into();
+        assert_eq!(activity_symbol(&idle), "● ");
+        assert_eq!(activity_text_style(&idle).fg, Some(theme().overlay0));
     }
 
     #[test]
