@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600" role="img" aria-labelledby="title desc">
+  <title id="title">月夜山湖</title>
+  <desc id="desc">深蓝夜空中悬着月牙，流星划过群山，一艘小帆船漂在映着月光的湖面上。</desc>
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1">
+      <stop stop-color="#101b3e"/>
+      <stop offset="1" stop-color="#6677a8"/>
+    </linearGradient>
+    <linearGradient id="lake" x2="0" y2="1">
+      <stop stop-color="#526f9b"/>
+      <stop offset="1" stop-color="#172640"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="600" rx="32" fill="url(#sky)"/>
+  <g fill="#fff0d8">
+    <circle cx="100" cy="85" r="2"/>
+    <circle cx="240" cy="120" r="3"/>
+    <circle cx="390" cy="65" r="2"/>
+    <circle cx="670" cy="100" r="2"/>
+    <circle cx="720" cy="170" r="3"/>
+  </g>
+  <path d="M571 141a58 58 0 1 0 29 96 49 49 0 0 1-29-96Z" fill="#fff0c7"/>
+  <path d="m315 112 65 31" fill="none" stroke="#dbeaff" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="380" cy="143" r="3" fill="#fff"/>
+  <path d="M0 355 150 180 300 340 410 235 610 370 720 270 800 355V470H0Z" fill="#62547f"/>
+  <path d="m110 227 40-47 55 59-54-20Z" fill="#cfbfd5"/>
+  <path d="M0 405 190 290 355 410 560 305 800 420V490H0Z" fill="#393b61"/>
+  <path d="M0 425H800V568Q800 600 768 600H32Q0 600 0 568Z" fill="url(#lake)"/>
+  <g fill="none" stroke="#c9e0f5" stroke-linecap="round" opacity=".65">
+    <path d="M498 450h94" stroke-width="5"/>
+    <path d="M475 471h130" stroke-width="4"/>
+    <path d="M501 492h82" stroke-width="3"/>
+    <path d="M460 514h148" stroke-width="3"/>
+    <path d="M488 536h101" stroke-width="2"/>
+  </g>
+  <g transform="translate(330 463)">
+    <path d="M-43 0h86L28 16h-55Z" fill="#16233b"/>
+    <path d="M0-65V0" stroke="#e5d9bd" stroke-width="3"/>
+    <path d="M-5-59-5-7h-32Z" fill="#e5edf7"/>
+    <path d="M5-46 32-7H5Z" fill="#a4bcd9"/>
+    <path d="M-33 24h65m-52 9h39" fill="none" stroke="#a4bcd9" stroke-width="2" opacity=".45" stroke-linecap="round"/>
+  </g>
+  <path d="M0 536q90-30 170 8t150 56H32Q0 600 0 568Z" fill="#202940"/>
+  <g fill="#202940">
+    <path d="m85 420-35 76h23l-31 42h86l-31-42h23Z"/>
+    <rect x="80" y="523" width="10" height="39"/>
+    <path d="m160 455-27 58h18l-25 33h68l-25-33h18Z"/>
+    <rect x="156" y="538" width="8" height="30"/>
+  </g>
+</svg>
