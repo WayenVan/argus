@@ -189,7 +189,13 @@ pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
                 attach::Target { socket: paths::holder_socket(agent.id), name: agent.name, id: Some(agent.id) };
             attach::attach(
                 &target,
-                attach::Options { readonly: false, steal: false, replay: false, allow_clipboard_replay: false },
+                attach::Options {
+                    readonly: false,
+                    steal: false,
+                    replay: false,
+                    allow_clipboard_replay: false,
+                    shared_screen: false,
+                },
             )
         }
         Response::Agent { agent, .. } => {

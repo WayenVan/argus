@@ -510,7 +510,7 @@ fn event_loop(
                         KeyCode::Enter => {
                             if let Some(tile) = grid.tiles.get(grid.selected) {
                                 let (id, name) = (tile.info.id, tile.info.name.clone());
-                                attach_to(terminal, id, name)?;
+                                status = Some((attach_to(terminal, id, name)?, Instant::now()));
                                 last_tick = Instant::now() - PREVIEW_TICK;
                             }
                         }
@@ -535,7 +535,7 @@ fn event_loop(
                     KeyCode::Enter => match rows.get(tree.selected) {
                         Some(Row::Agent { info, .. }) => {
                             let (id, name) = (info.id, info.name.clone());
-                            attach_to(terminal, id, name)?;
+                            status = Some((attach_to(terminal, id, name)?, Instant::now()));
                             last_tick = Instant::now() - PREVIEW_TICK;
                         }
                         Some(Row::Group { path, expanded, .. }) => {
@@ -689,15 +689,25 @@ fn kill_status(conn: &mut Conn, id: u64, name: &str) -> String {
 }
 
 /// Gives `attach` the real terminal for the duration of the session, then
-/// reclaims it. `terminal.draw` right after would paint over a stale frame,
-/// so the caller resets its preview tick to refresh immediately.
-fn attach_to(terminal: &mut ratatui::DefaultTerminal, id: u64, name: String) -> Result<()> {
+/// reclaims it. The alternate screen is kept throughout so the normal screen
+/// never flashes by; it is re-entered anyway after, in case the agent left
+/// it. `terminal.draw` right after would paint over a stale frame, so the
+/// caller resets its preview tick to refresh immediately. Returns how the
+/// session ended for the footer: printing it would land on the normal screen
+/// and pile up there until the TUI exits.
+fn attach_to(terminal: &mut ratatui::DefaultTerminal, id: u64, name: String) -> Result<String> {
     let target = attach::Target { socket: argus_proto::paths::holder_socket(id), name, id: Some(id) };
-    ratatui::restore();
-    let opts = attach::Options { readonly: false, steal: false, replay: false, allow_clipboard_replay: false };
-    let _ = attach::attach(&target, opts);
-    *terminal = ratatui::init();
-    Ok(())
+    let opts = attach::Options {
+        readonly: false,
+        steal: false,
+        replay: false,
+        allow_clipboard_replay: false,
+        shared_screen: true,
+    };
+    let ending = attach::session(&target, opts).unwrap_or_else(|e| format!("attach failed: {e}"));
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    terminal.clear()?;
+    Ok(ending)
 }
 
 // ---------------------------------------------------------------------------

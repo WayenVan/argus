@@ -37,6 +37,7 @@ const FOCUS_OUT: &[u8] = b"\x1b[O";
 /// one leaves its last frame in the caller's scrollback after detach.
 const ENTER: &str = "\x1b[?1049h\x1b[?1004h";
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+const ALT_SCREEN_LEAVE: &str = "\x1b[?1049l";
 /// Home + clear, for when there is no screen restore to draw instead.
 const CLEAR: &str = "\x1b[H\x1b[2J";
 /// Leaves the agent's terminal modes behind: synchronized-output hold
@@ -54,6 +55,10 @@ pub struct Options {
     pub steal: bool,
     pub replay: bool,
     pub allow_clipboard_replay: bool,
+    /// The caller already holds the alternate screen and redraws it after:
+    /// the TUI. Switching screens around the session would flash whatever
+    /// the normal screen holds on the way in and out.
+    pub shared_screen: bool,
 }
 
 pub struct Target {
@@ -72,6 +77,14 @@ enum Ending {
 }
 
 pub fn attach(target: &Target, opts: Options) -> Result<()> {
+    eprintln!("{}", session(target, opts)?);
+    Ok(())
+}
+
+/// Runs one attach session and returns the line describing how it ended,
+/// leaving it to the caller whether to print it: the TUI shows it in its
+/// footer instead, so repeated attaches don't pile lines up behind it.
+pub fn session(target: &Target, opts: Options) -> Result<String> {
     if !isatty(io::stdin().as_raw_fd())? {
         bail!("attach needs a terminal on stdin");
     }
@@ -107,7 +120,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
 
     let ending = {
         let _raw = term::RawMode::enter()?;
-        let _display = DisplaySession::enter();
+        let _display = DisplaySession::enter(opts.shared_screen);
         match &restore {
             // Only worth drawing if it is a real redraw of the size we are
             // about to show it at; otherwise the holder will resize the PTY
@@ -120,13 +133,12 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
         pump(stream, opts.readonly)
     };
 
-    match ending? {
-        Ending::Detached => eprintln!("[detached from {}]", target.name),
-        Ending::Exited(code) => eprintln!("[{} exited with code {code}]", target.name),
-        Ending::Kicked => eprintln!("[{} was attached elsewhere]", target.name),
-        Ending::Lost => eprintln!("[connection to {} lost]", target.name),
-    }
-    Ok(())
+    Ok(match ending? {
+        Ending::Detached => format!("[detached from {}]", target.name),
+        Ending::Exited(code) => format!("[{} exited with code {code}]", target.name),
+        Ending::Kicked => format!("[{} was attached elsewhere]", target.name),
+        Ending::Lost => format!("[connection to {} lost]", target.name),
+    })
 }
 
 struct Restore {
@@ -399,18 +411,24 @@ impl Drop for SignalRegistration {
 
 /// Keeps the agent's drawing off the caller's normal screen and restores all
 /// terminal modes even when attaching returns with an error or unwinds.
-struct DisplaySession;
+struct DisplaySession {
+    shared: bool,
+}
 
 impl DisplaySession {
-    fn enter() -> Self {
-        print_raw(ENTER);
-        Self
+    fn enter(shared: bool) -> Self {
+        print_raw(if shared { ENTER.trim_start_matches("\x1b[?1049h") } else { ENTER });
+        Self { shared }
     }
 }
 
 impl Drop for DisplaySession {
     fn drop(&mut self) {
-        print_raw(RESET);
+        if self.shared {
+            print_raw(&RESET.replace(ALT_SCREEN_LEAVE, ""));
+        } else {
+            print_raw(RESET);
+        }
         print_raw(&term::restore_cursor_shape());
     }
 }

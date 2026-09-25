@@ -240,9 +240,10 @@ fn main() -> ExitCode {
         Command::Run { name, group, cwd, detach, label, kind, program, args } => {
             client::run(client::RunOptions { name, group, cwd, labels: label, kind, attach: !detach }, program, args)
         }
-        Command::Attach { target, ro, steal, replay, allow_clipboard_replay } => {
-            client::attach(target, attach::Options { readonly: ro, steal, replay, allow_clipboard_replay })
-        }
+        Command::Attach { target, ro, steal, replay, allow_clipboard_replay } => client::attach(
+            target,
+            attach::Options { readonly: ro, steal, replay, allow_clipboard_replay, shared_screen: false },
+        ),
         Command::Ps { prefix, all, label, watch, json } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
         }
