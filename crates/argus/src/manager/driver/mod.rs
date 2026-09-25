@@ -9,6 +9,7 @@
 mod claude;
 mod codex;
 mod generic;
+mod opencode;
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,8 @@ pub enum Hint {
 /// The command a holder will execute, as a driver may rewrite it.
 pub struct Launch {
     pub command: Vec<String>,
+    /// The agent's environment, starting as the client's.
+    pub env: Vec<(String, String)>,
     /// The agent's own state directory, for per-agent files.
     pub agent_dir: PathBuf,
 }
@@ -59,7 +62,14 @@ pub trait Driver: Send + Sync {
         None
     }
 
-    /// Rewrites the launch command. Returns a warning to show the user when
+    /// Whether a freshly started agent is at its prompt once it shows a
+    /// cursor on its alternate screen: for agents that report nothing before
+    /// the first prompt and drop keys typed before their input is set up.
+    fn ready_on_cursor(&self) -> bool {
+        false
+    }
+
+    /// Rewrites the launch command or environment. Returns a warning to show the user when
     /// state tracking will be degraded; the agent is started regardless.
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>>;
 
@@ -70,19 +80,24 @@ pub trait Driver: Send + Sync {
 static CLAUDE: claude::Claude = claude::Claude;
 static CODEX: codex::Codex = codex::Codex;
 static GENERIC: generic::Generic = generic::Generic;
+static OPENCODE: opencode::Opencode = opencode::Opencode;
 
 /// The driver for a kind; unknown kinds get the generic driver.
 pub fn for_kind(kind: &str) -> &'static dyn Driver {
     match kind {
         "claude" => &CLAUDE,
         "codex" => &CODEX,
+        "opencode" => &OPENCODE,
         _ => &GENERIC,
     }
 }
 
-/// Writes the files drivers share across agents (e.g. Claude's hook settings).
+/// Writes the files drivers share across agents (e.g. Claude's hook
+/// settings, opencode's plugin). Rewritten at every manager start and never
+/// removed, since running agents may still read them.
 pub fn install_shared_files(ctx: &Context) -> Result<()> {
-    claude::write_shared_settings(ctx)
+    claude::write_shared_settings(ctx)?;
+    opencode::write_shared_files(ctx)
 }
 
 /// Injected as a system-prompt/developer-instruction addition at launch, so

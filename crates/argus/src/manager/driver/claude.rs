@@ -177,7 +177,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let ctx = Context { hook_exe: Some(PathBuf::from("/opt/argus hook")), dir: dir.clone() };
 
-        let mut launch = Launch { command: vec!["claude".into(), "-c".into()], agent_dir: dir.clone() };
+        let mut launch = Launch { command: vec!["claude".into(), "-c".into()], env: vec![], agent_dir: dir.clone() };
         Claude.prepare(&mut launch, &ctx).unwrap();
         // Each `splice(1..1, ..)` lands right after the program name, so the
         // one that runs second (the settings injection) ends up first.
@@ -187,8 +187,11 @@ mod tests {
         assert_eq!(launch.command[5], "-c", "the user's own trailing arg is kept, just pushed further out");
 
         let user = r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"mine"}]}]}}"#;
-        let mut launch =
-            Launch { command: vec!["claude".into(), "--settings".into(), user.into()], agent_dir: dir.clone() };
+        let mut launch = Launch {
+            command: vec!["claude".into(), "--settings".into(), user.into()],
+            env: vec![],
+            agent_dir: dir.clone(),
+        };
         Claude.prepare(&mut launch, &ctx).unwrap();
         let merged: Value = serde_json::from_str(&fs::read_to_string(&launch.command[4]).unwrap()).unwrap();
         assert_eq!(merged["model"], "opus");

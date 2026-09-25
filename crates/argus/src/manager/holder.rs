@@ -22,7 +22,14 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Launches `argus-holder` and waits for it to report the agent is running.
 /// Returns `(holder_pid, agent_pid)`.
-pub async fn start(holder_exe: &Path, id: u64, req: &RunRequest, command: Vec<String>) -> Result<(u32, u32)> {
+/// `command` and `env` are the request's, as the driver prepared them.
+pub async fn start(
+    holder_exe: &Path,
+    id: u64,
+    req: &RunRequest,
+    command: Vec<String>,
+    env: Vec<(String, String)>,
+) -> Result<(u32, u32)> {
     let dir = paths::agent_dir(id);
     paths::ensure_private_dir(&dir)?;
     let log_file = OpenOptions::new().create(true).append(true).open(dir.join("holder.log"))?;
@@ -30,7 +37,7 @@ pub async fn start(holder_exe: &Path, id: u64, req: &RunRequest, command: Vec<St
         id,
         command,
         cwd: req.cwd.clone(),
-        env: req.env.clone(),
+        env,
         rows: req.rows,
         cols: req.cols,
         socket: paths::holder_socket(id),

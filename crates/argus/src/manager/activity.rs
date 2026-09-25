@@ -96,6 +96,8 @@ impl Manager {
                 }
             }
             Fact::Ack => rec.info.activity == "done" && set(rec, "idle"),
+            // Nothing has reported otherwise since it started.
+            Fact::Ready => rec.info.activity == "unknown" && set(rec, "idle"),
         };
         if changed {
             reg.changed(id);
@@ -188,6 +190,8 @@ pub enum Fact {
     Attached { count: u32, focused: u32 },
     Input,
     Ack,
+    /// A freshly started agent can take input (see `Driver::ready_on_cursor`).
+    Ready,
 }
 
 /// Ties hook reports to one agent session. `ARGUS_AGENT_ID` is inherited by

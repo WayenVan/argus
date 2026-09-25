@@ -354,13 +354,13 @@ impl Manager {
 
         let dir = paths::agent_dir(info.id);
         paths::ensure_private_dir(&dir)?;
-        let mut launch = driver::Launch { command: req.command.clone(), agent_dir: dir };
+        let mut launch = driver::Launch { command: req.command.clone(), env: req.env.clone(), agent_dir: dir };
         let warnings: Vec<String> = match driver.prepare(&mut launch, &self.drivers) {
             Ok(w) => w.into_iter().collect(),
             Err(e) => vec![format!("{} setup failed, activity will not be tracked: {e:#}", driver.kind())],
         };
 
-        match holder::start(&self.holder_exe, info.id, &req, launch.command).await {
+        match holder::start(&self.holder_exe, info.id, &req, launch.command, launch.env).await {
             Ok((holder_pid, agent_pid)) => {
                 let info = {
                     let mut reg = self.registry.lock().unwrap();
@@ -378,7 +378,7 @@ impl Manager {
                     info
                 };
                 holder::link_name(&info.name, info.id);
-                self.follow(info.id);
+                self.follow(info.id, driver.ready_on_cursor());
                 log(&format!("started {} (id {}, holder {holder_pid}, agent {agent_pid})", info.name, info.id));
                 Ok((info, warnings))
             }
@@ -461,12 +461,14 @@ impl Manager {
         log(&format!("recovering {} live agents", live.len()));
         for (id, name) in live {
             holder::link_name(&name, id);
-            self.follow(id);
+            // Not `ready_on_cursor`: a recovered agent may be mid-turn.
+            self.follow(id, false);
         }
     }
 
     /// Follows a holder's events until the agent exits, then records it.
-    fn follow(self: &Arc<Self>, id: u64) {
+    /// `ready_on_cursor`: see [`driver::Driver::ready_on_cursor`].
+    fn follow(self: &Arc<Self>, id: u64, ready_on_cursor: bool) {
         let hookless = {
             let reg = self.registry.lock().unwrap();
             reg.agents.get(&id).is_some_and(|r| !driver::for_kind(&r.info.kind).has_hooks())
@@ -474,7 +476,11 @@ impl Manager {
         if hookless {
             self.poll_output(id);
         }
-        self.screens.track(id);
+        let on_cursor = ready_on_cursor.then(|| {
+            let manager = self.clone();
+            Box::new(move || manager.on_fact(id, Fact::Ready)) as Box<dyn FnOnce() + Send>
+        });
+        self.screens.track(id, on_cursor);
         let manager = self.clone();
         tokio::spawn(async move {
             let on_event = |event: HolderEvent| match event {

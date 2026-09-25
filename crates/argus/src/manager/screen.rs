@@ -43,11 +43,21 @@ impl Screens {
     /// virtual terminal in sync until the agent exits or the connection is
     /// lost. A separate holder connection from the lifecycle `follow` task,
     /// kept simple rather than threading screen state through it.
-    pub fn track(self: &Arc<Self>, id: u64) {
+    ///
+    /// `on_cursor` runs once, the first time the agent shows a cursor on its
+    /// alternate screen.
+    pub fn track(self: &Arc<Self>, id: u64, on_cursor: Option<Box<dyn FnOnce() + Send>>) {
         let screens = self.clone();
+        let mut on_cursor = on_cursor;
         tokio::spawn(async move {
             let on_event = |event: HolderEvent| screens.on_event(id, event);
-            let on_data = |start: u64, bytes: &[u8]| screens.on_data(id, start, bytes);
+            let on_data = |start: u64, bytes: &[u8]| {
+                if screens.on_data(id, start, bytes)
+                    && let Some(f) = on_cursor.take()
+                {
+                    f();
+                }
+            };
             let _ = holder::follow_screen(id, on_event, on_data).await;
             screens.states.lock().unwrap().remove(&id);
         });
@@ -66,11 +76,14 @@ impl Screens {
         }
     }
 
-    fn on_data(&self, id: u64, start: u64, bytes: &[u8]) {
+    /// Returns whether the agent is showing a cursor on its alternate screen.
+    fn on_data(&self, id: u64, start: u64, bytes: &[u8]) -> bool {
         let mut states = self.states.lock().unwrap();
-        let Some(state) = states.get_mut(&id) else { return }; // No size yet.
+        let Some(state) = states.get_mut(&id) else { return false }; // No size yet.
         state.parser.process(bytes);
         state.offset = start + bytes.len() as u64;
+        let screen = state.parser.screen();
+        screen.alternate_screen() && !screen.hide_cursor()
     }
 
     /// How `id`'s screen should be restored. `since_offset` lets a caller
@@ -328,6 +341,15 @@ mod tests {
         let s = screens();
         s.on_data(1, 0, b"too early");
         assert_eq!(s.get(1, None).mode, ScreenMode::Unavailable);
+    }
+
+    #[test]
+    fn cursor_counts_only_once_shown_on_the_alternate_screen() {
+        let s = screens();
+        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
+        assert!(!s.on_data(1, 0, b"$ "), "the primary screen's default cursor is not a prompt");
+        assert!(!s.on_data(1, 2, b"\x1b[?1049h\x1b[?25l"), "entered, cursor hidden while loading");
+        assert!(s.on_data(1, 16, b"\x1b[?25h"));
     }
 
     #[test]
