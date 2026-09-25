@@ -17,3 +17,9 @@ pub const MANAGER_PROTOCOL_VERSION: u32 = 2;
 /// Manager/client ↔ holder protocol. Kept independent so a new manager can
 /// reconnect to holders left running by an older installation.
 pub const HOLDER_PROTOCOL_VERSION: u32 = 1;
+
+/// This build: the crate version plus the git commit it was built at, when
+/// known. Reported in `Hello` replies so a client can tell that the manager
+/// (or a holder) still runs code from an older install; unlike the protocol
+/// versions it changes with every commit, and is only ever informational.
+pub const BUILD: &str = env!("ARGUS_BUILD");

@@ -330,6 +330,7 @@ impl Holder {
                 version: HOLDER_PROTOCOL_VERSION,
                 pid: std::process::id(),
                 capabilities: HOLDER_CAPABILITIES.to_vec(),
+                build: Some(argus_proto::BUILD.to_string()),
             },
             Ok(HolderRequest::Info) => HolderResponse::Info(HolderInfo {
                 id: self.spec.id,

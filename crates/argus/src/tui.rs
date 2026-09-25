@@ -21,7 +21,7 @@ use argus_proto::msg::{AgentInfo, Capability, PreviewColor, PreviewLine, Preview
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -425,7 +425,10 @@ fn event_loop(
         }
 
         let status_line = status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TTL).map(|(msg, _)| msg.as_str());
-        terminal.draw(|frame| draw(frame, mode, &grid, &tree, &rows, &overlay, status_line, jump_socket.as_deref()))?;
+        let stale = conn.stale_manager().is_some();
+        terminal.draw(|frame| {
+            draw(frame, mode, &grid, &tree, &rows, &overlay, status_line, jump_socket.as_deref(), stale)
+        })?;
 
         let timeout = INPUT_POLL.min(PREVIEW_TICK.saturating_sub(last_tick.elapsed()));
         if !event::poll(timeout)? {
@@ -1039,11 +1042,12 @@ fn draw(
     overlay: &Overlay,
     status: Option<&str>,
     jump_socket: Option<&str>,
+    stale_manager: bool,
 ) {
     let area = frame.area();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(area);
     let blink = blink_on();
-    draw_tabs(frame, chunks[0], mode);
+    draw_tabs(frame, chunks[0], mode, stale_manager);
     match mode {
         Mode::Grid => draw_grid(frame, chunks[1], &grid.tiles, grid.selected, blink, jump_socket),
         Mode::Tree => draw_tree(frame, chunks[1], rows, tree, blink, jump_socket),
@@ -1052,7 +1056,9 @@ fn draw(
     draw_overlay(frame, area, overlay);
 }
 
-fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode) {
+/// `stale_manager`: the manager is another build (see `Conn::stale_manager`),
+/// flagged on the right for as long as that lasts.
+fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode, stale_manager: bool) {
     let mut spans = vec![Span::styled(" argus ", Style::default().fg(theme().mauve).add_modifier(Modifier::BOLD))];
     for m in Mode::ALL {
         spans.push(Span::raw(" "));
@@ -1063,7 +1069,13 @@ fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode) {
         };
         spans.push(Span::styled(format!(" {} ", m.label()), style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme().mantle)), area);
+    let bar = Style::default().bg(theme().mantle);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+    if stale_manager {
+        let notice =
+            Line::styled("manager is a different build · argus manager restart ", Style::default().fg(theme().yellow));
+        frame.render_widget(Paragraph::new(notice).alignment(Alignment::Right).style(bar), area);
+    }
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, status: Option<&str>) {
@@ -1394,5 +1406,15 @@ mod tests {
             assert_eq!(buf[(1, 1)].bg, expected_bg, "band starts at the row's edge");
             assert_eq!(buf[(18, 1)].bg, expected_bg, "band fills the row");
         }
+    }
+
+    #[test]
+    fn stale_manager_notice_shares_the_tab_bar() {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+        terminal.draw(|frame| draw_tabs(frame, frame.area(), Mode::Tree, true)).unwrap();
+        let line: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(line.starts_with(" argus "), "{line:?}");
+        assert!(line.contains(" Tree "), "{line:?}");
+        assert!(line.trim_end().ends_with("argus manager restart"), "{line:?}");
     }
 }

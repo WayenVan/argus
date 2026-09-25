@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "argus", version, about = "Lightweight manager for long-running terminal agents")]
+#[command(name = "argus", version = argus_proto::BUILD, about = "Lightweight manager for long-running terminal agents")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

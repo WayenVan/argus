@@ -3,26 +3,36 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
-use argus_proto::msg::{AgentInfo, Capability, MANAGER_CAPABILITIES, Request, Response, RunRequest, now_secs};
-use argus_proto::{MANAGER_PROTOCOL_VERSION, paths};
+use argus_proto::msg::{
+    AgentInfo, Capability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, MANAGER_CAPABILITIES, Request, Response,
+    RunRequest, now_secs,
+};
+use argus_proto::{BUILD, HOLDER_PROTOCOL_VERSION, MANAGER_PROTOCOL_VERSION, paths};
 use nix::sys::signal::kill as signal_process;
-use nix::unistd::{Pid, setsid};
+use nix::unistd::{Pid, isatty, setsid};
 
 use crate::{attach, naming, stream, term};
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// `Conn::connect` warns about a stale manager at most once per process.
+static STALE_WARNED: AtomicBool = AtomicBool::new(false);
+
 pub struct Conn {
     stream: UnixStream,
     capabilities: Vec<Capability>,
+    /// The manager's `BUILD`; `None` from a manager that predates it.
+    manager_build: Option<String>,
 }
 
 impl Conn {
@@ -37,10 +47,11 @@ impl Conn {
             }
             Err(_) => return Ok(None),
         };
-        let mut conn = Conn { stream, capabilities: Vec::new() };
+        let mut conn = Conn { stream, capabilities: Vec::new(), manager_build: None };
         match conn.request(&hello_request())? {
-            Response::Hello { version, capabilities, .. } if version == MANAGER_PROTOCOL_VERSION => {
+            Response::Hello { version, capabilities, build, .. } if version == MANAGER_PROTOCOL_VERSION => {
                 conn.capabilities = capabilities;
+                conn.manager_build = build;
                 Ok(Some(conn))
             }
             Response::Hello { version, .. } => bail!(
@@ -50,8 +61,30 @@ impl Conn {
         }
     }
 
+    /// Like `open(true)`, for commands run from a shell: also warns, once
+    /// and only on a terminal, when the manager is a different build.
     pub fn connect() -> Result<Conn> {
-        Ok(Conn::open(true)?.expect("autostart always yields a connection"))
+        let conn = Conn::open(true)?.expect("autostart always yields a connection");
+        if let Some(notice) = conn.stale_manager()
+            && isatty(io::stderr().as_raw_fd()).unwrap_or(false)
+            && !STALE_WARNED.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("argus: {notice}");
+        }
+        Ok(conn)
+    }
+
+    /// Set when the running manager is not this build — typically an
+    /// upgrade installed without `argus manager restart`, which leaves the
+    /// old manager serving the old code.
+    pub fn stale_manager(&self) -> Option<String> {
+        let build = self.manager_build.as_deref();
+        (build != Some(BUILD)).then(|| {
+            format!(
+                "the manager runs {}, this argus is {BUILD}; `argus manager restart` to switch",
+                build.unwrap_or("an older build")
+            )
+        })
     }
 
     pub fn supports(&self, capability: Capability) -> bool {
@@ -439,15 +472,44 @@ pub fn manager_status() -> Result<()> {
         println!("manager is not running");
         return Ok(());
     };
-    let Response::Hello { pid, version, capabilities } = conn.request(&hello_request())? else {
+    let Response::Hello { pid, version, capabilities, build } = conn.request(&hello_request())? else {
         bail!("unexpected reply to Hello");
     };
     let agents = conn.list(true)?;
     let running = agents.iter().filter(|a| a.status.is_live()).count();
     println!("manager running (pid {pid}, protocol v{version}), {running} running / {} total agents", agents.len());
+    println!("build: {} (this argus: {BUILD})", build.as_deref().unwrap_or("unknown, older"));
+    if let Some(notice) = conn.stale_manager() {
+        println!("note: {notice}");
+    }
+    // Holders outlive upgrades by design (their agents keep running), so an
+    // older one is expected; listed so it is not a surprise when debugging.
+    let older: Vec<String> = agents
+        .iter()
+        .filter(|a| a.status.is_live())
+        .filter_map(|a| {
+            let build = holder_build(a.id);
+            (build.as_deref() != Some(BUILD)).then(|| format!("{} ({})", a.name, build.as_deref().unwrap_or("older")))
+        })
+        .collect();
+    if !older.is_empty() {
+        println!("agents on an older holder (restart them to upgrade): {}", older.join(", "));
+    }
     println!("capabilities: {}", capabilities.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", "));
     println!("socket: {}", paths::manager_socket().display());
     Ok(())
+}
+
+/// The `BUILD` a running holder reports; `None` when it predates that or
+/// cannot be reached.
+fn holder_build(id: u64) -> Option<String> {
+    let mut stream = UnixStream::connect(paths::holder_socket(id)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    let hello = HolderRequest::Hello { version: HOLDER_PROTOCOL_VERSION, capabilities: HOLDER_CAPABILITIES.to_vec() };
+    match attach::call(&mut stream, &hello).ok()? {
+        HolderResponse::Hello { build, .. } => build,
+        _ => None,
+    }
 }
 
 fn hello_request() -> Request {

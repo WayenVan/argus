@@ -258,6 +258,10 @@ pub enum Response {
         pid: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         capabilities: Vec<Capability>,
+        /// [`crate::BUILD`] of the replying process; absent from builds
+        /// that predate it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
     },
     Agent {
         agent: AgentInfo,
@@ -517,6 +521,10 @@ pub enum HolderResponse {
         pid: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         capabilities: Vec<Capability>,
+        /// [`crate::BUILD`] of the replying process; absent from builds
+        /// that predate it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
     },
     Info(HolderInfo),
     Ok,
@@ -566,7 +574,10 @@ mod compatibility_tests {
         assert!(matches!(request, Request::Hello { capabilities, .. } if capabilities.is_empty()));
 
         let holder: HolderResponse = serde_json::from_str(r#"{"type":"Hello","version":1,"pid":42}"#).unwrap();
-        assert!(matches!(holder, HolderResponse::Hello { capabilities, .. } if capabilities.is_empty()));
+        assert!(matches!(holder, HolderResponse::Hello { capabilities, build: None, .. } if capabilities.is_empty()));
+
+        let manager: Response = serde_json::from_str(r#"{"type":"Hello","version":2,"pid":42}"#).unwrap();
+        assert!(matches!(manager, Response::Hello { build: None, .. }));
     }
 
     #[test]
