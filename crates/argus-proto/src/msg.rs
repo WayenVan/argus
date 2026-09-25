@@ -35,6 +35,141 @@ impl AgentStatus {
     }
 }
 
+/// What an agent is doing, as decided by the manager's activity state
+/// machine. On the wire it is a plain string (`idle`, `tool:Bash`, ...); a
+/// string this build does not know reads as `Unknown`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Activity {
+    /// At its prompt, waiting for input.
+    Idle,
+    /// Finished a turn nobody has looked at yet.
+    Done,
+    Working,
+    /// Running the named tool.
+    Tool(String),
+    /// Waiting for a permission answer.
+    Blocked,
+    Error,
+    #[default]
+    Unknown,
+    /// Printing output; for agents without hooks.
+    Busy,
+    /// No recent output; for agents without hooks.
+    Quiet,
+}
+
+/// Whether an agent can be counted on or left alone. Coarser than
+/// [`Activity`]; this is what scripts and other agents should decide on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Availability {
+    /// Doing something.
+    Active,
+    /// Not doing anything: free to take a prompt or be counted on. Named
+    /// apart from the `idle` activity, which is only one of the activities
+    /// that map here.
+    Free,
+    /// Waiting on a person: a permission prompt or an error.
+    Attention,
+    /// No reliable signal.
+    Unknown,
+    /// No longer running.
+    Exited,
+}
+
+impl Activity {
+    /// Whether typing a prompt (`argus send`) is safe. `done` counts: it is
+    /// `idle` that nobody has looked at yet. `quiet` does not: a hook-less
+    /// agent may just be thinking.
+    pub fn awaits_prompt(&self) -> bool {
+        matches!(self, Activity::Idle | Activity::Done)
+    }
+
+    /// The one mapping from activity to availability. `quiet` counts as free
+    /// because hook-less agents have no better signal.
+    pub fn availability(&self) -> Availability {
+        match self {
+            Activity::Working | Activity::Tool(_) | Activity::Busy => Availability::Active,
+            Activity::Idle | Activity::Done | Activity::Quiet => Availability::Free,
+            Activity::Blocked | Activity::Error => Availability::Attention,
+            Activity::Unknown => Availability::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for Activity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Activity::Idle => "idle",
+            Activity::Done => "done",
+            Activity::Working => "working",
+            Activity::Tool(name) => return write!(f, "tool:{name}"),
+            Activity::Blocked => "blocked",
+            Activity::Error => "error",
+            Activity::Unknown => "unknown",
+            Activity::Busy => "busy",
+            Activity::Quiet => "quiet",
+        })
+    }
+}
+
+impl From<&str> for Activity {
+    fn from(s: &str) -> Self {
+        match s {
+            "idle" => Activity::Idle,
+            "done" => Activity::Done,
+            "working" => Activity::Working,
+            "blocked" => Activity::Blocked,
+            "error" => Activity::Error,
+            "busy" => Activity::Busy,
+            "quiet" => Activity::Quiet,
+            _ => match s.strip_prefix("tool:") {
+                Some(name) => Activity::Tool(name.to_string()),
+                None => Activity::Unknown,
+            },
+        }
+    }
+}
+
+impl Serialize for Activity {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Activity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(String::deserialize(d)?.as_str().into())
+    }
+}
+
+impl std::fmt::Display for Availability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Availability::Active => "active",
+            Availability::Free => "free",
+            Availability::Attention => "attention",
+            Availability::Unknown => "unknown",
+            Availability::Exited => "exited",
+        })
+    }
+}
+
+impl std::str::FromStr for Availability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(match s {
+            "active" => Availability::Active,
+            "free" => Availability::Free,
+            "attention" => Availability::Attention,
+            "unknown" => Availability::Unknown,
+            "exited" => Availability::Exited,
+            _ => return Err(format!("expected free, active, attention, unknown or exited; got {s:?}")),
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentInfo {
     pub id: u64,
@@ -57,8 +192,8 @@ pub struct AgentInfo {
     /// What the agent is doing, as understood by its driver: `working`,
     /// `tool:<name>`, `blocked`, `done`, `idle`, `error`,
     /// `unknown`; `busy` / `quiet` for agents without hooks.
-    #[serde(default = "unknown")]
-    pub activity: String,
+    #[serde(default)]
+    pub activity: Activity,
     /// Unix seconds when `activity` last changed.
     #[serde(default)]
     pub activity_since: Option<u64>,
@@ -72,15 +207,18 @@ pub struct AgentInfo {
     pub labels: BTreeMap<String, String>,
 }
 
+impl AgentInfo {
+    /// [`Activity::availability`], or `Exited` once the agent is not live.
+    pub fn availability(&self) -> Availability {
+        if self.status.is_live() { self.activity.availability() } else { Availability::Exited }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TmuxLocation {
     /// The tmux server socket; pane IDs are only unique within one server.
     pub socket: String,
     pub pane: String,
-}
-
-fn unknown() -> String {
-    "unknown".into()
 }
 
 // ---------------------------------------------------------------------------
@@ -553,13 +691,6 @@ pub struct ExitRecord {
     pub exited_at: u64,
 }
 
-/// Whether an agent with this activity is waiting for a prompt, so typing
-/// one (`argus send`) is safe. `done` counts: it is `idle` that nobody has
-/// looked at yet.
-pub fn awaits_prompt(activity: &str) -> bool {
-    matches!(activity, "idle" | "done")
-}
-
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -567,6 +698,37 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
+
+    #[test]
+    fn activity_is_a_plain_string_on_the_wire() {
+        for text in
+            ["idle", "done", "working", "tool:Bash", "tool:mcp__x__y", "blocked", "error", "unknown", "busy", "quiet"]
+        {
+            let activity: Activity = serde_json::from_value(serde_json::json!(text)).unwrap();
+            assert_eq!(serde_json::to_value(&activity).unwrap(), serde_json::json!(text));
+        }
+        // A newer manager's activity reads as unknown instead of failing.
+        let activity: Activity = serde_json::from_str(r#""pondering""#).unwrap();
+        assert_eq!(activity, Activity::Unknown);
+    }
+
+    #[test]
+    fn availability_of_each_activity() {
+        use Availability::*;
+        for (text, expected) in [
+            ("working", Active),
+            ("tool:Bash", Active),
+            ("busy", Active),
+            ("idle", Free),
+            ("done", Free),
+            ("quiet", Free),
+            ("blocked", Attention),
+            ("error", Attention),
+            ("unknown", Unknown),
+        ] {
+            assert_eq!(Activity::from(text).availability(), expected, "{text}");
+        }
+    }
 
     #[test]
     fn hello_capabilities_are_optional_for_older_peers() {

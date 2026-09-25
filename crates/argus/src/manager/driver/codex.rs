@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use argus_proto::msg::Activity;
 use serde_json::Value;
 
 use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command};
@@ -39,9 +40,9 @@ impl Driver for Codex {
         true
     }
 
-    fn initial_activity(&self) -> Option<&'static str> {
+    fn initial_activity(&self) -> Option<Activity> {
         // At its prompt; the first hook only arrives with the first prompt.
-        Some("idle")
+        Some(Activity::Idle)
     }
 
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {

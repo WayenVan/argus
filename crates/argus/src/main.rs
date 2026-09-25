@@ -5,17 +5,22 @@
 
 mod attach;
 mod client;
+mod errors;
 mod manager;
 mod naming;
+mod output;
+mod query;
 mod stream;
 mod term;
 mod theme;
 mod tmux;
 mod tui;
+mod wait;
 
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use output::OutputArgs;
 
 #[derive(Parser)]
 #[command(name = "argus", version = argus_proto::BUILD, about = "Lightweight manager for long-running terminal agents")]
@@ -46,6 +51,8 @@ enum Command {
         /// Treat the program as this kind of agent (e.g. a wrapper script for claude)
         #[arg(long)]
         kind: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Program to run; its name selects the kind unless --kind is given
         program: String,
         /// Arguments passed to the program
@@ -65,8 +72,38 @@ enum Command {
         /// Keep the list on screen and update it as agents change
         #[arg(short, long, conflicts_with = "json")]
         watch: bool,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Show one agent in full
+    Inspect {
+        /// ID, name, or `self` for the agent running this command
+        target: String,
+        /// Also print its current screen as plain text
         #[arg(long)]
-        json: bool,
+        screen: bool,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Agents working in a directory, and whether they are all free.
+    /// Leaves out the agent running this command
+    Status {
+        /// Directory (default: the current one)
+        path: Option<std::path::PathBuf>,
+        /// Which working directories count as in PATH
+        #[arg(long, value_enum, default_value = "under")]
+        scope: query::Scope,
+        /// Include exited agents
+        #[arg(short, long)]
+        all: bool,
+        /// Include the agent running this command
+        #[arg(long)]
+        include_self: bool,
+        /// Only agents with this label (repeatable; all must match)
+        #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
+        label: Vec<(String, String)>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Full-screen dashboard: a live thumbnail grid of every agent's screen
     Grid {
@@ -126,14 +163,23 @@ enum Command {
         /// Give up after this many seconds, counting both waits (exit 124)
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Rename an agent: a new last segment, a full path, or `group/`
-    Rename { target: String, name: String },
+    Rename {
+        target: String,
+        name: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Move an agent into another group, keeping its last segment
     Mv {
         target: String,
         /// Destination group; `/` for the top level
         group: String,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Set (key=value) or remove (key-) labels
     Label {
@@ -141,24 +187,49 @@ enum Command {
         target: String,
         #[arg(required = true, value_name = "KEY=VALUE|KEY-")]
         changes: Vec<String>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Mark a finished agent as seen (done → idle)
-    Ack { target: String },
+    Ack {
+        target: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Print agent events as they happen
     Events {
-        /// One JSON object per line
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
-    /// Block until an agent exits (exiting with its code) or reaches an activity
+    /// Block until agents are free (their turn is over) or reach another
+    /// state; with several, until all have. One agent waited on to exit
+    /// passes on its exit code
     Wait {
-        target: String,
-        /// `exited`, or an activity such as `waiting`
-        #[arg(long, default_value = "exited")]
-        until: String,
+        /// IDs, names or `group/**`
+        #[arg(required_unless_present = "dir")]
+        targets: Vec<String>,
+        /// Wait for every running agent working in this directory instead,
+        /// as `argus status` lists them (not the one running this command)
+        #[arg(long, value_name = "PATH", conflicts_with = "targets")]
+        dir: Option<std::path::PathBuf>,
+        /// With --dir: which working directories count as in PATH [default: under]
+        #[arg(long, value_enum)]
+        scope: Option<query::Scope>,
+        /// With --dir: only agents with this label (repeatable)
+        #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
+        label: Vec<(String, String)>,
+        /// The availability to wait for: `free`, `active`, `attention`,
+        /// `unknown`, or `exited` (the process ended)
+        #[arg(long, value_name = "AVAILABILITY", default_value = "free", value_parser = wait::parse_availability)]
+        until: argus_proto::msg::Availability,
+        /// Wait for one exact activity instead, such as `done` or `tool:Bash`
+        #[arg(long, value_name = "ACTIVITY", value_parser = wait::parse_activity, conflicts_with = "until")]
+        until_activity: Option<argus_proto::msg::Activity>,
         /// Give up after this many seconds (exit code 124)
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Take over an agent's terminal (detach with Ctrl-\)
     Attach {
@@ -184,9 +255,15 @@ enum Command {
         /// Signal number to send instead of SIGTERM
         #[arg(short, long)]
         signal: Option<i32>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Remove an exited agent
-    Rm { target: String },
+    Rm {
+        target: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Remove every exited agent
     Prune {
         /// Only agents under this group prefix
@@ -194,6 +271,8 @@ enum Command {
         /// Only agents that ended longer ago than this, e.g. 30m, 24h, 7d
         #[arg(long, value_name = "AGE", value_parser = parse_age)]
         older_than: Option<u64>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Manage the manager process
     Manager {
@@ -205,17 +284,28 @@ enum Command {
 #[derive(Subcommand)]
 enum ManagerAction {
     /// Start the manager if it is not running
-    Start,
+    Start {
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Restart the manager (e.g. after upgrading); running agents keep running
-    Restart,
+    Restart {
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Stop the manager; running agents keep running
     Stop {
         /// Also kill every running agent
         #[arg(long)]
         kill_agents: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Show whether the manager is running
-    Status,
+    Status {
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Run the manager in the foreground (used by auto-start)
     #[command(hide = true)]
     Run,
@@ -235,47 +325,133 @@ fn parse_age(s: &str) -> Result<u64, String> {
     Ok(n * scale)
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Run { name, group, cwd, detach, label, kind, program, args } => {
-            client::run(client::RunOptions { name, group, cwd, labels: label, kind, attach: !detach }, program, args)
+impl Command {
+    /// The output options of a command that prints data; `None` for the
+    /// interactive ones.
+    fn output(&self) -> Option<OutputArgs> {
+        match self {
+            Command::Run { output, .. }
+            | Command::Ps { output, .. }
+            | Command::Inspect { output, .. }
+            | Command::Status { output, .. }
+            | Command::Send { output, .. }
+            | Command::Rename { output, .. }
+            | Command::Mv { output, .. }
+            | Command::Label { output, .. }
+            | Command::Ack { output, .. }
+            | Command::Events { output }
+            | Command::Wait { output, .. }
+            | Command::Kill { output, .. }
+            | Command::Rm { output, .. }
+            | Command::Prune { output, .. }
+            | Command::Manager {
+                action:
+                    ManagerAction::Start { output }
+                    | ManagerAction::Restart { output }
+                    | ManagerAction::Stop { output, .. }
+                    | ManagerAction::Status { output },
+            } => Some(*output),
+            Command::Attach { .. }
+            | Command::Grid { .. }
+            | Command::Tree { .. }
+            | Command::Logs { .. }
+            | Command::Manager { action: ManagerAction::Run } => None,
         }
+    }
+}
+
+impl Command {
+    /// Every agent target this command takes, for expanding `self`.
+    fn targets(&mut self) -> Vec<&mut String> {
+        match self {
+            Command::Attach { target, .. }
+            | Command::Inspect { target, .. }
+            | Command::Logs { target, .. }
+            | Command::Send { target, .. }
+            | Command::Rename { target, .. }
+            | Command::Mv { target, .. }
+            | Command::Label { target, .. }
+            | Command::Ack { target, .. }
+            | Command::Kill { target, .. }
+            | Command::Rm { target, .. } => vec![target],
+            Command::Wait { targets, .. } => targets.iter_mut().collect(),
+            Command::Run { .. }
+            | Command::Ps { .. }
+            | Command::Status { .. }
+            | Command::Grid { .. }
+            | Command::Tree { .. }
+            | Command::Events { .. }
+            | Command::Prune { .. }
+            | Command::Manager { .. } => vec![],
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let mut cli = Cli::parse();
+    let json = cli.command.output().is_some_and(|o| o.json);
+    if let Err(e) = cli.command.targets().into_iter().try_for_each(naming::expand_self) {
+        output::report(&e, json);
+        return ExitCode::from(errors::exit_status(&e));
+    }
+    let result = match cli.command {
+        Command::Run { name, group, cwd, detach, label, kind, output, program, args } => client::run(
+            client::RunOptions { name, group, cwd, labels: label, kind, attach: !detach, json: output.json },
+            program,
+            args,
+        ),
         Command::Attach { target, ro, steal, replay, allow_clipboard_replay } => client::attach(
             target,
             attach::Options { readonly: ro, steal, replay, allow_clipboard_replay, shared_screen: false },
         ),
-        Command::Ps { prefix, all, label, watch, json } => {
-            client::ps(client::PsOptions { prefix, all, labels: label, json, watch })
+        Command::Ps { prefix, all, label, watch, output } => {
+            client::ps(client::PsOptions { prefix, all, labels: label, json: output.json, watch })
+        }
+        Command::Inspect { target, screen, output } => query::inspect(target, screen, output.json),
+        Command::Status { path, scope, all, include_self, label, output } => {
+            query::status(query::StatusOptions { path, scope, all, include_self, labels: label, json: output.json })
         }
         Command::Grid { prefix, label } => tui::run(tui::Mode::Grid, prefix, label),
         Command::Tree { prefix, label } => tui::run(tui::Mode::Tree, prefix, label),
         Command::Logs { target, bytes, follow, raw, screen } => stream::logs(target, bytes, follow, raw, screen),
-        Command::Send { target, text, no_enter, force, wait, then_wait, timeout } => {
-            stream::send(target, stream::SendOptions { text, enter: !no_enter, force, wait, then_wait, timeout })
+        Command::Send { target, text, no_enter, force, wait, then_wait, timeout, output } => stream::send(
+            target,
+            stream::SendOptions { text, enter: !no_enter, force, wait, then_wait, timeout, json: output.json },
+        ),
+        Command::Rename { target, name, output } => client::rename(target, name, output.json),
+        Command::Mv { target, group, output } => client::mv(target, group, output.json),
+        Command::Label { target, changes, output } => client::label(target, changes, output.json),
+        Command::Events { output } => stream::events(output.json),
+        Command::Ack { target, output } => client::ack(target, output.json),
+        Command::Wait { targets, dir, scope, label, until, until_activity, timeout, output } => {
+            let waited = match dir {
+                Some(path) => Ok(wait::Waited::Dir {
+                    path: Some(path),
+                    scope: scope.unwrap_or(query::Scope::Under),
+                    labels: label,
+                }),
+                None if scope.is_some() || !label.is_empty() => Err(anyhow::anyhow!("--scope and --label need --dir")),
+                None => Ok(wait::Waited::Targets(targets)),
+            };
+            let goal = until_activity.map_or(wait::Goal::Availability(until), wait::Goal::Activity);
+            waited.and_then(|waited| wait::wait(waited, goal, timeout, output.json))
         }
-        Command::Rename { target, name } => client::rename(target, name),
-        Command::Mv { target, group } => client::mv(target, group),
-        Command::Label { target, changes } => client::label(target, changes),
-        Command::Events { json } => stream::events(json),
-        Command::Ack { target } => client::ack(target),
-        Command::Wait { target, until, timeout } => stream::wait(target, until, timeout),
-        Command::Kill { target, signal } => client::kill(target, signal),
-        Command::Rm { target } => client::rm(target),
-        Command::Prune { prefix, older_than } => client::prune(prefix, older_than),
+        Command::Kill { target, signal, output } => client::kill(target, signal, output.json),
+        Command::Rm { target, output } => client::rm(target, output.json),
+        Command::Prune { prefix, older_than, output } => client::prune(prefix, older_than, output.json),
         Command::Manager { action } => match action {
-            ManagerAction::Start => client::manager_start(),
-            ManagerAction::Stop { kill_agents } => client::manager_stop(kill_agents),
-            ManagerAction::Restart => client::manager_restart(),
-            ManagerAction::Status => client::manager_status(),
+            ManagerAction::Start { output } => client::manager_start(output.json),
+            ManagerAction::Stop { kill_agents, output } => client::manager_stop(kill_agents, output.json),
+            ManagerAction::Restart { output } => client::manager_restart(output.json),
+            ManagerAction::Status { output } => client::manager_status(output.json),
             ManagerAction::Run => manager::run(),
         },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("argus: {e:#}");
-            ExitCode::FAILURE
+            output::report(&e, json);
+            ExitCode::from(errors::exit_status(&e))
         }
     }
 }
@@ -292,6 +468,75 @@ mod tests {
         assert_eq!(parse_age("7d"), Ok(604800));
         assert!(parse_age("3w").is_err());
         assert!(parse_age("h").is_err());
+    }
+
+    /// Commands that print nothing a script would parse: interactive or
+    /// raw byte streams.
+    const NO_JSON: &[&str] = &["attach", "grid", "tree", "logs", "manager run"];
+
+    fn leaf_commands(cmd: &clap::Command, path: &str, out: &mut Vec<(String, clap::Command)>) {
+        for sub in cmd.get_subcommands() {
+            let name = if path.is_empty() { sub.get_name().to_string() } else { format!("{path} {}", sub.get_name()) };
+            if sub.has_subcommands() {
+                leaf_commands(sub, &name, out);
+            } else {
+                out.push((name, sub.clone()));
+            }
+        }
+    }
+
+    /// Every command either takes `--json` and honors it, or is listed as
+    /// not printing data, so a new command cannot forget the convention.
+    #[test]
+    fn every_command_follows_the_output_convention() {
+        use clap::{CommandFactory, Parser};
+        let mut commands = Vec::new();
+        leaf_commands(&super::Cli::command(), "", &mut commands);
+        for (name, cmd) in commands {
+            let has_json = cmd.get_arguments().any(|a| a.get_long() == Some("json"));
+            let listed = NO_JSON.contains(&name.as_str());
+            assert!(has_json != listed, "{name}: takes --json: {has_json}, listed as without: {listed}");
+            if !has_json {
+                continue;
+            }
+            let mut argv: Vec<String> = vec!["argus".into()];
+            argv.extend(name.split(' ').map(String::from));
+            // Every positional that parses without `--`, required or not.
+            for arg in cmd.get_positionals().filter(|a| !a.is_last_set()) {
+                argv.push(format!("<{}>", arg.get_id()));
+            }
+            argv.push("--json".into());
+            let cli = super::Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(cli.command.output().is_some_and(|o| o.json), "{name}: --json is not wired to Command::output");
+        }
+    }
+
+    /// Every command the launch instructions show still parses, so they
+    /// cannot drift from the CLI.
+    #[test]
+    fn instruction_commands_parse() {
+        use clap::Parser;
+        let text = [include_str!("instructions/core.md"), include_str!("instructions/coordination.md")].concat();
+        let mut checked = 0;
+        for line in text.lines() {
+            let line = line.trim_start().trim_start_matches('`');
+            if !line.starts_with("argus ") || line.contains('\'') {
+                continue;
+            }
+            let command = line.split("  ").next().unwrap().split('`').next().unwrap();
+            let command = command
+                .replace("<id>...", "1 2")
+                .replace("<id>", "1")
+                .replace("<secs>", "5")
+                .replace("<activity>", "done")
+                .replace(['[', ']'], "");
+            let args: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = super::Cli::try_parse_from(&args) {
+                panic!("{command}: {e}");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 7, "only {checked} commands found");
     }
 
     /// `docs/src/reference/cli.md` is generated from the clap definitions.

@@ -17,7 +17,9 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use argus_proto::msg::{AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response, RunRequest};
+use argus_proto::msg::{
+    Activity, AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response, RunRequest,
+};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -27,7 +29,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::attach;
-use crate::client::{Conn, ManagerError, PsOptions};
+use crate::client::{Conn, PsOptions};
+use crate::errors::CodedError;
 use crate::theme::theme;
 use crate::{Cli, Command, stream, term, tmux};
 
@@ -414,7 +417,7 @@ fn event_loop(
                 // Not a refusal: the connection itself is gone (a manager
                 // restart). The watch reconnects on its own; this one has to
                 // be replaced here, or every later request fails with it.
-                if e.downcast_ref::<ManagerError>().is_none()
+                if e.downcast_ref::<CodedError>().is_none()
                     && let Ok(Some(fresh)) = Conn::open(false)
                 {
                     *conn = fresh;
@@ -812,7 +815,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
                 spans.push(marker);
             }
             let activity = format!(" · {}", tile.info.activity);
-            spans.push(if tile.info.status.is_live() && tile.info.activity == "blocked" {
+            spans.push(if is_blocked(&tile.info) {
                 Span::styled(activity, activity_text_style(&tile.info))
             } else {
                 Span::raw(activity)
@@ -1002,7 +1005,7 @@ fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>, highlight: O
                 for span in &mut spans[2..] {
                     span.style = span.style.patch(style);
                 }
-                if info.status.is_live() && info.activity == "blocked" {
+                if is_blocked(info) {
                     // Keep the warning color while retaining the selection background.
                     spans.last_mut().unwrap().style = style.patch(activity_text_style(info));
                 }
@@ -1203,14 +1206,18 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     Rect { x, y, width, height }
 }
 
+fn is_blocked(info: &AgentInfo) -> bool {
+    info.status.is_live() && info.activity == Activity::Blocked
+}
+
 /// A blocked agent needs a distinct shape as well as color: idle shares its
 /// yellow, but only blocked requires approval.
 fn activity_symbol(info: &AgentInfo) -> &'static str {
-    if info.status.is_live() && info.activity == "blocked" { "◉ " } else { "● " }
+    if is_blocked(info) { "◉ " } else { "● " }
 }
 
 fn activity_text_style(info: &AgentInfo) -> Style {
-    if info.status.is_live() && info.activity == "blocked" {
+    if is_blocked(info) {
         Style::default().fg(theme().yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme().overlay0)
@@ -1219,22 +1226,19 @@ fn activity_text_style(info: &AgentInfo) -> Style {
 
 /// Status-colored dot: gray once exited, otherwise colored by `activity` —
 /// green (pulsing) while actively doing something, steady green once `done`,
-/// steady yellow while it wants your input, red on `error`. Matched loosely
-/// (`tool:<name>` falls through to the active/pulsing case) since new
-/// activity strings are added on the driver side over time.
+/// steady yellow while it wants your input, red on `error`.
 fn activity_color(info: &AgentInfo, blink: bool) -> Color {
     let t = theme();
     if !info.status.is_live() {
         return t.surface2;
     }
-    match info.activity.as_str() {
-        "error" => t.red,
-        "done" => t.green,
-        "idle" | "blocked" => t.yellow,
-        "quiet" | "unknown" => t.overlay0,
-        // working / tool:<name> / busy: actively running, pulse to draw the
-        // eye toward what's currently in motion.
-        _ => {
+    match info.activity {
+        Activity::Error => t.red,
+        Activity::Done => t.green,
+        Activity::Idle | Activity::Blocked => t.yellow,
+        Activity::Quiet | Activity::Unknown => t.overlay0,
+        // Actively running: pulse to draw the eye toward what's in motion.
+        Activity::Working | Activity::Tool(_) | Activity::Busy => {
             if blink {
                 t.green
             } else {

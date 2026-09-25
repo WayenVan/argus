@@ -149,7 +149,7 @@ async fn handle_conn(manager: Arc<Manager>, stream: UnixStream) -> Result<()> {
         let shutdown = matches!(req, Request::Shutdown { .. });
         let resp = match manager.dispatch(req).await {
             Ok(resp) => resp,
-            Err(e) => Response::error("failed", format!("{e:#}")),
+            Err(e) => Response::error(crate::errors::code_of(&e), format!("{e:#}")),
         };
         aio::write_json(&mut writer, &resp).await?;
         if shutdown && matches!(resp, Response::Ok) {
@@ -369,7 +369,7 @@ impl Manager {
                     let agent = &mut reg.agents.get_mut(&info.id).expect("agent inserted above").info;
                     agent.status = AgentStatus::Running;
                     if let Some(activity) = driver.initial_activity() {
-                        agent.activity = activity.into();
+                        agent.activity = activity;
                         agent.activity_since = Some(now_secs());
                     }
                     agent.holder_pid = Some(holder_pid);

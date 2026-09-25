@@ -16,6 +16,7 @@ mod pi;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use argus_proto::msg::Activity;
 use serde_json::Value;
 
 /// What a hook event means, independent of which agent sent it.
@@ -60,7 +61,7 @@ pub trait Driver: Send + Sync {
     fn has_hooks(&self) -> bool;
 
     /// Activity to show once the agent is running, before any hook arrives.
-    fn initial_activity(&self) -> Option<&'static str> {
+    fn initial_activity(&self) -> Option<Activity> {
         None
     }
 
@@ -112,35 +113,15 @@ pub fn install_shared_files(ctx: &Context) -> Result<()> {
 /// the agent can update its own state without needing a wider grant — see
 /// the design doc's `argus tui` recap section for why this replaced both the
 /// hook-derived-summary and Claude-session-title approaches to recap.
-pub(super) const SELF_LABEL_INSTRUCTIONS: &str = "\
-You are running as a session managed by argus, a lightweight process manager for \
-coding-agent sessions. Your argus agent id is in the environment variable $ARGUS_AGENT_ID. \
-MANDATORY, EVERY TURN, NO EXCEPTIONS: you maintain two conventional labels, title and recap.
-Before you consider a turn complete and hand control back to the user, you MUST evaluate
-both of them. This is a hard requirement, not a suggestion, not something to do \"when it
-feels right\", and not something you may skip because the turn was small or unrelated. Your
-very first turn is not an exception either — both labels start unset, so your first turn is
-exactly when you set them; do not wait for a \"better\" moment that never comes. If you catch
-yourself finishing a response without having done this check, you have made a mistake.
-
-The evaluation itself is always required; only the update is conditional. For each label,
-compare it against what you already recorded — from your own memory of the conversation, not
-by querying anything — and update only if it's unset or stale:
-
-1. title — a short name for what this session is about. Stale means what you're working on
-   has genuinely moved on from that title (a rename, a pivot). If it still describes the
-   session accurately, leave it alone.
-2. recap — a short summary of what you're doing or just did. Stale means what you last
-   recorded no longer describes where things stand (you finished that step, hit a different
-   problem, moved to a new part of the task). If you're still in the middle of exactly what
-   the current recap already says, leave it alone.
-
-Update with: argus label $ARGUS_AGENT_ID <key>=\"<value>\".
-Do not run any other argus subcommand on yourself or other agents unless the user explicitly
-asks you to and explains why.
-
-Before you send your final message for this turn, double check: have you actually evaluated
-title and recap this turn? If not, do it now, before responding.";
+/// Coordination is injected whole rather than behind a command the agent must
+/// remember to run: agents do not reliably follow such pointers.
+pub(super) const SELF_LABEL_INSTRUCTIONS: &str = concat!(
+    include_str!("../../instructions/core.md"),
+    "\n",
+    include_str!("../../instructions/coordination.md"),
+    "\nBefore you send your final message for this turn, double check: have you actually evaluated\n",
+    "title and recap this turn? If not, do it now, before responding.\n",
+);
 
 /// `'path' arg`, quoted for the `sh -c` that agents run hook commands through.
 pub fn hook_command(hook_exe: &Path, source: &str) -> String {
@@ -176,4 +157,18 @@ fn plugin_hint(event: &Value, version: u64) -> Hint {
 /// Reads a string field of a hook event.
 fn field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SELF_LABEL_INSTRUCTIONS;
+
+    /// Agents copy the example: it must be single-quoted, with the escape for
+    /// a quote inside spelled as the shell needs it.
+    #[test]
+    fn label_example_is_shell_safe() {
+        assert!(SELF_LABEL_INSTRUCTIONS.contains("argus label self title='Fix auth redirect'"));
+        assert!(SELF_LABEL_INSTRUCTIONS.contains(r"as '\''"));
+        assert!(!SELF_LABEL_INSTRUCTIONS.contains("=\"<value>\""));
+    }
 }

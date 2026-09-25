@@ -38,3 +38,6 @@ Key/value pairs on an agent. Agents set two of them on their own:
 - `recap`: what the agent is doing right now.
 
 argus asks agents to do this through a short instruction it adds at launch.
+The same instruction says what "running", "finished" and "exited" mean for
+other agents, how to check on and wait for them, and not to change or message
+other agents unless you ask.

@@ -28,6 +28,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A driver for omp (oh-my-pi), wired in like pi with its own extension. It
   reports tool approvals and the `ask` tool as `blocked`, including while
   parallel tool calls wait for approval one after another.
+- `--json` on every command except `attach`, `grid`, `tree` and `logs`.
+  Commands that change agents print them as they are afterwards, so scripts
+  need no second lookup. `run --json` needs `-d`.
+- `argus status [PATH]`: the agents working in a directory (`--scope under`,
+  `exact` or `repo`, the last counting every worktree) and whether they are all
+  free. It leaves out the agent running it.
+- `argus inspect <agent>`: one agent in full, `--screen` for its current screen
+  as plain text.
+- The target `self` names the agent running the command, in every command that
+  takes an agent. `self` is now a reserved name segment.
+- `argus wait` takes several targets (and `group/**`), or `--dir PATH` for
+  every agent working there, as `argus status` counts them. A `--timeout`
+  error names the agents still pending; `--timeout 0` checks once.
+- `argus ps` shows each agent's availability in an `AVAIL` column.
+
+### Changed
+
+- `--json` output follows one convention. Every object carries `"schema": 1`,
+  and agents gain `group`, `availability` (`free`, `active`, `attention`,
+  `unknown`, `exited`) and `activity_age_secs`. Under `--json`, errors go to
+  stderr as `{"schema":1,"error":{"code","message"}}`.
+  - `argus ps --json` prints `{"schema":1,"agents":[...]}` instead of a bare
+    array, on one line.
+  - `argus events --json` prints `{"schema":1,"event":"updated","agent":{...}}`
+    instead of the manager's internal protocol messages.
+- `argus wait` now waits until agents are `free` (turn over: `idle`, `done` or
+  `quiet`) instead of until they exit; pass `--until exited` for the old
+  behavior. `--until` takes only an availability; exact activities move to
+  `--until-activity`. A named agent that exits before reaching the state fails
+  with code `exited` instead of `failed`.
+- The instruction argus adds to agents at launch now allows read-only commands
+  for coordinating with other agents and explains how to check on and wait for
+  them: the states, the commands and their pitfalls. It says that other agents the user refers to
+  as running now are argus agents, to be checked with argus rather than the
+  agent's own subagent or session tools, but questions about agent programs or
+  code are not. It says that "running" means `active`,
+  "finished" means `free`, only "exited" means the process ended, and "agents"
+  leaves out exited ones. Commands that change or message other agents still
+  need the user to ask.
+- The label instruction is shorter, gives examples, and tells agents to
+  single-quote values on one line (`argus label self title='...'`): double
+  quotes let the shell expand `$` and backticks in a recap.
 
 ### Fixed
 
@@ -37,6 +79,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alternate screen itself since, as omp does on every resize. Such agents now
   scroll with tmux copy mode or the terminal's scrollback, and their output
   stays there after detaching; agents on their alternate screen are unchanged.
+- `argus wait --help` gave `waiting` as an example activity; no agent reports
+  it. It now says `idle`.
 - Keep screen tracking alive when vt100 panics: vendor vt100 0.16.2 with a fix
   for a panic after a row is shortened through a wide character (a resize or an
   ICH) and that column is then written or erased (see `vendor/vt100/PATCHES.md`).

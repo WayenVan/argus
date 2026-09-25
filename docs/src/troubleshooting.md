@@ -15,6 +15,10 @@ you start an agent.
 Either the session was started outside argus, or you passed your own
 `-c developer_instructions`. See [Codex](agents/codex.md#known-limitations).
 
+**`argus status` says all free while a program is still working.**
+Programs without hooks count as free once their output stops. See
+[Other programs](agents/generic.md#known-limitations).
+
 **An agent shows `unknown`.**
 It stopped reporting while working, for example after Claude was interrupted
 with Esc. See [Claude Code](agents/claude.md#known-limitations).

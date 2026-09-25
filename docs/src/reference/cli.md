@@ -12,6 +12,8 @@ Lightweight manager for long-running terminal agents
 
 * `run` — Start an agent and attach to it (use -d to leave it running in the background)
 * `ps` — List agents
+* `inspect` — Show one agent in full
+* `status` — Agents working in a directory, and whether they are all free. Leaves out the agent running this command
 * `grid` — Full-screen dashboard: a live thumbnail grid of every agent's screen
 * `tree` — Full-screen dashboard: a group-path tree with a live detail pane for the selected agent (same app as `argus grid`, opened on the tree mode)
 * `logs` — Print an agent's recent output
@@ -21,7 +23,7 @@ Lightweight manager for long-running terminal agents
 * `label` — Set (key=value) or remove (key-) labels
 * `ack` — Mark a finished agent as seen (done → idle)
 * `events` — Print agent events as they happen
-* `wait` — Block until an agent exits (exiting with its code) or reaches an activity
+* `wait` — Block until agents are free (their turn is over) or reach another state; with several, until all have. One agent waited on to exit passes on its exit code
 * `attach` — Take over an agent's terminal (detach with Ctrl-\)
 * `kill` — Stop an agent (SIGTERM, then SIGKILL after 5s)
 * `rm` — Remove an exited agent
@@ -49,6 +51,7 @@ Start an agent and attach to it (use -d to leave it running in the background)
 * `-d`, `--detach` — Start in the background instead of attaching right away
 * `-l`, `--label <KEY=VALUE>` — Label as key=value (repeatable)
 * `--kind <KIND>` — Treat the program as this kind of agent (e.g. a wrapper script for claude)
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -67,7 +70,55 @@ List agents
 * `-a`, `--all` — Include exited agents
 * `-l`, `--label <KEY=VALUE>` — Only agents with this label (repeatable; all must match)
 * `-w`, `--watch` — Keep the list on screen and update it as agents change
-* `--json`
+* `--json` — Print JSON (one object per line) instead of text
+
+
+
+## `argus inspect`
+
+Show one agent in full
+
+**Usage:** `argus inspect [OPTIONS] <TARGET>`
+
+###### **Arguments:**
+
+* `<TARGET>` — ID, name, or `self` for the agent running this command
+
+###### **Options:**
+
+* `--screen` — Also print its current screen as plain text
+* `--json` — Print JSON (one object per line) instead of text
+
+
+
+## `argus status`
+
+Agents working in a directory, and whether they are all free. Leaves out the agent running this command
+
+**Usage:** `argus status [OPTIONS] [PATH]`
+
+###### **Arguments:**
+
+* `<PATH>` — Directory (default: the current one)
+
+###### **Options:**
+
+* `--scope <SCOPE>` — Which working directories count as in PATH
+
+  Default value: `under`
+
+  Possible values:
+  - `under`:
+    Working directory is PATH or below it
+  - `exact`:
+    Working directory is exactly PATH
+  - `repo`:
+    Working directory is in the same git repository as PATH, including its other worktrees
+
+* `-a`, `--all` — Include exited agents
+* `--include-self` — Include the agent running this command
+* `-l`, `--label <KEY=VALUE>` — Only agents with this label (repeatable; all must match)
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -140,6 +191,7 @@ Type a prompt into an agent and press Enter, only while it is idle (or done); ot
 * `-w`, `--wait` — Wait until the agent is idle instead of failing
 * `--then-wait` — After sending, block until the agent finishes the turn; prints the activity it ends in (exit 1 if blocked, error or unknown)
 * `--timeout <SECS>` — Give up after this many seconds, counting both waits (exit 124)
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -147,12 +199,16 @@ Type a prompt into an agent and press Enter, only while it is idle (or done); ot
 
 Rename an agent: a new last segment, a full path, or `group/`
 
-**Usage:** `argus rename <TARGET> <NAME>`
+**Usage:** `argus rename [OPTIONS] <TARGET> <NAME>`
 
 ###### **Arguments:**
 
 * `<TARGET>`
 * `<NAME>`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -160,12 +216,16 @@ Rename an agent: a new last segment, a full path, or `group/`
 
 Move an agent into another group, keeping its last segment
 
-**Usage:** `argus mv <TARGET> <GROUP>`
+**Usage:** `argus mv [OPTIONS] <TARGET> <GROUP>`
 
 ###### **Arguments:**
 
 * `<TARGET>`
 * `<GROUP>` — Destination group; `/` for the top level
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -173,12 +233,16 @@ Move an agent into another group, keeping its last segment
 
 Set (key=value) or remove (key-) labels
 
-**Usage:** `argus label <TARGET> <KEY=VALUE|KEY->...`
+**Usage:** `argus label [OPTIONS] <TARGET> <KEY=VALUE|KEY->...`
 
 ###### **Arguments:**
 
 * `<TARGET>` — ID, name, or `group/**`
 * `<KEY=VALUE|KEY->`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -186,11 +250,15 @@ Set (key=value) or remove (key-) labels
 
 Mark a finished agent as seen (done → idle)
 
-**Usage:** `argus ack <TARGET>`
+**Usage:** `argus ack [OPTIONS] <TARGET>`
 
 ###### **Arguments:**
 
 * `<TARGET>`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -202,26 +270,40 @@ Print agent events as they happen
 
 ###### **Options:**
 
-* `--json` — One JSON object per line
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
 ## `argus wait`
 
-Block until an agent exits (exiting with its code) or reaches an activity
+Block until agents are free (their turn is over) or reach another state; with several, until all have. One agent waited on to exit passes on its exit code
 
-**Usage:** `argus wait [OPTIONS] <TARGET>`
+**Usage:** `argus wait [OPTIONS] [TARGETS]...`
 
 ###### **Arguments:**
 
-* `<TARGET>`
+* `<TARGETS>` — IDs, names or `group/**`
 
 ###### **Options:**
 
-* `--until <UNTIL>` — `exited`, or an activity such as `waiting`
+* `--dir <PATH>` — Wait for every running agent working in this directory instead, as `argus status` lists them (not the one running this command)
+* `--scope <SCOPE>` — With --dir: which working directories count as in PATH [default: under]
 
-  Default value: `exited`
+  Possible values:
+  - `under`:
+    Working directory is PATH or below it
+  - `exact`:
+    Working directory is exactly PATH
+  - `repo`:
+    Working directory is in the same git repository as PATH, including its other worktrees
+
+* `-l`, `--label <KEY=VALUE>` — With --dir: only agents with this label (repeatable)
+* `--until <AVAILABILITY>` — The availability to wait for: `free`, `active`, `attention`, `unknown`, or `exited` (the process ended)
+
+  Default value: `free`
+* `--until-activity <ACTIVITY>` — Wait for one exact activity instead, such as `done` or `tool:Bash`
 * `--timeout <SECS>` — Give up after this many seconds (exit code 124)
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -257,6 +339,7 @@ Stop an agent (SIGTERM, then SIGKILL after 5s)
 ###### **Options:**
 
 * `-s`, `--signal <SIGNAL>` — Signal number to send instead of SIGTERM
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -264,11 +347,15 @@ Stop an agent (SIGTERM, then SIGKILL after 5s)
 
 Remove an exited agent
 
-**Usage:** `argus rm <TARGET>`
+**Usage:** `argus rm [OPTIONS] <TARGET>`
 
 ###### **Arguments:**
 
 * `<TARGET>`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -285,6 +372,7 @@ Remove every exited agent
 ###### **Options:**
 
 * `--older-than <AGE>` — Only agents that ended longer ago than this, e.g. 30m, 24h, 7d
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -307,7 +395,11 @@ Manage the manager process
 
 Start the manager if it is not running
 
-**Usage:** `argus manager start`
+**Usage:** `argus manager start [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -315,7 +407,11 @@ Start the manager if it is not running
 
 Restart the manager (e.g. after upgrading); running agents keep running
 
-**Usage:** `argus manager restart`
+**Usage:** `argus manager restart [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -328,6 +424,7 @@ Stop the manager; running agents keep running
 ###### **Options:**
 
 * `--kill-agents` — Also kill every running agent
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
@@ -335,7 +432,11 @@ Stop the manager; running agents keep running
 
 Show whether the manager is running
 
-**Usage:** `argus manager status`
+**Usage:** `argus manager status [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Print JSON (one object per line) instead of text
 
 
 

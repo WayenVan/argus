@@ -9,12 +9,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
 use argus_proto::msg::{
-    AgentEvent, AgentInfo, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request, Response, SubscribeLevel,
+    Activity, AgentEvent, AgentInfo, Availability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request,
+    Response, SubscribeLevel,
 };
 use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 
 use crate::attach;
-use crate::client::{self, Conn, ManagerError, PsOptions};
+use crate::client::{self, Conn, PsOptions};
+use crate::errors::{self, NOT_READY, TIMEOUT, coded};
+use crate::output::{self, AgentView, OneAgent};
+use serde::Serialize;
 
 /// Ends passive log rendering at a clean shell boundary. The allowlist means
 /// only SGR state can remain. This is never written into redirected data.
@@ -234,7 +238,7 @@ pub fn events(json: bool) -> Result<()> {
     loop {
         let (_, rx) = start_watch(None, true)?;
         while let Ok(Ok(Some(msg))) = rx.recv() {
-            let line = if json { serde_json::to_string(&msg)? } else { describe(&msg) };
+            let line = if json { event_line(&msg) } else { describe(&msg) };
             if line.is_empty() {
                 continue;
             }
@@ -244,6 +248,32 @@ pub fn events(json: bool) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// `agent` for changes to one, `id` once it is removed.
+#[derive(Serialize)]
+struct EventLine<'a> {
+    event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentView<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+}
+
+/// An event as one `--json` line; empty for anything but an event.
+fn event_line(msg: &Response) -> String {
+    fn line<'a>(event: &'static str, agent: &'a AgentInfo) -> EventLine<'a> {
+        EventLine { event, agent: Some(AgentView::new(agent)), id: None }
+    }
+    let Response::Event { event, .. } = msg else { return String::new() };
+    output::to_line(match event {
+        AgentEvent::Created { agent } => line("created", agent),
+        AgentEvent::Updated { agent } => line("updated", agent),
+        AgentEvent::Exited { agent } => line("exited", agent),
+        AgentEvent::Removed { id } => EventLine { event: "removed", agent: None, id: Some(*id) },
+        // Events may have been missed; re-read the list.
+        AgentEvent::Resync => EventLine { event: "resync", agent: None, id: None },
+    })
 }
 
 fn describe(msg: &Response) -> String {
@@ -286,49 +316,12 @@ fn clock() -> String {
 
 /// Blocks until the agent exits (and exits with its code), or until its
 /// activity equals `until`. Exits 124 on timeout, like `timeout(1)`.
-pub fn wait(target: String, until: String, timeout: Option<u64>) -> Result<()> {
-    let agent = Conn::connect()?.find(&target)?;
-    let deadline = timeout.map(|s| Instant::now() + Duration::from_secs(s));
-    let (agents, rx) = start_watch(Some(vec![agent.id]), true)?;
-    let mut current = agents.into_iter().next().unwrap_or(agent);
-    loop {
-        if !current.status.is_live() {
-            if until != "exited" {
-                bail!("{} {} before becoming {until}", current.name, current.status.as_str());
-            }
-            match current.exit_code {
-                Some(code) => {
-                    println!("{code}");
-                    std::process::exit(code.clamp(0, 255));
-                }
-                None => {
-                    println!("{}", current.status.as_str());
-                    std::process::exit(255);
-                }
-            }
-        }
-        if current.activity == until {
-            println!("{until}");
-            return Ok(());
-        }
-        let wait_for = deadline.map_or(Duration::from_secs(3600), |d| d.saturating_duration_since(Instant::now()));
-        match rx.recv_timeout(wait_for) {
-            Ok(Ok(Some(msg))) => {
-                let mut table = BTreeMap::from([(current.id, current.clone())]);
-                apply(&mut table, &msg);
-                match table.remove(&current.id) {
-                    Some(a) => current = a,
-                    None => bail!("{} was removed", current.name),
-                }
-            }
-            Err(RecvTimeoutError::Timeout) if deadline.is_some_and(|d| Instant::now() >= d) => {
-                eprintln!("timed out waiting for {}", current.name);
-                std::process::exit(124);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(Err(e)) => return Err(e),
-            Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => bail!("lost connection to the manager"),
-        }
+/// Prints where a wait ended: `text`, or the agent under `--json`.
+fn print_result(json: bool, agent: &AgentInfo, text: &str) {
+    if json {
+        output::print(OneAgent::new(agent));
+    } else {
+        println!("{text}");
     }
 }
 
@@ -336,8 +329,6 @@ pub fn wait(target: String, until: String, timeout: Option<u64>) -> Result<()> {
 // send
 // ---------------------------------------------------------------------------
 
-/// Exit code when the agent is not waiting for a prompt (`EX_TEMPFAIL`).
-const NOT_READY: i32 = 75;
 /// How long `--then-wait` gives a sent prompt to show up as activity.
 const PICKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -351,6 +342,7 @@ pub struct SendOptions {
     /// After sending, block until the agent is waiting on someone again.
     pub then_wait: bool,
     pub timeout: Option<u64>,
+    pub json: bool,
 }
 
 /// Types a prompt into an agent, but only while it waits for one; the
@@ -368,8 +360,13 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
     let deadline = opts.timeout.map(|s| Instant::now() + Duration::from_secs(s));
     let mut conn = Conn::connect()?;
     if !opts.wait && !opts.then_wait {
-        let request = Request::Send { target, text, enter: opts.enter, force: opts.force };
-        return conn.request(&request).map(drop).map_err(exit_if_not_ready);
+        if !opts.json {
+            return conn.request(&Request::Send { target, text, enter: opts.enter, force: opts.force }).map(drop);
+        }
+        let id = conn.find(&target)?.id.to_string();
+        conn.request(&Request::Send { target: id.clone(), text, enter: opts.enter, force: opts.force })?;
+        output::print(OneAgent::new(&conn.find(&id)?));
+        return Ok(());
     }
 
     // Watch before sending, so no activity change after the send is missed.
@@ -378,22 +375,25 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
     let mut current = agents.into_iter().next().unwrap_or(agent);
     let request = Request::Send { target: current.id.to_string(), text, enter: opts.enter, force: opts.force };
     loop {
-        if opts.force || argus_proto::msg::awaits_prompt(&current.activity) {
+        if opts.force || current.activity.awaits_prompt() {
             match conn.request(&request) {
                 Ok(_) => break,
-                Err(e) if opts.wait && ManagerError::has_code(&e, "not_ready") => {}
-                Err(e) => return Err(exit_if_not_ready(e)),
+                Err(e) if opts.wait && errors::has_code(&e, NOT_READY) => {}
+                Err(e) => return Err(e),
             }
         } else if !opts.wait {
-            return Err(exit_if_not_ready(anyhow::anyhow!(ManagerError {
-                code: "not_ready".into(),
-                message: format!("{} is {}, not waiting for a prompt", current.name, current.activity),
-            })));
+            return Err(coded(
+                NOT_READY,
+                format!("{} is {}, not waiting for a prompt", current.name, current.activity),
+            ));
         }
         // Someone typing clears without an activity change, so poll too.
         next_update(&rx, &mut current, deadline, Duration::from_secs(1))?;
     }
     if !opts.then_wait {
+        if opts.json {
+            output::print(OneAgent::new(&current));
+        }
         return Ok(());
     }
 
@@ -403,8 +403,8 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
     loop {
         // A quick turn can go idle → working → done between two updates.
         picked_up |= current.activity != sent.activity || current.activity_since != sent.activity_since;
-        if picked_up && (argus_proto::msg::awaits_prompt(&current.activity) || is_stuck(&current.activity)) {
-            println!("{}", current.activity);
+        if picked_up && (current.activity.awaits_prompt() || is_stuck(&current.activity)) {
+            print_result(opts.json, &current, &current.activity.to_string());
             std::process::exit(if is_stuck(&current.activity) { 1 } else { 0 });
         }
         if !picked_up && sent_at.elapsed() > PICKUP_TIMEOUT {
@@ -415,16 +415,8 @@ pub fn send(target: String, opts: SendOptions) -> Result<()> {
 }
 
 /// Activities in which the agent waits on a person but not with a result.
-fn is_stuck(activity: &str) -> bool {
-    matches!(activity, "blocked" | "error" | "unknown")
-}
-
-fn exit_if_not_ready(e: anyhow::Error) -> anyhow::Error {
-    if ManagerError::has_code(&e, "not_ready") {
-        eprintln!("argus: {e}");
-        std::process::exit(NOT_READY);
-    }
-    e
+fn is_stuck(activity: &Activity) -> bool {
+    matches!(activity.availability(), Availability::Attention | Availability::Unknown)
 }
 
 /// Waits at most `poll` for the next change to `current`. Exits 124 once
@@ -445,8 +437,7 @@ fn next_update(rx: &Messages, current: &mut AgentInfo, deadline: Option<Instant>
         Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => bail!("lost connection to the manager"),
     }
     if deadline.is_some_and(|d| Instant::now() >= d) {
-        eprintln!("timed out waiting for {}", current.name);
-        std::process::exit(124);
+        return Err(coded(TIMEOUT, format!("timed out waiting for {}", current.name)));
     }
     if !current.status.is_live() {
         bail!("{} {}", current.name, current.status.as_str());

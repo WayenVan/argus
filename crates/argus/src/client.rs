@@ -14,14 +14,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
 use argus_proto::msg::{
-    AgentInfo, Capability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, MANAGER_CAPABILITIES, Request, Response,
-    RunRequest, now_secs,
+    Activity, AgentInfo, Capability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, MANAGER_CAPABILITIES, Request,
+    Response, RunRequest, now_secs,
 };
 use argus_proto::{BUILD, HOLDER_PROTOCOL_VERSION, MANAGER_PROTOCOL_VERSION, paths};
 use nix::sys::signal::kill as signal_process;
 use nix::unistd::{Pid, isatty, setsid};
 
+use crate::errors::{self, CodedError};
+use crate::output::{self, AgentList, AgentView, AgentWithWarnings, OneAgent};
 use crate::{attach, naming, stream, term};
+use serde::Serialize;
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -54,9 +57,12 @@ impl Conn {
                 conn.manager_build = build;
                 Ok(Some(conn))
             }
-            Response::Hello { version, .. } => bail!(
-                "manager speaks protocol v{version}, this argus speaks v{MANAGER_PROTOCOL_VERSION}; run `argus manager stop` and retry"
-            ),
+            Response::Hello { version, .. } => Err(errors::coded(
+                errors::MANAGER_UNAVAILABLE,
+                format!(
+                    "manager speaks protocol v{version}, this argus speaks v{MANAGER_PROTOCOL_VERSION}; run `argus manager stop` and retry"
+                ),
+            )),
             other => bail!("unexpected handshake reply: {other:?}"),
         }
     }
@@ -103,7 +109,7 @@ impl Conn {
             bail!("unexpected frame type {t:#x} from manager");
         }
         match serde_json::from_slice(&payload)? {
-            Response::Error { code, message } => Err(ManagerError { code, message }.into()),
+            Response::Error { code, message } => Err(CodedError { code, message }.into()),
             resp => Ok(Some(resp)),
         }
     }
@@ -119,31 +125,11 @@ impl Conn {
     pub fn find(&mut self, target: &str) -> Result<AgentInfo> {
         let mut agents = self.list(true)?;
         let ids = naming::resolve(target, agents.iter())?;
-        let [id] = ids[..] else { bail!("{target} matches {} agents", ids.len()) };
+        let [id] = ids[..] else {
+            return Err(errors::coded(errors::AMBIGUOUS, format!("{target} matches {} agents", ids.len())));
+        };
         let idx = agents.iter().position(|a| a.id == id).expect("resolved from this list");
         Ok(agents.swap_remove(idx))
-    }
-}
-
-/// An error reply from the manager, kept typed so callers can tell a refusal
-/// they can wait out (`not_ready`) from a failure.
-#[derive(Debug)]
-pub struct ManagerError {
-    pub code: String,
-    pub message: String,
-}
-
-impl std::fmt::Display for ManagerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ManagerError {}
-
-impl ManagerError {
-    pub fn has_code(e: &anyhow::Error, code: &str) -> bool {
-        e.downcast_ref::<ManagerError>().is_some_and(|m| m.code == code)
     }
 }
 
@@ -172,8 +158,11 @@ fn wait_for_socket(socket: &PathBuf) -> Result<UnixStream> {
         match UnixStream::connect(socket) {
             Ok(s) => return Ok(s),
             Err(e) if started.elapsed() > START_TIMEOUT => {
-                return Err(e)
-                    .with_context(|| format!("manager did not start; see {}", paths::manager_log().display()));
+                let log = paths::manager_log();
+                return Err(errors::coded(
+                    errors::MANAGER_UNAVAILABLE,
+                    format!("manager did not start; see {}: {e}", log.display()),
+                ));
             }
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }
@@ -187,9 +176,13 @@ pub struct RunOptions {
     pub labels: Vec<(String, String)>,
     pub kind: Option<String>,
     pub attach: bool,
+    pub json: bool,
 }
 
 pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
+    if opts.json && opts.attach {
+        bail!("--json needs --detach: an attached run prints nothing to parse");
+    }
     let cwd = match opts.cwd {
         Some(dir) => std::fs::canonicalize(&dir).with_context(|| format!("no such directory: {}", dir.display()))?,
         None => std::env::current_dir()?,
@@ -211,6 +204,12 @@ pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
         colors: term::profile().colors.clone(),
     };
     let reply = Conn::connect()?.request(&Request::Run(req))?;
+    if let Response::Agent { agent, warnings } = &reply
+        && opts.json
+    {
+        output::print(AgentWithWarnings { agent: AgentView::new(agent), warnings });
+        return Ok(());
+    }
     if let Response::Agent { warnings, .. } = &reply {
         for w in warnings {
             eprintln!("argus: warning: {w}");
@@ -261,7 +260,7 @@ pub fn ps(opts: PsOptions) -> Result<()> {
     }
     let agents: Vec<AgentInfo> = Conn::connect()?.list(true)?.into_iter().filter(|a| opts.keeps(a)).collect();
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&agents)?);
+        output::print(AgentList::new(&agents));
     } else {
         print!("{}", format_table(&agents));
     }
@@ -272,7 +271,7 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let now = now_secs();
     let with_labels = agents.iter().any(|a| !a.labels.is_empty());
-    let mut header = vec!["ID", "GROUP", "NAME", "KIND", "STATUS", "ACTIVITY", "AGE", "ATTACHED", "CWD"];
+    let mut header = vec!["ID", "GROUP", "NAME", "KIND", "STATUS", "AVAIL", "ACTIVITY", "AGE", "ATTACHED", "CWD"];
     if with_labels {
         header.push("LABELS");
     }
@@ -295,6 +294,7 @@ pub fn format_table(agents: &[AgentInfo]) -> String {
                 name.to_string(),
                 a.kind.clone(),
                 status,
+                a.availability().to_string(),
                 activity(a, now),
                 age(now.saturating_sub(a.created_at)),
                 attached,
@@ -333,15 +333,15 @@ fn activity(a: &AgentInfo, now: u64) -> String {
     if !a.status.is_live() {
         return "-".into();
     }
-    match (a.activity.as_str(), a.activity_since) {
-        ("done" | "blocked" | "error", Some(since)) => {
+    match (&a.activity, a.activity_since) {
+        (Activity::Done | Activity::Blocked | Activity::Error, Some(since)) => {
             format!("{} {}", a.activity, age(now.saturating_sub(since)))
         }
-        _ => a.activity.clone(),
+        _ => a.activity.to_string(),
     }
 }
 
-fn age(secs: u64) -> String {
+pub fn age(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
@@ -364,8 +364,13 @@ pub fn attach(target: String, opts: attach::Options) -> Result<()> {
     attach::attach(&attach::resolve(&target, from_manager)?, opts)
 }
 
-pub fn kill(target: String, signal: Option<i32>) -> Result<()> {
+pub fn kill(target: String, signal: Option<i32>, json: bool) -> Result<()> {
     match Conn::connect()?.request(&Request::Kill { target, signal })? {
+        Response::Killed { ids } if json => {
+            // Signalled, not yet exited: `argus wait` for that.
+            output::print(serde_json::json!({ "ids": ids }));
+            Ok(())
+        }
         Response::Killed { ids } => {
             for id in ids {
                 println!("{id}");
@@ -376,15 +381,27 @@ pub fn kill(target: String, signal: Option<i32>) -> Result<()> {
     }
 }
 
-pub fn rm(target: String) -> Result<()> {
-    Conn::connect()?.request(&Request::Remove { target })?;
+pub fn rm(target: String, json: bool) -> Result<()> {
+    let mut conn = Conn::connect()?;
+    if !json {
+        conn.request(&Request::Remove { target })?;
+        return Ok(());
+    }
+    // Resolved first: once removed there is nothing left to describe.
+    let agent = conn.find(&target)?;
+    conn.request(&Request::Remove { target: agent.id.to_string() })?;
+    output::print(OneAgent::new(&agent));
     Ok(())
 }
 
-pub fn prune(prefix: Option<String>, older_than: Option<u64>) -> Result<()> {
+pub fn prune(prefix: Option<String>, older_than: Option<u64>, json: bool) -> Result<()> {
     let Response::Pruned { agents } = Conn::connect()?.request(&Request::Prune { older_than, prefix })? else {
         bail!("unexpected reply to Prune");
     };
+    if json {
+        output::print(AgentList::new(&agents));
+        return Ok(());
+    }
     for a in &agents {
         println!("{}\t{}", a.id, a.name);
     }
@@ -392,20 +409,24 @@ pub fn prune(prefix: Option<String>, older_than: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-pub fn rename(target: String, name: String) -> Result<()> {
+pub fn rename(target: String, name: String, json: bool) -> Result<()> {
     if let Response::Agent { agent, .. } = Conn::connect()?.request(&Request::Rename { target, name })? {
-        println!("{}\t{}", agent.id, agent.name);
+        if json {
+            output::print(OneAgent::new(&agent));
+        } else {
+            println!("{}\t{}", agent.id, agent.name);
+        }
     }
     Ok(())
 }
 
 /// `argus mv <target> <group>`: keeps the last segment, changes the group.
-pub fn mv(target: String, group: String) -> Result<()> {
+pub fn mv(target: String, group: String, json: bool) -> Result<()> {
     let dest = if group.ends_with('/') { group } else { format!("{group}/") };
-    rename(target, dest)
+    rename(target, dest, json)
 }
 
-pub fn label(target: String, changes: Vec<String>) -> Result<()> {
+pub fn label(target: String, changes: Vec<String>, json: bool) -> Result<()> {
     let mut set = BTreeMap::new();
     let mut unset = Vec::new();
     for change in changes {
@@ -417,6 +438,10 @@ pub fn label(target: String, changes: Vec<String>) -> Result<()> {
         }
     }
     if let Response::Agents { agents } = Conn::connect()?.request(&Request::Label { target, set, unset })? {
+        if json {
+            output::print(AgentList::new(&agents));
+            return Ok(());
+        }
         for a in agents {
             let labels: Vec<String> = a.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
             println!("{}\t{}\t{}", a.id, a.name, labels.join(","));
@@ -425,30 +450,42 @@ pub fn label(target: String, changes: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn ack(target: String) -> Result<()> {
-    Conn::connect()?.request(&Request::Ack { target })?;
+pub fn ack(target: String, json: bool) -> Result<()> {
+    let mut conn = Conn::connect()?;
+    if !json {
+        conn.request(&Request::Ack { target })?;
+        return Ok(());
+    }
+    let id = conn.find(&target)?.id.to_string();
+    conn.request(&Request::Ack { target: id.clone() })?;
+    output::print(OneAgent::new(&conn.find(&id)?));
     Ok(())
 }
 
-pub fn manager_start() -> Result<()> {
+pub fn manager_start(json: bool) -> Result<()> {
     Conn::connect()?;
-    manager_status()
+    manager_status(json)
 }
 
-pub fn manager_stop(kill_agents: bool) -> Result<()> {
-    match Conn::open(false)? {
+pub fn manager_stop(kill_agents: bool, json: bool) -> Result<()> {
+    let was_running = match Conn::open(false)? {
         Some(mut conn) => {
             conn.request(&Request::Shutdown { kill_agents })?;
-            println!("manager stopped");
+            true
         }
-        None => println!("manager is not running"),
+        None => false,
+    };
+    if json {
+        output::print(serde_json::json!({ "was_running": was_running }));
+    } else {
+        println!("{}", if was_running { "manager stopped" } else { "manager is not running" });
     }
     Ok(())
 }
 
 /// Replaces the running manager with the installed binary, e.g. after an
 /// upgrade. Agents keep running; the new manager reconnects to their holders.
-pub fn manager_restart() -> Result<()> {
+pub fn manager_restart(json: bool) -> Result<()> {
     if let Some(mut conn) = Conn::open(false)? {
         let Response::Hello { pid, .. } = conn.request(&hello_request())? else {
             bail!("unexpected reply to Hello");
@@ -464,12 +501,65 @@ pub fn manager_restart() -> Result<()> {
         }
     }
     Conn::connect()?;
-    manager_status()
+    manager_status(json)
 }
 
-pub fn manager_status() -> Result<()> {
+/// `argus manager status --json`.
+#[derive(Serialize)]
+struct ManagerStatus<'a> {
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<u32>,
+    /// The manager's build; `null` from one that predates reporting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build: Option<Option<&'a str>>,
+    client_build: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agents: Option<AgentCounts>,
+    /// Running agents whose holder is not this build.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    older_holders: Vec<OlderHolder>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<Capability>,
+    socket: String,
+}
+
+#[derive(Serialize)]
+struct AgentCounts {
+    running: usize,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct OlderHolder {
+    id: u64,
+    name: String,
+    build: Option<String>,
+}
+
+pub fn manager_status(json: bool) -> Result<()> {
+    let socket = paths::manager_socket().display().to_string();
     let Some(mut conn) = Conn::open(false)? else {
-        println!("manager is not running");
+        if json {
+            output::print(ManagerStatus {
+                running: false,
+                pid: None,
+                protocol: None,
+                build: None,
+                client_build: BUILD,
+                stale: None,
+                agents: None,
+                older_holders: vec![],
+                capabilities: vec![],
+                socket,
+            });
+        } else {
+            println!("manager is not running");
+        }
         return Ok(());
     };
     let Response::Hello { pid, version, capabilities, build } = conn.request(&hello_request())? else {
@@ -477,6 +567,27 @@ pub fn manager_status() -> Result<()> {
     };
     let agents = conn.list(true)?;
     let running = agents.iter().filter(|a| a.status.is_live()).count();
+    if json {
+        let older_holders = agents
+            .iter()
+            .filter(|a| a.status.is_live())
+            .map(|a| OlderHolder { id: a.id, name: a.name.clone(), build: holder_build(a.id) })
+            .filter(|h| h.build.as_deref() != Some(BUILD))
+            .collect();
+        output::print(ManagerStatus {
+            running: true,
+            pid: Some(pid),
+            protocol: Some(version),
+            build: Some(build.as_deref()),
+            client_build: BUILD,
+            stale: Some(conn.stale_manager().is_some()),
+            agents: Some(AgentCounts { running, total: agents.len() }),
+            older_holders,
+            capabilities,
+            socket,
+        });
+        return Ok(());
+    }
     println!("manager running (pid {pid}, protocol v{version}), {running} running / {} total agents", agents.len());
     println!("build: {} (this argus: {BUILD})", build.as_deref().unwrap_or("unknown, older"));
     if let Some(notice) = conn.stale_manager() {
@@ -496,7 +607,7 @@ pub fn manager_status() -> Result<()> {
         println!("agents on an older holder (restart them to upgrade): {}", older.join(", "));
     }
     println!("capabilities: {}", capabilities.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", "));
-    println!("socket: {}", paths::manager_socket().display());
+    println!("socket: {socket}");
     Ok(())
 }
 

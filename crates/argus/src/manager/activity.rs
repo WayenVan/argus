@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argus_proto::msg::{TmuxLocation, awaits_prompt, now_secs};
+use argus_proto::msg::{Activity, TmuxLocation, now_secs};
 use serde_json::Value;
 
 use super::driver::{self, Hint};
@@ -48,7 +48,7 @@ impl Manager {
             return;
         }
         let changed = apply(rec, hint);
-        let arm = rec.info.activity == "working";
+        let arm = rec.info.activity == Activity::Working;
         if arm && changed {
             rec.runtime.working_gen += 1;
         }
@@ -81,25 +81,25 @@ impl Manager {
                 let locations_changed = rec.info.tmux_locations != tmux_locations;
                 rec.info.attached = count;
                 rec.info.tmux_locations = tmux_locations;
-                let seen = gained_focus && rec.info.activity == "done" && set(rec, "idle");
+                let seen = gained_focus && rec.info.activity == Activity::Done && set(rec, Activity::Idle);
                 attach_changed || locations_changed || seen
             }
             Fact::Input => {
                 rec.runtime.last_input = Some(Instant::now());
-                match rec.info.activity.as_str() {
-                    "done" => set(rec, "idle"),
+                match rec.info.activity {
+                    Activity::Done => set(rec, Activity::Idle),
                     // Answering a permission prompt takes a keypress; the
                     // tool that asked now runs.
-                    "blocked" => {
-                        let next = rec.runtime.last_tool.as_ref().map_or("working".into(), |t| format!("tool:{t}"));
-                        set(rec, &next)
+                    Activity::Blocked => {
+                        let next = rec.runtime.last_tool.clone().map_or(Activity::Working, Activity::Tool);
+                        set(rec, next)
                     }
                     _ => false,
                 }
             }
-            Fact::Ack => rec.info.activity == "done" && set(rec, "idle"),
+            Fact::Ack => rec.info.activity == Activity::Done && set(rec, Activity::Idle),
             // Nothing has reported otherwise since it started.
-            Fact::Ready => rec.info.activity == "unknown" && set(rec, "idle"),
+            Fact::Ready => rec.info.activity == Activity::Unknown && set(rec, Activity::Idle),
         };
         if changed {
             reg.changed(id);
@@ -115,7 +115,7 @@ impl Manager {
                 let mut reg = self.registry.lock().unwrap();
                 let Some(rec) = reg.agents.get_mut(&id) else { return };
                 match rec.runtime.deadline {
-                    Some(d) if rec.info.status.is_live() && rec.info.activity == "working" => {
+                    Some(d) if rec.info.status.is_live() && rec.info.activity == Activity::Working => {
                         (d, rec.runtime.working_gen)
                     }
                     _ => {
@@ -137,7 +137,7 @@ impl Manager {
             let offset = holder::output_offset(id).await.ok();
             let mut reg = self.registry.lock().unwrap();
             let Some(rec) = reg.agents.get_mut(&id) else { return };
-            if rec.info.activity != "working" {
+            if rec.info.activity != Activity::Working {
                 rec.runtime.watchdog = false;
                 return;
             }
@@ -154,7 +154,7 @@ impl Manager {
                     rec.runtime.deadline = Some(Instant::now() + SILENCE);
                 }
                 _ => {
-                    set(rec, "unknown");
+                    set(rec, Activity::Unknown);
                     rec.runtime.watchdog = false;
                     reg.changed(id);
                     return;
@@ -178,7 +178,7 @@ impl Manager {
                     }
                     let busy = last.is_some() && offset != last;
                     last = offset;
-                    if set(rec, if busy { "busy" } else { "quiet" }) {
+                    if set(rec, if busy { Activity::Busy } else { Activity::Quiet }) {
                         reg.changed(id);
                     }
                 }
@@ -221,32 +221,32 @@ fn bind_session(rec: &mut AgentRecord, event: &Value, hint: &Hint) -> bool {
 fn apply(rec: &mut AgentRecord, hint: Hint) -> bool {
     match hint {
         // Unseen results stay marked until someone looks.
-        Hint::SessionStart | Hint::WaitingInput if rec.info.activity == "done" => false,
-        Hint::SessionStart | Hint::WaitingInput => set(rec, "idle"),
-        Hint::Working => set(rec, "working"),
+        Hint::SessionStart | Hint::WaitingInput if rec.info.activity == Activity::Done => false,
+        Hint::SessionStart | Hint::WaitingInput => set(rec, Activity::Idle),
+        Hint::Working => set(rec, Activity::Working),
         Hint::Tool(name) => {
-            let changed = set(rec, &format!("tool:{name}"));
+            let changed = set(rec, Activity::Tool(name.clone()));
             rec.runtime.last_tool = Some(name);
             changed
         }
-        Hint::WaitingApproval => set(rec, "blocked"),
+        Hint::WaitingApproval => set(rec, Activity::Blocked),
         // Someone watching it finish has already seen it.
-        Hint::Done if rec.runtime.focused > 0 => set(rec, "idle"),
-        Hint::Done => set(rec, "done"),
-        Hint::Error => set(rec, "error"),
+        Hint::Done if rec.runtime.focused > 0 => set(rec, Activity::Idle),
+        Hint::Done => set(rec, Activity::Done),
+        Hint::Error => set(rec, Activity::Error),
         Hint::Ignore => false,
     }
 }
 
-fn set(rec: &mut AgentRecord, activity: &str) -> bool {
+fn set(rec: &mut AgentRecord, activity: Activity) -> bool {
     if rec.info.activity == activity {
         return false;
     }
-    rec.info.activity = activity.to_string();
-    rec.info.activity_since = Some(now_secs());
-    if !awaits_prompt(activity) {
+    if !activity.awaits_prompt() {
         rec.runtime.submitting = None; // The sent prompt went through.
     }
+    rec.info.activity = activity;
+    rec.info.activity_since = Some(now_secs());
     true
 }
 
@@ -282,15 +282,15 @@ mod tests {
         let mut rec = record();
         apply(&mut rec, Hint::Working);
         apply(&mut rec, Hint::Done);
-        assert_eq!(rec.info.activity, "done");
+        assert_eq!(rec.info.activity, Activity::Done);
         // Idle notifications do not clear an unseen result.
         apply(&mut rec, Hint::WaitingInput);
-        assert_eq!(rec.info.activity, "done");
+        assert_eq!(rec.info.activity, Activity::Done);
 
         let mut watched = record();
         watched.runtime.focused = 1;
         apply(&mut watched, Hint::Done);
-        assert_eq!(watched.info.activity, "idle");
+        assert_eq!(watched.info.activity, Activity::Idle);
     }
 
     #[test]

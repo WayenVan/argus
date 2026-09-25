@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use argus_proto::msg::{Response, awaits_prompt};
+use argus_proto::msg::{Activity, Response};
 
 use super::registry::AgentRecord;
 use super::{Manager, holder, log, resolve_one};
@@ -37,7 +37,7 @@ impl Manager {
             }
             let now = Instant::now();
             if let Some(reason) = refusal(rec, force, now) {
-                return Ok(Response::error("not_ready", format!("{} {reason}", rec.info.name)));
+                return Ok(Response::error(crate::errors::NOT_READY, format!("{} {reason}", rec.info.name)));
             }
             rec.runtime.submitting = Some(now + SUBMIT_TIMEOUT);
             (id, rec.info.name.clone())
@@ -81,15 +81,15 @@ impl Manager {
 
 /// Why typing into `rec` now would be unsafe, if it would.
 fn refusal(rec: &AgentRecord, force: bool, now: Instant) -> Option<String> {
-    let activity = rec.info.activity.as_str();
-    if activity == "blocked" {
+    let activity = &rec.info.activity;
+    if *activity == Activity::Blocked {
         // Even forced: the keypress would answer the permission prompt.
         return Some("is waiting for a permission answer; attach to answer it".into());
     }
     if force {
         return None;
     }
-    if !awaits_prompt(activity) {
+    if !activity.awaits_prompt() {
         return Some(format!("is {activity}, not waiting for a prompt"));
     }
     if rec.info.attached > 0 && rec.runtime.last_input.is_some_and(|t| now < t + TYPING_GRACE) {

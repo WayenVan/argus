@@ -14,7 +14,7 @@ Set both directory variables to run a separate, isolated argus.
 
 | Variable | Value |
 |---|---|
-| `ARGUS_AGENT_ID` | The agent's ID. |
+| `ARGUS_AGENT_ID` | The agent's ID. `argus status` and `argus wait --dir` leave this agent out; the target `self` names it. |
 | `ARGUS_SOCKET` | The manager's socket. |
 
 pi agents also get `ARGUS_PI_HOOK`, and omp agents `ARGUS_OMP_HOOK`: the

@@ -1,10 +1,13 @@
 //! Agent names are paths (`research/claude-1`); a group is a name prefix.
 //!
 //! Each segment matches `[a-z0-9._-]+` and must not be all digits, so a bare
-//! number on the command line always means an ID.
+//! number on the command line always means an ID. `self` is reserved: as a
+//! target it names the agent running the command.
 
 use anyhow::{Result, bail};
 use argus_proto::msg::AgentInfo;
+
+use crate::errors::{AMBIGUOUS, NOT_FOUND, coded};
 
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -20,7 +23,7 @@ fn validate_segment(segment: &str) -> Result<()> {
     if segment.is_empty() {
         bail!("empty path segment");
     }
-    if segment == "." || segment == ".." {
+    if segment == "." || segment == ".." || segment == SELF {
         bail!("segment {segment:?} is reserved");
     }
     if let Some(c) = segment.chars().find(|c| !matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-')) {
@@ -28,6 +31,25 @@ fn validate_segment(segment: &str) -> Result<()> {
     }
     if segment.chars().all(|c| c.is_ascii_digit()) {
         bail!("segment {segment:?} is all digits and would look like an ID");
+    }
+    Ok(())
+}
+
+/// The target naming the agent a command runs inside.
+pub const SELF: &str = "self";
+
+/// The agent this command runs inside, if any.
+pub fn self_id() -> Option<u64> {
+    std::env::var("ARGUS_AGENT_ID").ok()?.parse().ok()
+}
+
+/// Turns a `self` target into the ID from `ARGUS_AGENT_ID`; other targets
+/// pass through.
+pub fn expand_self(target: &mut String) -> Result<()> {
+    if target == SELF {
+        let id = self_id()
+            .ok_or_else(|| coded(NOT_FOUND, "`self` only works inside an argus agent (ARGUS_AGENT_ID is unset)"))?;
+        *target = id.to_string();
     }
     Ok(())
 }
@@ -74,13 +96,13 @@ pub fn resolve<'a>(target: &str, agents: impl Iterator<Item = &'a AgentInfo> + C
         if agents.clone().any(|a| a.id == id) {
             return Ok(vec![id]);
         }
-        bail!("no agent with ID {id}");
+        return Err(coded(NOT_FOUND, format!("no agent with ID {id}")));
     }
     if let Some(group) = target.strip_suffix("/**").or_else(|| target.strip_suffix('/')) {
         let prefix = format!("{group}/");
         let ids: Vec<u64> = agents.filter(|a| a.name.starts_with(&prefix)).map(|a| a.id).collect();
         if ids.is_empty() {
-            bail!("no agents in group {group}");
+            return Err(coded(NOT_FOUND, format!("no agents in group {group}")));
         }
         return Ok(ids);
     }
@@ -90,18 +112,23 @@ pub fn resolve<'a>(target: &str, agents: impl Iterator<Item = &'a AgentInfo> + C
             Some(id) => Ok(vec![id]),
             None => {
                 let ids: Vec<String> = exact.iter().map(|a| a.id.to_string()).collect();
-                bail!("{target} matches {} agents (name reused after exit); use an ID: {}", exact.len(), ids.join(", "))
+                let message = format!(
+                    "{target} matches {} agents (name reused after exit); use an ID: {}",
+                    exact.len(),
+                    ids.join(", ")
+                );
+                Err(coded(AMBIGUOUS, message))
             }
         };
     }
     let matches: Vec<&AgentInfo> = agents.filter(|a| a.name.rsplit('/').next() == Some(target)).collect();
     match matches.as_slice() {
-        [] => bail!("no agent named {target}"),
+        [] => Err(coded(NOT_FOUND, format!("no agent named {target}"))),
         _ => match pick_one(&matches) {
             Some(id) => Ok(vec![id]),
             None => {
                 let names: Vec<&str> = matches.iter().map(|a| a.name.as_str()).collect();
-                bail!("{target} is ambiguous: {}", names.join(", "))
+                Err(coded(AMBIGUOUS, format!("{target} is ambiguous: {}", names.join(", "))))
             }
         },
     }
@@ -150,6 +177,16 @@ pub fn in_prefix(name: &str, prefix: &str) -> bool {
 mod tests {
     use super::*;
     use argus_proto::msg::AgentStatus;
+
+    #[test]
+    fn self_is_reserved_and_names_the_calling_agent() {
+        assert!(validate_name("self").is_err());
+        assert!(validate_name("team/self").is_err());
+        assert!(validate_name("myself").is_ok());
+        let mut other = "claude-1".to_string();
+        expand_self(&mut other).unwrap();
+        assert_eq!(other, "claude-1");
+    }
 
     fn agent(id: u64, name: &str) -> AgentInfo {
         AgentInfo {
