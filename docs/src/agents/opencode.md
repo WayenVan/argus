@@ -14,5 +14,6 @@ its config into yours. No user file is modified, and nothing needs trusting.
 opencode creates its session with the first prompt.
 
 **Input is not accepted for the first few seconds.**
-opencode ignores keys typed while it starts. argus waits until the prompt
-shows a cursor before it reports `idle`, so `argus send --wait` is safe.
+opencode ignores keys typed while it starts, about 5 s for opencode 1.18.
+Until its prompt shows a cursor the agent is `unknown`, so `argus send`
+refuses it; `argus send --wait` waits until it is `idle`.

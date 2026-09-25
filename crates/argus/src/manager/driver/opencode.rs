@@ -18,6 +18,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
@@ -42,8 +43,8 @@ impl Driver for Opencode {
         true
     }
 
-    fn ready_on_cursor(&self) -> bool {
-        true
+    fn ready_on_cursor(&self) -> Option<Duration> {
+        Some(Duration::ZERO)
     }
 
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {

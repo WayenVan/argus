@@ -96,8 +96,8 @@ impl Activity {
             Activity::Quiet => {
                 "is quiet (no hooks, so it may still be working); use --force if it is at its prompt".into()
             }
-            Activity::Unknown => "is unknown (e.g. interrupted, or the manager restarted mid-turn); \
-                                  use --force if it is at its prompt"
+            Activity::Unknown => "is unknown (still starting, interrupted, or the manager restarted mid-turn); \
+                                  use --wait, or --force if it is at its prompt"
                 .into(),
             other => format!("is {} ({other}), not waiting for a prompt", other.availability()),
         })
@@ -768,7 +768,7 @@ mod compatibility_tests {
         );
         assert!(Activity::Blocked.send_refusal().unwrap().starts_with("needs attention (blocked"));
         assert!(Activity::Quiet.send_refusal().unwrap().contains("--force"));
-        assert!(Activity::Unknown.send_refusal().unwrap().contains("the manager restarted mid-turn); use --force"));
+        assert!(Activity::Unknown.send_refusal().unwrap().contains("mid-turn); use --wait, or --force"));
     }
 
     #[test]

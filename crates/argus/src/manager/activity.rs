@@ -104,12 +104,43 @@ impl Manager {
                 }
             }
             Fact::Ack => rec.info.activity == Activity::Done && set(rec, Activity::Idle),
-            // Nothing has reported otherwise since it started.
-            Fact::Ready => rec.info.activity == Activity::Unknown && set(rec, Activity::Idle),
         };
         if changed {
             reg.changed(id);
         }
+    }
+
+    /// A freshly started agent showed or hid its cursor. Once it has stayed
+    /// up for `steady` (see `Driver::ready_on_cursor`), the agent is at its
+    /// prompt, unless a hook has reported something since it started.
+    pub(super) fn on_cursor(self: &Arc<Self>, id: u64, shown: bool, steady: Duration) {
+        let generation = {
+            let mut reg = self.registry.lock().unwrap();
+            let Some(rec) = reg.agents.get_mut(&id) else { return };
+            rec.runtime.cursor_gen += 1;
+            if !shown || rec.info.activity != Activity::Unknown {
+                return;
+            }
+            rec.runtime.cursor_gen
+        };
+        let manager = self.clone();
+        let ready = move || {
+            let mut reg = manager.registry.lock().unwrap();
+            let Some(rec) = reg.agents.get_mut(&id) else { return };
+            if rec.runtime.cursor_gen == generation
+                && rec.info.activity == Activity::Unknown
+                && set(rec, Activity::Idle)
+            {
+                reg.changed(id);
+            }
+        };
+        if steady.is_zero() {
+            return ready();
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(steady).await;
+            ready();
+        });
     }
 
     /// Downgrades `working` to `unknown` once hooks and output both go quiet.
@@ -195,15 +226,9 @@ impl Manager {
 }
 
 pub enum Fact {
-    Attached {
-        count: u32,
-        focused: u32,
-        tmux_locations: Vec<TmuxLocation>,
-    },
+    Attached { count: u32, focused: u32, tmux_locations: Vec<TmuxLocation> },
     Input,
     Ack,
-    /// A freshly started agent can take input (see `Driver::ready_on_cursor`).
-    Ready,
 }
 
 /// Ties hook reports to one agent session. `ARGUS_AGENT_ID` is inherited by

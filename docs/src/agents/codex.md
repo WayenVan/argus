@@ -16,9 +16,13 @@ agent and accept argus's hooks. You only need to do this once.
 
 ## Known limitations
 
-**No activity until the first prompt.**
-Codex fires its first hook with the first prompt, so a new agent shows `idle`
-until then.
+**No hook until the first prompt.**
+Codex fires its first hook with the first prompt. A new agent is `unknown`
+until its prompt has shown a cursor for 3 s, then `idle`. Codex draws its
+prompt first and a startup dialog (trust this folder, review hooks) over it
+about a second later; while a dialog is up the agent stays `unknown`, so
+`argus send` does not answer it. Answer it by attaching. A dialog that appears
+later than 3 s is not caught.
 
 **Your own `-c developer_instructions` replaces argus's.**
 Codex uses the last value it is given. The agent still runs, but it will not

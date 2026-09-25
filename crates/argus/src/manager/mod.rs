@@ -470,7 +470,7 @@ impl Manager {
         for (id, name) in live {
             holder::link_name(&name, id);
             // Not `ready_on_cursor`: a recovered agent may be mid-turn.
-            self.follow(id, false);
+            self.follow(id, None);
         }
         for (id, restore) in restore {
             tokio::spawn(self.clone().restore(id, restore));
@@ -526,7 +526,7 @@ impl Manager {
 
     /// Follows a holder's events until the agent exits, then records it.
     /// `ready_on_cursor`: see [`driver::Driver::ready_on_cursor`].
-    fn follow(self: &Arc<Self>, id: u64, ready_on_cursor: bool) {
+    fn follow(self: &Arc<Self>, id: u64, ready_on_cursor: Option<Duration>) {
         let hookless = {
             let reg = self.registry.lock().unwrap();
             reg.agents.get(&id).is_some_and(|r| !driver::for_kind(&r.info.kind).has_hooks())
@@ -534,9 +534,9 @@ impl Manager {
         if hookless {
             self.poll_output(id);
         }
-        let on_cursor = ready_on_cursor.then(|| {
+        let on_cursor = ready_on_cursor.map(|steady| {
             let manager = self.clone();
-            Box::new(move || manager.on_fact(id, Fact::Ready)) as Box<dyn FnOnce() + Send>
+            Arc::new(move |shown| manager.on_cursor(id, shown, steady)) as screen::OnCursor
         });
         self.screens.track(id, on_cursor);
         let manager = self.clone();

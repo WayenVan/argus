@@ -8,17 +8,22 @@
 //! frozen: changing any of them makes every user review the hooks again.
 //!
 //! Codex only fires `SessionStart` with the first prompt, so a freshly started
-//! agent reports nothing until then.
+//! agent reports nothing until then. It draws its prompt first and a startup
+//! dialog (trust this folder, review hooks) over it about a second later, so
+//! it counts as ready only once its cursor has stayed up for `STEADY_CURSOR`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
-use argus_proto::msg::Activity;
 use serde_json::Value;
 
 use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command};
 
 pub struct Codex;
+
+/// Measured: startup dialogs replace the prompt 1.0–1.2 s after it appears.
+const STEADY_CURSOR: Duration = Duration::from_secs(3);
 
 /// (hook event, the name Codex uses for it in trust keys).
 const HOOK_EVENTS: &[(&str, &str)] = &[
@@ -40,9 +45,8 @@ impl Driver for Codex {
         true
     }
 
-    fn initial_activity(&self) -> Option<Activity> {
-        // At its prompt; the first hook only arrives with the first prompt.
-        Some(Activity::Idle)
+    fn ready_on_cursor(&self) -> Option<Duration> {
+        Some(STEADY_CURSOR)
     }
 
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {

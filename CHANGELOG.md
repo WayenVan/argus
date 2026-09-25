@@ -96,6 +96,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A new Codex agent no longer shows `idle` while a startup dialog (trust this
+  folder, review hooks) is up, so `argus send` cannot answer it: Codex draws
+  its prompt first and the dialog over it a second later. It is `unknown`
+  until its prompt has kept a cursor for 3 s.
+- `argus send` types escape sequences and control characters (Esc, arrow
+  keys, Ctrl-C) as keys again instead of pasting them as text.
+
 - `argus send` to Codex left the prompt in its input box instead of
   submitting it: Codex took the fast typing for a paste and the Enter after it
   as a new line. Single-line prompts are now sent as a bracketed paste too,

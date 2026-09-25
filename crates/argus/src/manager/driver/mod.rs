@@ -14,6 +14,7 @@ mod opencode;
 mod pi;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use argus_proto::msg::Activity;
@@ -67,11 +68,13 @@ pub trait Driver: Send + Sync {
         None
     }
 
-    /// Whether a freshly started agent is at its prompt once it shows a
-    /// cursor on its alternate screen: for agents that report nothing before
-    /// the first prompt and drop keys typed before their input is set up.
-    fn ready_on_cursor(&self) -> bool {
-        false
+    /// For agents that report nothing before the first prompt: a freshly
+    /// started agent is at its prompt once it has shown a cursor on its
+    /// alternate screen for this long without hiding it. Agents that draw
+    /// their prompt first and a startup dialog over it after a moment need
+    /// the wait; keys typed into the dialog would answer it.
+    fn ready_on_cursor(&self) -> Option<Duration> {
+        None
     }
 
     /// Rewrites the launch command or environment. Returns a warning to show the user when

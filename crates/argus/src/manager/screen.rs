@@ -28,9 +28,9 @@ struct State {
     offset: u64,
 }
 
-/// Runs once, the first time the agent shows a cursor on its alternate
-/// screen; shared so it survives a tracker restart.
-type OnCursor = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+/// Told whether the agent shows a cursor on its alternate screen, each time
+/// that changes; shared so it survives a tracker restart.
+pub type OnCursor = Arc<dyn Fn(bool) + Send + Sync>;
 
 pub struct ScreenReply {
     pub mode: ScreenMode,
@@ -60,9 +60,8 @@ impl Screens {
     /// A tracker that panics or finds its state poisoned is started over:
     /// re-subscribing backfills from the holder's ring buffer, the same way
     /// a tracker that starts late catches up.
-    pub fn track(self: &Arc<Self>, id: u64, on_cursor: Option<Box<dyn FnOnce() + Send>>) {
+    pub fn track(self: &Arc<Self>, id: u64, on_cursor: Option<OnCursor>) {
         let screens = self.clone();
-        let on_cursor: OnCursor = Arc::new(Mutex::new(on_cursor));
         tokio::spawn(async move {
             loop {
                 // Its own task, so a panic ends the attempt and not this loop.
@@ -81,13 +80,15 @@ impl Screens {
         });
     }
 
-    async fn follow(self: Arc<Self>, id: u64, on_cursor: OnCursor) -> anyhow::Result<ControlFlow<()>> {
+    async fn follow(self: Arc<Self>, id: u64, on_cursor: Option<OnCursor>) -> anyhow::Result<ControlFlow<()>> {
         let on_event = |event: HolderEvent| self.on_event(id, event);
+        let mut shown = false;
         let on_data = |start: u64, bytes: &[u8]| {
-            if self.on_data(id, start, bytes)? {
-                let f = on_cursor.lock().unwrap().take();
-                if let Some(f) = f {
-                    f();
+            let now_shown = self.on_data(id, start, bytes)?;
+            if now_shown != shown {
+                shown = now_shown;
+                if let Some(f) = &on_cursor {
+                    f(shown);
                 }
             }
             ControlFlow::Continue(())

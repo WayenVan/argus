@@ -62,7 +62,7 @@ impl Manager {
         if multiline && !paste {
             bail!("multi-line text needs an agent that accepts pastes (bracketed paste is off)");
         }
-        let pasted = paste && !text.is_empty();
+        let pasted = paste && pastes(text);
         if pasted {
             // A line break inside the text would press Enter; pasting it
             // keeps it as text. Single lines are pasted too: typed fast, they
@@ -82,6 +82,15 @@ impl Manager {
         }
         Ok(())
     }
+}
+
+/// Whether `text` goes in as a bracketed paste, for an agent that accepts
+/// them. Escape sequences and control characters are keys (Esc, arrows,
+/// Ctrl-C) unless the text spans lines; pasted, they would arrive as text.
+fn pastes(text: &str) -> bool {
+    let multiline = text.contains(['\n', '\r']);
+    let keys = text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'));
+    !text.is_empty() && (multiline || !keys)
 }
 
 /// Why typing into `rec` now would be unsafe, if it would.
@@ -141,6 +150,12 @@ mod tests {
             assert_eq!(refusal(&record(busy), true, now), None, "--force {busy}");
         }
         assert!(refusal(&record("blocked"), true, now).is_some(), "blocked even with --force");
+    }
+
+    #[test]
+    fn prompts_paste_and_keys_do_not() {
+        assert!(pastes("Fix the failing test") && pastes("line one\nline two"));
+        assert!(!pastes("") && !pastes("\x1b") && !pastes("\x1b[B") && !pastes("\x03"));
     }
 
     #[test]
