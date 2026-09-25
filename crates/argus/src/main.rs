@@ -8,6 +8,7 @@ mod client;
 mod manager;
 mod naming;
 mod stream;
+mod term;
 mod tui;
 
 use std::process::ExitCode;

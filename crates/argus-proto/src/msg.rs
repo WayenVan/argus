@@ -204,6 +204,31 @@ pub struct RunRequest {
     /// Overrides kind detection from the program name (`--kind`).
     #[serde(default)]
     pub kind: Option<String>,
+    /// The client terminal's colours, for the holder to answer the agent's
+    /// colour queries with until a terminal attaches.
+    #[serde(default)]
+    pub colors: TerminalColors,
+}
+
+/// Default foreground and background of a terminal, as the bodies of its
+/// OSC 10 / OSC 11 replies (e.g. `rgb:1e1e/1e1e/2e2e`). `None` when the
+/// terminal did not answer.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalColors {
+    #[serde(default)]
+    pub foreground: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+}
+
+impl TerminalColors {
+    /// Whether `spec` is a plain X11 colour spec (`rgb:…`, `#…`), safe to
+    /// write into an agent's input inside an OSC reply.
+    pub fn is_color_spec(spec: &str) -> bool {
+        (1..=64).contains(&spec.len())
+            && (spec.starts_with("rgb:") || spec.starts_with('#'))
+            && spec.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'#'))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -365,6 +390,9 @@ pub struct HolderSpec {
     pub socket: PathBuf,
     pub state_dir: PathBuf,
     pub manager_socket: PathBuf,
+    /// From [`RunRequest::colors`].
+    #[serde(default)]
+    pub colors: TerminalColors,
 }
 
 /// Written by the holder to its stdout as one JSON line once it is serving.
@@ -434,6 +462,10 @@ pub struct AttachRequest {
     /// screen snapshot or replay.
     #[serde(default)]
     pub from_offset: Option<u64>,
+    /// The attaching terminal's colours; the holder answers the agent's
+    /// colour queries with them once this terminal is gone again.
+    #[serde(default)]
+    pub colors: TerminalColors,
 }
 
 /// Pushed by the holder to subscribers as control frames.

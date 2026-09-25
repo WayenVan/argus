@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Pa
 
 use crate::attach;
 use crate::client::{Conn, PsOptions};
-use crate::stream;
+use crate::{stream, term};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
 /// list (pushed by Watch, applied as it arrives), preview bytes are always a
@@ -76,8 +76,9 @@ pub fn run(mode: Mode, prefix: Option<String>, labels: Vec<(String, String)>) ->
     if !conn.supports(Capability::StyledPreview) {
         anyhow::bail!("the running manager does not support styled previews; restart it with `argus manager restart`");
     }
-    // Before ratatui takes stdin; see `remember_cursor_shape`.
-    attach::remember_cursor_shape();
+    // Before ratatui takes stdin and before any agent changes the terminal;
+    // see `term::profile`.
+    term::profile();
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut conn, &opts, mode);
     ratatui::restore();

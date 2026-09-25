@@ -16,7 +16,7 @@ use argus_proto::{MANAGER_PROTOCOL_VERSION, paths};
 use nix::sys::signal::kill as signal_process;
 use nix::unistd::{Pid, setsid};
 
-use crate::{attach, naming, stream};
+use crate::{attach, naming, stream, term};
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -153,6 +153,7 @@ pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
         cols,
         labels: opts.labels.into_iter().collect(),
         kind: opts.kind,
+        colors: term::profile().colors.clone(),
     };
     let reply = Conn::connect()?.request(&Request::Run(req))?;
     if let Response::Agent { warnings, .. } = &reply {

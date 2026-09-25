@@ -12,6 +12,7 @@ mod conn;
 mod ring;
 mod server;
 mod spawn;
+mod stand_in;
 
 use std::fs::File;
 use std::io::{Read, Write};

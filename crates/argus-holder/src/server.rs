@@ -32,15 +32,13 @@ use signal_hook::consts::SIGCHLD;
 use crate::conn::{Conn, Role};
 use crate::ring::Ring;
 use crate::spawn::{self, cloexec_pipe, set_nonblocking};
+use crate::stand_in::StandIn;
 
 const READ_CHUNK: usize = 64 * 1024;
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const LINGER: Duration = Duration::from_secs(60);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const INPUT_EVENT_INTERVAL: Duration = Duration::from_secs(1);
-const TERMINAL_QUERY_GRACE: Duration = Duration::from_millis(250);
-const OSC_FOREGROUND_QUERY: &[u8] = b"\x1b]10;?\x1b\\";
-const OSC_BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 
 pub struct Holder {
     spec: HolderSpec,
@@ -61,65 +59,7 @@ pub struct Holder {
     /// Last `(attached, focused)` counts sent to subscribers.
     attached_reported: (u32, u32),
     last_input_event: Option<Instant>,
-    terminal_queries: TerminalQueries,
-}
-
-#[derive(Default)]
-struct TerminalQueries {
-    tail: Vec<u8>,
-    foreground: bool,
-    background: bool,
-    deadline: Option<Instant>,
-}
-
-impl TerminalQueries {
-    fn observe(&mut self, bytes: &[u8]) {
-        let mut combined = Vec::with_capacity(self.tail.len() + bytes.len());
-        combined.extend_from_slice(&self.tail);
-        combined.extend_from_slice(bytes);
-        self.foreground |= contains(&combined, OSC_FOREGROUND_QUERY);
-        self.background |= contains(&combined, OSC_BACKGROUND_QUERY);
-        if (self.foreground || self.background) && self.deadline.is_none() {
-            self.deadline = Some(Instant::now() + TERMINAL_QUERY_GRACE);
-        }
-        let keep = OSC_BACKGROUND_QUERY.len().saturating_sub(1).min(combined.len());
-        self.tail.clear();
-        self.tail.extend_from_slice(&combined[combined.len() - keep..]);
-    }
-
-    fn take_requests(&mut self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        if self.foreground {
-            bytes.extend_from_slice(OSC_FOREGROUND_QUERY);
-        }
-        if self.background {
-            bytes.extend_from_slice(OSC_BACKGROUND_QUERY);
-        }
-        self.clear_pending();
-        bytes
-    }
-
-    fn take_fallback_responses(&mut self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        if self.foreground {
-            bytes.extend_from_slice(b"\x1b]10;rgb:e5e5/e5e5/e5e5\x1b\\");
-        }
-        if self.background {
-            bytes.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x1b\\");
-        }
-        self.clear_pending();
-        bytes
-    }
-
-    fn clear_pending(&mut self) {
-        self.foreground = false;
-        self.background = false;
-        self.deadline = None;
-    }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    stand_in: StandIn,
 }
 
 /// PTY size and who decides it.
@@ -161,6 +101,7 @@ impl Holder {
         };
         set_nonblocking(spawned.master.as_raw_fd());
         let current = (spec.rows.max(1), spec.cols.max(1));
+        let stand_in = StandIn::new(spec.colors.clone());
 
         Ok(Holder {
             spec,
@@ -179,7 +120,7 @@ impl Holder {
             size: Size { current, owner: None, history: Vec::new(), last_change: None, pending: None },
             attached_reported: (0, 0),
             last_input_event: None,
-            terminal_queries: TerminalQueries::default(),
+            stand_in,
         })
     }
 
@@ -265,10 +206,7 @@ impl Holder {
     }
 
     fn next_timeout(&self) -> PollTimeout {
-        let deadline = [self.kill_deadline, self.linger_deadline, self.size.pending, self.terminal_queries.deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        let deadline = [self.kill_deadline, self.linger_deadline, self.size.pending].into_iter().flatten().min();
         match deadline {
             None => PollTimeout::NONE,
             Some(d) => PollTimeout::try_from(d.saturating_duration_since(Instant::now())).unwrap_or(PollTimeout::MAX),
@@ -286,11 +224,6 @@ impl Holder {
         if self.size.pending.is_some_and(|d| now >= d) {
             self.size.pending = None;
             self.apply_owner_size();
-        }
-        if self.terminal_queries.deadline.is_some_and(|d| now >= d) {
-            let responses = self.terminal_queries.take_fallback_responses();
-            self.master_out.extend_from_slice(&responses);
-            self.write_master();
         }
     }
 
@@ -449,27 +382,22 @@ impl Holder {
                 c.dead = true;
             }
         }
-        // If the agent queried terminal colours before anyone attached, give
-        // the real terminal one chance to answer. The control reply must stay
-        // first so the attach handshake remains framed correctly.
-        let pending_terminal_queries = if req.readonly { Vec::new() } else { self.terminal_queries.take_requests() };
+        if !req.readonly {
+            self.stand_in.learn(req.colors.clone());
+        }
         let conn = &mut self.conns[i];
         conn.role = Role::Attach { readonly: req.readonly };
         conn.size = (req.rows.max(1), req.cols.max(1));
         conn.push(frame::encode_json(&HolderResponse::Ok));
-        if !pending_terminal_queries.is_empty() {
-            conn.push(frame::encode(ty::DATA, &pending_terminal_queries));
-        }
         if let Some(offset) = req.from_offset {
             let (_, bytes) = self.ring.since(offset);
-            let bytes = if req.allow_clipboard_replay { bytes } else { argus_proto::ansi::strip_osc52(&bytes) };
+            let bytes = argus_proto::ansi::filter_replay(&bytes, req.allow_clipboard_replay);
             for chunk in bytes.chunks(READ_CHUNK) {
                 conn.push(frame::encode(ty::DATA, chunk));
             }
         } else if req.replay {
             let contents = self.ring.contents();
-            let contents =
-                if req.allow_clipboard_replay { contents } else { argus_proto::ansi::strip_osc52(&contents) };
+            let contents = argus_proto::ansi::filter_replay(&contents, req.allow_clipboard_replay);
             for chunk in contents.chunks(READ_CHUNK) {
                 conn.push(frame::encode(ty::DATA, chunk));
             }
@@ -547,6 +475,10 @@ impl Holder {
         let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: TIOCSWINSZ on our PTY master; the kernel signals the agent.
         unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+    }
+
+    fn writable_attached(&self) -> bool {
+        self.conns.iter().any(|c| c.role == Role::Attach { readonly: false } && !c.dead)
     }
 
     fn attached_count(&self) -> u32 {
@@ -638,12 +570,13 @@ impl Holder {
             break;
         }
         if filled > 0 {
-            self.terminal_queries.observe(&buf[..filled]);
+            let replies = self.stand_in.answer(&buf[..filled]);
             self.publish(&buf[..filled]);
-            // An attached real terminal receives live queries and supplies
-            // the answer through its normal input stream.
-            if self.attached_count() > 0 {
-                self.terminal_queries.clear_pending();
+            // A writable terminal receives the queries with the output and
+            // answers them itself, through its input.
+            if !replies.is_empty() && !self.writable_attached() {
+                self.master_out.extend_from_slice(&replies);
+                self.write_master();
             }
         }
         if closed {
@@ -762,6 +695,7 @@ mod tests {
             replay,
             allow_clipboard_replay: false,
             from_offset,
+            colors: Default::default(),
         }
     }
 
@@ -778,30 +712,5 @@ mod tests {
     #[test]
     fn skips_the_jiggle_for_a_ring_buffer_replay() {
         assert!(!needs_jiggle(&req(None, true)));
-    }
-
-    #[test]
-    fn detects_terminal_colour_queries_across_reads() {
-        let mut queries = TerminalQueries::default();
-        queries.observe(b"before\x1b]10;?\x1b\\\x1b]11;");
-        queries.observe(b"?\x1b\\after");
-
-        assert!(queries.foreground);
-        assert!(queries.background);
-        assert!(queries.deadline.is_some());
-        assert_eq!(queries.take_requests(), b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-        assert!(queries.deadline.is_none());
-    }
-
-    #[test]
-    fn answers_unattended_terminal_colour_queries() {
-        let mut queries = TerminalQueries::default();
-        queries.observe(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-
-        assert_eq!(
-            queries.take_fallback_responses(),
-            b"\x1b]10;rgb:e5e5/e5e5/e5e5\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\"
-        );
-        assert!(!queries.foreground && !queries.background);
     }
 }

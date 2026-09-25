@@ -9,8 +9,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
@@ -20,12 +19,12 @@ use argus_proto::msg::{
 use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::isatty;
 use signal_hook::SigId;
 use signal_hook::consts::SIGWINCH;
 
 use crate::client::Conn;
+use crate::term;
 
 /// Ctrl-\ (FS). In raw mode it arrives as a byte instead of SIGQUIT, unless
 /// the agent turned on an extended keyboard mode: see [`find_detach`].
@@ -47,20 +46,8 @@ const CLEAR: &str = "\x1b[H\x1b[2J";
 /// own stack), modifyOtherKeys, focus reporting, alternate screen, mouse
 /// modes, bracketed paste, colour scheme reports, hidden cursor, cursor
 /// colour, colours. The cursor shape is restored separately, to what it was
-/// before argus started: see [`remember_cursor_shape`].
+/// before argus started: see [`term::Profile::cursor_shape`].
 const RESET: &str = "\x1b[?2026l\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b]112\x07\x1b[0m";
-/// DECRQSS for the cursor shape (DECSCUSR), then DA1. Every terminal answers
-/// DA1, and replies come back in order, so its arrival means any DECRQSS
-/// answer is already in; a terminal that ignores DECRQSS costs no timeout.
-const CURSOR_SHAPE_QUERY: &str = "\x1bP$q q\x1b\\\x1b[c";
-/// Upper bound for a terminal that answers neither query.
-const QUERY_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// The caller's cursor shape (DECSCUSR parameter) from before argus took
-/// over the terminal. Neither the alternate screen nor anything else scopes
-/// the shape, so one agent's (Codex resets it to the terminal default every
-/// frame) would otherwise carry into the tree and the next agent attached.
-static CURSOR_SHAPE: OnceLock<Option<u16>> = OnceLock::new();
 
 pub struct Options {
     pub readonly: bool,
@@ -88,7 +75,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
     if !isatty(io::stdin().as_raw_fd())? {
         bail!("attach needs a terminal on stdin");
     }
-    remember_cursor_shape();
+    let profile = term::profile();
     let (rows, cols) = crate::client::terminal_size();
     let restore = target.id.and_then(fetch_screen);
 
@@ -113,11 +100,12 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
             replay: opts.replay,
             allow_clipboard_replay: opts.allow_clipboard_replay,
             from_offset,
+            colors: profile.colors.clone(),
         }),
     )?;
 
     let ending = {
-        let _raw = RawMode::enter()?;
+        let _raw = term::RawMode::enter()?;
         let _display = DisplaySession::enter();
         match &restore {
             // Only worth drawing if it is a real redraw of the size we are
@@ -406,28 +394,6 @@ impl Drop for SignalRegistration {
     }
 }
 
-/// Puts the terminal in raw mode and restores it on drop, including on panic.
-struct RawMode {
-    saved: Termios,
-}
-
-impl RawMode {
-    fn enter() -> Result<RawMode> {
-        let stdin = io::stdin();
-        let saved = tcgetattr(stdin.as_fd()).context("reading terminal settings")?;
-        let mut raw = saved.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw).context("entering raw mode")?;
-        Ok(RawMode { saved })
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        let _ = tcsetattr(io::stdin().as_fd(), SetArg::TCSANOW, &self.saved);
-    }
-}
-
 /// Keeps the agent's drawing off the caller's normal screen and restores all
 /// terminal modes even when attaching returns with an error or unwinds.
 struct DisplaySession;
@@ -442,64 +408,8 @@ impl DisplaySession {
 impl Drop for DisplaySession {
     fn drop(&mut self) {
         print_raw(RESET);
-        // Unknown means the terminal could not say; its default is the best guess.
-        let shape = CURSOR_SHAPE.get().copied().flatten().unwrap_or(0);
-        print_raw(&format!("\x1b[{shape} q"));
+        print_raw(&term::restore_cursor_shape());
     }
-}
-
-/// Asks the terminal for the current cursor shape, once per process, so that
-/// every attach can hand it back on the way out. Call before anything else
-/// changes the shape: `argus tree` does so at startup, since by its second
-/// attach the terminal holds whatever the first agent left.
-pub fn remember_cursor_shape() {
-    CURSOR_SHAPE.get_or_init(query_cursor_shape);
-}
-
-fn query_cursor_shape() -> Option<u16> {
-    let _raw = RawMode::enter().ok()?;
-    print_raw(CURSOR_SHAPE_QUERY);
-    let stdin = io::stdin();
-    let deadline = Instant::now() + QUERY_TIMEOUT;
-    let mut reply = Vec::new();
-    let mut buf = [0u8; 256];
-    while !has_da1_reply(&reply) {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
-        match poll(&mut fds, PollTimeout::try_from(left).unwrap_or(PollTimeout::ZERO)) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(Errno::EINTR) => continue,
-            Err(_) => break,
-        }
-        match nix::unistd::read(stdin.as_raw_fd(), &mut buf) {
-            Ok(0) => break,
-            Ok(n) => reply.extend_from_slice(&buf[..n]),
-            Err(Errno::EINTR | Errno::EAGAIN) => {}
-            Err(_) => break,
-        }
-    }
-    parse_cursor_shape(&reply)
-}
-
-/// Whether `reply` holds a complete DA1 answer, `ESC [ ? … c`.
-fn has_da1_reply(reply: &[u8]) -> bool {
-    find(reply, b"\x1b[?").is_some_and(|i| reply[i + 3..].contains(&b'c'))
-}
-
-/// The shape in a DECRQSS answer, `ESC P 1 $ r <n> SP q ESC \`. tmux echoes
-/// the request in front (`… $ r SP q <n> SP q …`), so the number is taken as
-/// the digits right before the final `SP q`.
-fn parse_cursor_shape(reply: &[u8]) -> Option<u16> {
-    let start = find(reply, b"\x1bP1$r")? + 5;
-    let end = start + find(&reply[start..], b"\x1b\\")?;
-    let body = std::str::from_utf8(&reply[start..end]).ok()?.strip_suffix(" q")?;
-    let digits = body.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
-    body[digits..].parse().ok().filter(|&n| n <= 6)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Manager snapshots already begin by selecting the alternate screen. Attach
@@ -552,19 +462,7 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
-    use super::{find_detach, has_da1_reply, only_mouse_reports, parse_cursor_shape, snapshot_body, winch_pipe};
-
-    #[test]
-    fn cursor_shape_replies() {
-        assert_eq!(parse_cursor_shape(b"\x1bP1$r6 q\x1b\\\x1b[?62;22c"), Some(6));
-        assert_eq!(parse_cursor_shape(b"\x1bP1$r q2 q\x1b\\"), Some(2), "tmux");
-        assert_eq!(parse_cursor_shape(b"\x1bP1$r0 q\x1b\\"), Some(0));
-        assert_eq!(parse_cursor_shape(b"\x1bP0$r\x1b\\\x1b[?1;2c"), None, "not supported");
-        assert_eq!(parse_cursor_shape(b"\x1b[?1;2c"), None, "ignored");
-        assert_eq!(parse_cursor_shape(b"\x1bP1$r9 q\x1b\\"), None, "out of range");
-        assert!(has_da1_reply(b"\x1bP1$r6 q\x1b\\\x1b[?62;22c"));
-        assert!(!has_da1_reply(b"\x1bP1$r6 q\x1b\\\x1b[?62;2"));
-    }
+    use super::{find_detach, only_mouse_reports, snapshot_body, winch_pipe};
 
     #[test]
     fn detach_key_in_every_encoding() {

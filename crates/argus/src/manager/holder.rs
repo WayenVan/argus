@@ -36,6 +36,7 @@ pub async fn start(holder_exe: &Path, id: u64, req: &RunRequest, command: Vec<St
         socket: paths::holder_socket(id),
         state_dir: dir,
         manager_socket: paths::manager_socket(),
+        colors: req.colors.clone(),
     };
 
     let mut child = tokio::process::Command::new(holder_exe)
