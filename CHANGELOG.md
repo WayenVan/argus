@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-25
+
 ### Added
 
 - Catppuccin theming for the TUI, with Mocha or Latte picked from the terminal's
@@ -134,5 +136,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `argus run`, `argus attach`, and `argus grid`/`tree` dashboards with
   rename/move/kill/copy/new-agent shortcuts and tmux pane jumps.
 
-[Unreleased]: https://github.com/WayenVan/argus/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/WayenVan/argus/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/WayenVan/argus/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/WayenVan/argus/releases/tag/v0.0.1
