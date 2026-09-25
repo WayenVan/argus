@@ -723,9 +723,9 @@ fn kill_status(conn: &mut Conn, id: u64, name: &str) -> String {
 }
 
 /// Gives `attach` the real terminal for the duration of the session, then
-/// reclaims it. The alternate screen is kept throughout so the normal screen
-/// never flashes by; it is re-entered anyway after, in case the agent left
-/// it. `terminal.draw` right after would paint over a stale frame, so the
+/// reclaims it. The alternate screen is kept for an agent on its own, so the
+/// normal screen never flashes by; an agent on the normal screen is shown
+/// there. Either way it is re-entered after. `terminal.draw` right after would paint over a stale frame, so the
 /// caller resets its preview tick to refresh immediately. Returns how the
 /// session ended for the footer: printing it would land on the normal screen
 /// and pile up there until the TUI exits.

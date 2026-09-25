@@ -32,12 +32,15 @@ const DETACH_KEY: u8 = 0x1c;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
-/// Argus owns an alternate screen for the whole attachment. Some agents
-/// (notably Codex) draw on the normal screen, so relying on the child to enter
-/// one leaves its last frame in the caller's scrollback after detach.
-const ENTER: &str = "\x1b[?1049h\x1b[?1004h";
-const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+const ALT_SCREEN_ENTER: &str = "\x1b[?1049h";
 const ALT_SCREEN_LEAVE: &str = "\x1b[?1049l";
+/// Ends a normal-screen session: leaves an alternate screen the agent may
+/// have left the terminal on, without 1049's cursor restore (tmux restores
+/// the cursor even when already on the normal screen, which would jump it to
+/// wherever the agent's last 1049h saved it), then starts a line below the
+/// agent's last frame, where its cursor was not.
+const NORMAL_SCREEN_LEAVE: &str = "\x1b[?1047l\x1b[999B\r\n";
+const FOCUS_REPORTS: &str = "\x1b[?1004h";
 /// Home + clear, for when there is no screen restore to draw instead.
 const CLEAR: &str = "\x1b[H\x1b[2J";
 /// Leaves the agent's terminal modes behind: synchronized-output hold
@@ -56,8 +59,8 @@ pub struct Options {
     pub replay: bool,
     pub allow_clipboard_replay: bool,
     /// The caller already holds the alternate screen and redraws it after:
-    /// the TUI. Switching screens around the session would flash whatever
-    /// the normal screen holds on the way in and out.
+    /// the TUI. Kept for an agent on its alternate screen, so the normal
+    /// screen does not flash by; left for one on the normal screen.
     pub shared_screen: bool,
 }
 
@@ -118,9 +121,10 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
         }),
     )?;
 
+    let screen = screen_for(restore.as_ref().map(|r| r.mode));
     let ending = {
         let _raw = term::RawMode::enter()?;
-        let _display = DisplaySession::enter(opts.shared_screen);
+        let _display = DisplaySession::enter(screen, opts.shared_screen);
         match &restore {
             // Only worth drawing if it is a real redraw of the size we are
             // about to show it at; otherwise the holder will resize the PTY
@@ -409,26 +413,60 @@ impl Drop for SignalRegistration {
     }
 }
 
-/// Keeps the agent's drawing off the caller's normal screen and restores all
-/// terminal modes even when attaching returns with an error or unwinds.
+/// Which screen an attachment draws on: the one the agent is on, so the
+/// caller's terminal (and tmux's mouse-wheel binding, which only enters copy
+/// mode off the alternate screen) sees what running the agent directly would
+/// show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Screen {
+    /// The agent is on its alternate screen. Argus enters one for it, since
+    /// the snapshot and the agent's later redraws do not select it again.
+    Alternate,
+    /// The agent draws on the normal screen, so its output reaches the
+    /// caller's scrollback. Wrapping it in an alternate screen would not
+    /// hold anyway: an agent that toggles 1049 itself (omp does on every
+    /// resize) drops the terminal out of it at an arbitrary point.
+    Normal,
+}
+
+/// `None` or `Unavailable` mostly means an agent too new to have drawn
+/// anything, which selects its alternate screen itself when it wants one.
+fn screen_for(mode: Option<ScreenMode>) -> Screen {
+    match mode {
+        Some(ScreenMode::Snapshot) => Screen::Alternate,
+        Some(ScreenMode::Replay | ScreenMode::Unavailable) | None => Screen::Normal,
+    }
+}
+
+/// The screen switches around a session: one on the way in, one on the way
+/// out. A shared caller (the TUI) is on the alternate screen already and
+/// re-enters it after, so it only has to leave it for a normal-screen agent.
+fn screen_switches(screen: Screen, shared: bool) -> (&'static str, &'static str) {
+    match (screen, shared) {
+        (Screen::Alternate, false) => (ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE),
+        (Screen::Alternate, true) => ("", ""),
+        (Screen::Normal, false) => ("", NORMAL_SCREEN_LEAVE),
+        (Screen::Normal, true) => (ALT_SCREEN_LEAVE, NORMAL_SCREEN_LEAVE),
+    }
+}
+
+/// Selects the agent's screen and restores all terminal modes even when
+/// attaching returns with an error or unwinds.
 struct DisplaySession {
-    shared: bool,
+    leave: &'static str,
 }
 
 impl DisplaySession {
-    fn enter(shared: bool) -> Self {
-        print_raw(if shared { ENTER.trim_start_matches("\x1b[?1049h") } else { ENTER });
-        Self { shared }
+    fn enter(screen: Screen, shared: bool) -> Self {
+        let (enter, leave) = screen_switches(screen, shared);
+        print_raw(&format!("{enter}{FOCUS_REPORTS}"));
+        Self { leave }
     }
 }
 
 impl Drop for DisplaySession {
     fn drop(&mut self) {
-        if self.shared {
-            print_raw(&RESET.replace(ALT_SCREEN_LEAVE, ""));
-        } else {
-            print_raw(RESET);
-        }
+        print_raw(&RESET.replace(ALT_SCREEN_LEAVE, self.leave));
         print_raw(&term::restore_cursor_shape());
     }
 }
@@ -437,7 +475,7 @@ impl Drop for DisplaySession {
 /// has selected its own above, so repeating 1049h could overwrite the
 /// terminal's saved normal-screen cursor/state on some emulators.
 fn snapshot_body(bytes: &[u8]) -> &[u8] {
-    bytes.strip_prefix(ALT_SCREEN_ENTER).unwrap_or(bytes)
+    bytes.strip_prefix(ALT_SCREEN_ENTER.as_bytes()).unwrap_or(bytes)
 }
 
 fn print_raw(s: &str) {
@@ -483,7 +521,11 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
-    use super::{find_detach, only_mouse_reports, snapshot_body, winch_pipe};
+    use super::{
+        ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE, NORMAL_SCREEN_LEAVE, Screen, find_detach, only_mouse_reports, screen_for,
+        screen_switches, snapshot_body, winch_pipe,
+    };
+    use argus_proto::msg::ScreenMode;
 
     #[test]
     fn detach_key_in_every_encoding() {
@@ -496,6 +538,22 @@ mod tests {
         assert_eq!(find_detach(b"\x1b[92;7u"), None, "ctrl+alt");
         assert_eq!(find_detach(b"\x1b[92u"), None, "plain backslash");
         assert_eq!(find_detach(b"\x1b[97;5u\x1b[<0;1;2M"), None);
+    }
+
+    #[test]
+    fn only_an_alternate_screen_agent_gets_one() {
+        assert_eq!(screen_for(Some(ScreenMode::Snapshot)), Screen::Alternate);
+        assert_eq!(screen_for(Some(ScreenMode::Replay)), Screen::Normal);
+        assert_eq!(screen_for(Some(ScreenMode::Unavailable)), Screen::Normal);
+        assert_eq!(screen_for(None), Screen::Normal);
+    }
+
+    #[test]
+    fn screen_switches_leave_the_caller_where_it_started() {
+        assert_eq!(screen_switches(Screen::Alternate, false), (ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE));
+        assert_eq!(screen_switches(Screen::Alternate, true), ("", ""), "the TUI keeps its alternate screen");
+        assert_eq!(screen_switches(Screen::Normal, false), ("", NORMAL_SCREEN_LEAVE));
+        assert_eq!(screen_switches(Screen::Normal, true), (ALT_SCREEN_LEAVE, NORMAL_SCREEN_LEAVE));
     }
 
     #[test]

@@ -18,3 +18,8 @@ Either the session was started outside argus, or you passed your own
 **An agent shows `unknown`.**
 It stopped reporting while working, for example after Claude was interrupted
 with Esc. See [Claude Code](agents/claude.md#known-limitations).
+
+**The mouse wheel does not scroll an attached agent in tmux.**
+tmux sends the wheel to programs on the alternate screen instead of entering
+copy mode. Agents that use it (Claude Code, Codex, pi) handle it themselves. For
+omp, make sure argus is up to date: see [Attaching](concepts.md#attaching).

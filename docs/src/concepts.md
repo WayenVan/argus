@@ -11,6 +11,14 @@
 The holders own the agents, so the manager can stop or restart at any time
 without killing them.
 
+## Attaching
+
+`attach` shows the agent on the screen it uses. An agent on the alternate
+screen (Claude Code, Codex, pi) gets one for the session, and detaching leaves
+your terminal as it was. An agent drawing on the normal screen (omp) has
+its recent output replayed there, so you can scroll it back; it stays in your
+scrollback after you detach, and each attach adds it again.
+
 ## Names and groups
 
 An agent's name is a path, such as `web/api/claude`. Every segment except the

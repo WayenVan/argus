@@ -31,6 +31,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `attach` draws on the screen the agent is on. It used to always enter its
+  own alternate screen, so in tmux the mouse wheel did nothing for agents that
+  draw on the normal screen, such as omp — unless the agent had toggled the
+  alternate screen itself since, as omp does on every resize. Such agents now
+  scroll with tmux copy mode or the terminal's scrollback, and their output
+  stays there after detaching; agents on their alternate screen are unchanged.
 - Keep screen tracking alive when vt100 panics: vendor vt100 0.16.2 with a fix
   for a panic after a row is shortened through a wide character (a resize or an
   ICH) and that column is then written or erased (see `vendor/vt100/PATCHES.md`).
