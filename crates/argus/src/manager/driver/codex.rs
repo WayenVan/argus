@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Context, Driver, Hint, Launch, field, hook_command};
+use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command};
 
 pub struct Codex;
 
@@ -41,10 +41,17 @@ impl Driver for Codex {
 
     fn initial_activity(&self) -> Option<&'static str> {
         // At its prompt; the first hook only arrives with the first prompt.
-        Some("waiting_input")
+        Some("idle")
     }
 
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
+        // Independent of hooks: ARGUS_AGENT_ID is set on the process
+        // environment regardless, so self-labeling works even without them.
+        // A user's own `-c developer_instructions=` comes later in argv and
+        // wins, same as any other config override; that's a soft loss (the
+        // agent just won't know the label convention), not worth a warning.
+        launch.command.splice(1..1, developer_instructions_override());
+
         let Some(hook_exe) = &ctx.hook_exe else {
             return Ok(Some("argus-hook is not installed next to argus; activity will not be tracked".into()));
         };
@@ -96,6 +103,13 @@ fn hook_overrides(command: &str) -> Vec<String> {
         .collect()
 }
 
+/// `-c developer_instructions="…"`, escaped as a basic TOML string. Plain
+/// config, not a hook: never asks the user to trust anything.
+fn developer_instructions_override() -> Vec<String> {
+    let text = SELF_LABEL_INSTRUCTIONS.replace('\\', r"\\").replace('"', r#"\""#).replace('\n', r"\n");
+    vec!["-c".to_string(), format!(r#"developer_instructions="{text}""#)]
+}
+
 /// `$CODEX_HOME`, defaulting to `~/.codex`.
 fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
@@ -136,5 +150,20 @@ mod tests {
             args[1],
             r#"hooks.SessionStart=[{hooks=[{type="command",command="'/opt/argus hook' codex",async=true,timeout=3}]}]"#
         );
+    }
+
+    #[test]
+    fn developer_instructions_are_escaped_for_a_basic_toml_string() {
+        let args = developer_instructions_override();
+        assert_eq!(args[0], "-c");
+        assert!(args[1].starts_with(r#"developer_instructions=""#));
+        assert!(args[1].ends_with('"'));
+        // Real newlines break a basic (non-triple-quoted) TOML string; the
+        // instructions are multi-line, so they must come out escaped.
+        let inner = &args[1][r#"developer_instructions=""#.len()..args[1].len() - 1];
+        assert!(!inner.contains('\n'));
+        assert!(inner.contains(r"\n"));
+        assert!(SELF_LABEL_INSTRUCTIONS.contains('"'), "sanity check: exercises quote-escaping too");
+        assert!(inner.contains(r#"\""#));
     }
 }

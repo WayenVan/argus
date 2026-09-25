@@ -118,7 +118,58 @@ impl Registry {
         self.changes.subscribe()
     }
 
+    /// Only a *live* agent reserves its name: once it exits, the name is free
+    /// again for reuse (an exited record hangs around, addressable by ID,
+    /// until `argus rm`, but it no longer squats on the name).
     pub fn name_taken(&self, name: &str) -> bool {
-        self.infos().any(|a| a.name == name)
+        self.infos().any(|a| a.name == name && a.status.is_live())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use argus_proto::msg::AgentStatus;
+
+    fn agent(id: u64, name: &str, status: AgentStatus) -> AgentInfo {
+        AgentInfo {
+            id,
+            name: name.into(),
+            kind: "claude".into(),
+            command: vec!["claude".into()],
+            cwd: "/".into(),
+            created_at: 0,
+            exited_at: None,
+            holder_pid: None,
+            agent_pid: None,
+            status,
+            exit_code: None,
+            activity: "unknown".into(),
+            activity_since: None,
+            attached: 0,
+            labels: Default::default(),
+        }
+    }
+
+    fn registry(agents: Vec<AgentInfo>) -> Registry {
+        let (changes, _) = broadcast::channel(CHANGE_BACKLOG);
+        Registry {
+            next_id: agents.iter().map(|a| a.id + 1).max().unwrap_or(1),
+            agents: agents.into_iter().map(|a| (a.id, AgentRecord::new(a))).collect(),
+            seq: 0,
+            changes,
+        }
+    }
+
+    #[test]
+    fn an_exited_agents_name_is_free_again() {
+        let reg = registry(vec![agent(1, "codex-1", AgentStatus::Exited)]);
+        assert!(!reg.name_taken("codex-1"));
+    }
+
+    #[test]
+    fn a_live_agents_name_stays_taken() {
+        let reg = registry(vec![agent(1, "codex-1", AgentStatus::Running)]);
+        assert!(reg.name_taken("codex-1"));
     }
 }

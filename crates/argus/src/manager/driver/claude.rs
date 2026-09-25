@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
-use super::{Context, Driver, Hint, Launch, field, hook_command};
+use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command};
 
 pub struct Claude;
 
@@ -39,6 +39,10 @@ impl Driver for Claude {
     }
 
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
+        // Independent of hooks: ARGUS_AGENT_ID is set on the process
+        // environment regardless, so self-labeling works even without them.
+        launch.command.splice(1..1, ["--append-system-prompt".to_string(), SELF_LABEL_INSTRUCTIONS.to_string()]);
+
         let Some(hook_exe) = &ctx.hook_exe else {
             return Ok(Some("argus-hook is not installed next to argus; activity will not be tracked".into()));
         };
@@ -175,14 +179,18 @@ mod tests {
 
         let mut launch = Launch { command: vec!["claude".into(), "-c".into()], agent_dir: dir.clone() };
         Claude.prepare(&mut launch, &ctx).unwrap();
+        // Each `splice(1..1, ..)` lands right after the program name, so the
+        // one that runs second (the settings injection) ends up first.
         assert_eq!(launch.command[1], "--settings");
-        assert_eq!(launch.command[3], "-c");
+        assert_eq!(launch.command[3], "--append-system-prompt");
+        assert_eq!(launch.command[4], SELF_LABEL_INSTRUCTIONS);
+        assert_eq!(launch.command[5], "-c", "the user's own trailing arg is kept, just pushed further out");
 
         let user = r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"mine"}]}]}}"#;
         let mut launch =
             Launch { command: vec!["claude".into(), "--settings".into(), user.into()], agent_dir: dir.clone() };
         Claude.prepare(&mut launch, &ctx).unwrap();
-        let merged: Value = serde_json::from_str(&fs::read_to_string(&launch.command[2]).unwrap()).unwrap();
+        let merged: Value = serde_json::from_str(&fs::read_to_string(&launch.command[4]).unwrap()).unwrap();
         assert_eq!(merged["model"], "opus");
         let stop = merged["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "user hook kept, ours appended");

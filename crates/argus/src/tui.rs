@@ -23,7 +23,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::attach;
 use crate::client::{Conn, PsOptions};
@@ -403,9 +403,11 @@ fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, previ
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
     draw_tree_list(frame, cols[0], rows, selected, blink);
 
-    let detail = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(cols[1]);
+    let detail =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(cols[1]);
     draw_detail_preview(frame, detail[0], rows, selected, preview);
-    draw_detail_recap(frame, detail[1], rows, selected);
+    draw_detail_label(frame, detail[1], rows, selected, "title");
+    draw_detail_label(frame, detail[2], rows, selected, "recap");
 }
 
 fn draw_tree_list(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, blink: bool) {
@@ -460,16 +462,18 @@ fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], selected: us
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
-/// Placeholder: there is no recap data source yet (it would come from a
-/// summary the driver builds out of hook events). Reserving the pane now
-/// keeps the layout stable for when that lands.
-fn draw_detail_recap(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" recap ");
-    let body = match rows.get(selected) {
-        Some(Row::Agent { .. }) => "recap isn't implemented yet",
-        _ => "",
+/// One of the self-reported labels (`title`, `recap`) an agent is taught to
+/// maintain via `SELF_LABEL_INSTRUCTIONS` — a plain readback of
+/// `AgentInfo.labels`, not a separate data source.
+fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, key: &str) {
+    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(format!(" {key} "));
+    let value = match rows.get(selected) {
+        Some(Row::Agent { info, .. }) => info.labels.get(key).map(String::as_str).unwrap_or("none"),
+        _ => "none",
     };
-    frame.render_widget(Paragraph::new(body).style(Style::default().fg(Color::DarkGray)).block(block), area);
+    let paragraph = Paragraph::new(value).style(Style::default().fg(Color::Gray)).block(block);
+    let paragraph = if key == "recap" { paragraph.wrap(Wrap { trim: false }) } else { paragraph };
+    frame.render_widget(paragraph, area);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +533,7 @@ fn activity_color(info: &AgentInfo, blink: bool) -> Color {
     match info.activity.as_str() {
         "error" => Color::Red,
         "done" => Color::Green,
-        "waiting_input" | "waiting_approval" => Color::Yellow,
+        "idle" | "blocked" => Color::Yellow,
         "quiet" | "unknown" => Color::DarkGray,
         // working / tool:<name> / busy: actively running, pulse to draw the
         // eye toward what's currently in motion.

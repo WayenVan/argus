@@ -4,7 +4,7 @@
 //! hints and the holder's facts (focus, input) do to an agent's activity:
 //!
 //! - `done` means "finished and nobody has looked yet". It becomes
-//!   `waiting_input` when an attached terminal has focus, someone types, or
+//!   `idle` when an attached terminal has focus, someone types, or
 //!   the user acks it. Being attached alone does not count.
 //! - `working` is guarded by a silence watchdog: if no hook arrives and the
 //!   output offset stops moving, the agent is shown as `unknown` (e.g. Claude
@@ -79,20 +79,20 @@ impl Manager {
                 rec.runtime.focused = focused;
                 let attach_changed = rec.info.attached != count;
                 rec.info.attached = count;
-                let seen = gained_focus && rec.info.activity == "done" && set(rec, "waiting_input");
+                let seen = gained_focus && rec.info.activity == "done" && set(rec, "idle");
                 attach_changed || seen
             }
             Fact::Input => match rec.info.activity.as_str() {
-                "done" => set(rec, "waiting_input"),
+                "done" => set(rec, "idle"),
                 // Answering a permission prompt takes a keypress; the tool
                 // that asked now runs.
-                "waiting_approval" => {
+                "blocked" => {
                     let next = rec.runtime.last_tool.as_ref().map_or("working".into(), |t| format!("tool:{t}"));
                     set(rec, &next)
                 }
                 _ => false,
             },
-            Fact::Ack => rec.info.activity == "done" && set(rec, "waiting_input"),
+            Fact::Ack => rec.info.activity == "done" && set(rec, "idle"),
         };
         if changed {
             reg.changed(id);
@@ -209,16 +209,16 @@ fn apply(rec: &mut AgentRecord, hint: Hint) -> bool {
     match hint {
         // Unseen results stay marked until someone looks.
         Hint::SessionStart | Hint::WaitingInput if rec.info.activity == "done" => false,
-        Hint::SessionStart | Hint::WaitingInput => set(rec, "waiting_input"),
+        Hint::SessionStart | Hint::WaitingInput => set(rec, "idle"),
         Hint::Working => set(rec, "working"),
         Hint::Tool(name) => {
             let changed = set(rec, &format!("tool:{name}"));
             rec.runtime.last_tool = Some(name);
             changed
         }
-        Hint::WaitingApproval => set(rec, "waiting_approval"),
+        Hint::WaitingApproval => set(rec, "blocked"),
         // Someone watching it finish has already seen it.
-        Hint::Done if rec.runtime.focused > 0 => set(rec, "waiting_input"),
+        Hint::Done if rec.runtime.focused > 0 => set(rec, "idle"),
         Hint::Done => set(rec, "done"),
         Hint::Error => set(rec, "error"),
         Hint::Ignore => false,
@@ -273,7 +273,7 @@ mod tests {
         let mut watched = record();
         watched.runtime.focused = 1;
         apply(&mut watched, Hint::Done);
-        assert_eq!(watched.info.activity, "waiting_input");
+        assert_eq!(watched.info.activity, "idle");
     }
 
     #[test]

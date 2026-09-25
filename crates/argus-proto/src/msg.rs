@@ -55,7 +55,7 @@ pub struct AgentInfo {
     #[serde(default)]
     pub exit_code: Option<i32>,
     /// What the agent is doing, as understood by its driver: `working`,
-    /// `tool:<name>`, `waiting_approval`, `done`, `waiting_input`, `error`,
+    /// `tool:<name>`, `blocked`, `done`, `idle`, `error`,
     /// `unknown`; `busy` / `quiet` for agents without hooks.
     #[serde(default = "unknown")]
     pub activity: String,
@@ -154,7 +154,7 @@ pub enum Request {
         /// The hook payload exactly as the agent wrote it.
         event: serde_json::Value,
     },
-    /// Marks a finished agent as seen: `done` → `waiting_input`.
+    /// Marks a finished agent as seen: `done` → `idle`.
     Ack {
         target: String,
     },

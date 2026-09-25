@@ -272,7 +272,7 @@ fn activity(a: &AgentInfo, now: u64) -> String {
         return "-".into();
     }
     match (a.activity.as_str(), a.activity_since) {
-        ("done" | "waiting_approval" | "error", Some(since)) => {
+        ("done" | "blocked" | "error", Some(since)) => {
             format!("{} {}", a.activity, age(now.saturating_sub(since)))
         }
         _ => a.activity.clone(),

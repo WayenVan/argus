@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start an agent in the background
+    /// Start an agent and attach to it (use -d to leave it running in the background)
     Run {
         /// Agent name (last path segment, or a full `group/name` path)
         #[arg(long)]
@@ -34,9 +34,9 @@ enum Command {
         /// Working directory (default: current directory)
         #[arg(long)]
         cwd: Option<std::path::PathBuf>,
-        /// Attach right after starting
+        /// Start in the background instead of attaching right away
         #[arg(short, long)]
-        attach: bool,
+        detach: bool,
         /// Label as key=value (repeatable)
         #[arg(short, long = "label", value_name = "KEY=VALUE", value_parser = naming::parse_label)]
         label: Vec<(String, String)>,
@@ -123,7 +123,7 @@ enum Command {
         #[arg(required = true, value_name = "KEY=VALUE|KEY-")]
         changes: Vec<String>,
     },
-    /// Mark a finished agent as seen (done → waiting_input)
+    /// Mark a finished agent as seen (done → idle)
     Ack { target: String },
     /// Print agent events as they happen
     Events {
@@ -219,8 +219,8 @@ fn parse_age(s: &str) -> Result<u64, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Run { name, group, cwd, attach, label, kind, program, args } => {
-            client::run(client::RunOptions { name, group, cwd, labels: label, kind, attach }, program, args)
+        Command::Run { name, group, cwd, detach, label, kind, program, args } => {
+            client::run(client::RunOptions { name, group, cwd, labels: label, kind, attach: !detach }, program, args)
         }
         Command::Attach { target, ro, steal, replay, allow_clipboard_replay } => {
             client::attach(target, attach::Options { readonly: ro, steal, replay, allow_clipboard_replay })

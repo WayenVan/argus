@@ -84,17 +84,41 @@ pub fn resolve<'a>(target: &str, agents: impl Iterator<Item = &'a AgentInfo> + C
         }
         return Ok(ids);
     }
-    if let Some(a) = agents.clone().find(|a| a.name == target) {
-        return Ok(vec![a.id]);
+    let exact: Vec<&AgentInfo> = agents.clone().filter(|a| a.name == target).collect();
+    if !exact.is_empty() {
+        return match pick_one(&exact) {
+            Some(id) => Ok(vec![id]),
+            None => {
+                let ids: Vec<String> = exact.iter().map(|a| a.id.to_string()).collect();
+                bail!("{target} matches {} agents (name reused after exit); use an ID: {}", exact.len(), ids.join(", "))
+            }
+        };
     }
     let matches: Vec<&AgentInfo> = agents.filter(|a| a.name.rsplit('/').next() == Some(target)).collect();
     match matches.as_slice() {
         [] => bail!("no agent named {target}"),
-        [one] => Ok(vec![one.id]),
-        many => {
-            let names: Vec<&str> = many.iter().map(|a| a.name.as_str()).collect();
-            bail!("{target} is ambiguous: {}", names.join(", "))
-        }
+        _ => match pick_one(&matches) {
+            Some(id) => Ok(vec![id]),
+            None => {
+                let names: Vec<&str> = matches.iter().map(|a| a.name.as_str()).collect();
+                bail!("{target} is ambiguous: {}", names.join(", "))
+            }
+        },
+    }
+}
+
+/// Picks the one agent meant among several that share a name — this can
+/// legitimately happen once an exited agent's name is reused by a new one.
+/// The live agent wins when there's exactly one; a real tie (e.g. two exited
+/// agents still un-removed under the same name) can't be guessed and has to
+/// be broken by ID instead.
+fn pick_one(matches: &[&AgentInfo]) -> Option<u64> {
+    if let [one] = matches {
+        return Some(one.id);
+    }
+    match matches.iter().filter(|a| a.status.is_live()).collect::<Vec<_>>().as_slice() {
+        [one] => Some(one.id),
+        _ => None,
     }
 }
 
@@ -173,5 +197,25 @@ mod tests {
         assert_eq!(resolve("proj/**", all.iter()).unwrap(), vec![2, 3]);
         assert!(resolve("claude-1", all.iter()).is_err());
         assert!(resolve("9", all.iter()).is_err());
+    }
+
+    fn exited(id: u64, name: &str) -> AgentInfo {
+        let mut a = agent(id, name);
+        a.status = AgentStatus::Exited;
+        a
+    }
+
+    #[test]
+    fn a_recycled_name_resolves_to_the_live_agent() {
+        let all = [exited(1, "codex-1"), agent(2, "codex-1")];
+        assert_eq!(resolve("codex-1", all.iter()).unwrap(), vec![2]);
+        // The exited one is still there under its ID, just not by name.
+        assert_eq!(resolve("1", all.iter()).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn two_exited_agents_with_the_same_recycled_name_need_an_id() {
+        let all = [exited(1, "codex-1"), exited(2, "codex-1")];
+        assert!(resolve("codex-1", all.iter()).is_err());
     }
 }
