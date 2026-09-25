@@ -8,7 +8,7 @@
 
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B-B7410E?style=flat-square&logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6289ED?style=flat-square)
-![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20opencode-8068F2?style=flat-square)
+![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20opencode%20%C2%B7%20pi-8068F2?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-AD99F8?style=flat-square)
 
 <br><br>
@@ -61,7 +61,8 @@ Detaching with `Ctrl-\` leaves the agent running; reattach later with
 
 Works with [Claude Code](docs/src/agents/claude.md),
 [Codex](docs/src/agents/codex.md), [opencode](docs/src/agents/opencode.md),
-and [any other terminal program](docs/src/agents/generic.md).
+[pi](docs/src/agents/pi.md), and
+[any other terminal program](docs/src/agents/generic.md).
 
 ## Roadmap
 

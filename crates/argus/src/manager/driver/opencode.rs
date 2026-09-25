@@ -22,7 +22,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
-use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field};
+use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint};
 
 pub struct Opencode;
 
@@ -75,25 +75,7 @@ impl Driver for Opencode {
     }
 
     fn interpret(&self, event: &Value) -> Hint {
-        // Written by an older or newer plugin than this argus knows.
-        if event.get("v").and_then(Value::as_u64) != Some(EVENT_VERSION) {
-            return Hint::Ignore;
-        }
-        let tool = || field(event, "tool_name").map(str::to_string);
-        match field(event, "hook_event_name").unwrap_or_default() {
-            "SessionStart" => Hint::SessionStart,
-            "UserPromptSubmit" | "PostToolUse" => Hint::Working,
-            "PreToolUse" => Hint::Tool(tool().unwrap_or_else(|| "tool".into())),
-            "PermissionRequest" => Hint::WaitingApproval,
-            // The tool that asked now runs (or was refused, and the next
-            // event says what happens instead).
-            "PermissionReplied" => tool().map_or(Hint::Working, Hint::Tool),
-            "Stop" => Hint::Done,
-            "StopFailure" => Hint::Error,
-            // The user interrupted the turn and is presumably about to type.
-            "Interrupt" => Hint::WaitingInput,
-            _ => Hint::Ignore,
-        }
+        plugin_hint(event, EVENT_VERSION)
     }
 }
 

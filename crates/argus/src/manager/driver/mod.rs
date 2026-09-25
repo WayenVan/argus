@@ -10,6 +10,7 @@ mod claude;
 mod codex;
 mod generic;
 mod opencode;
+mod pi;
 
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,7 @@ static CLAUDE: claude::Claude = claude::Claude;
 static CODEX: codex::Codex = codex::Codex;
 static GENERIC: generic::Generic = generic::Generic;
 static OPENCODE: opencode::Opencode = opencode::Opencode;
+static PI: pi::Pi = pi::Pi;
 
 /// The driver for a kind; unknown kinds get the generic driver.
 pub fn for_kind(kind: &str) -> &'static dyn Driver {
@@ -88,6 +90,7 @@ pub fn for_kind(kind: &str) -> &'static dyn Driver {
         "claude" => &CLAUDE,
         "codex" => &CODEX,
         "opencode" => &OPENCODE,
+        "pi" => &PI,
         _ => &GENERIC,
     }
 }
@@ -97,7 +100,8 @@ pub fn for_kind(kind: &str) -> &'static dyn Driver {
 /// removed, since running agents may still read them.
 pub fn install_shared_files(ctx: &Context) -> Result<()> {
     claude::write_shared_settings(ctx)?;
-    opencode::write_shared_files(ctx)
+    opencode::write_shared_files(ctx)?;
+    pi::write_shared_files(ctx)
 }
 
 /// Injected as a system-prompt/developer-instruction addition at launch, so
@@ -138,6 +142,31 @@ title and recap this turn? If not, do it now, before responding.";
 pub fn hook_command(hook_exe: &Path, source: &str) -> String {
     let path = hook_exe.to_string_lossy().replace('\'', r"'\''");
     format!("'{path}' {source}")
+}
+
+/// Interprets an event from one of argus's own in-process plugins (opencode,
+/// pi), which flatten their agent's events into Claude-style hook events.
+/// Events in any other format `version` are ignored: an agent keeps the
+/// plugin it started with while the manager may be upgraded underneath it.
+fn plugin_hint(event: &Value, version: u64) -> Hint {
+    if event.get("v").and_then(Value::as_u64) != Some(version) {
+        return Hint::Ignore;
+    }
+    let tool = || field(event, "tool_name").map(str::to_string);
+    match field(event, "hook_event_name").unwrap_or_default() {
+        "SessionStart" => Hint::SessionStart,
+        "UserPromptSubmit" | "PostToolUse" => Hint::Working,
+        "PreToolUse" => Hint::Tool(tool().unwrap_or_else(|| "tool".into())),
+        "PermissionRequest" => Hint::WaitingApproval,
+        // The tool that asked now runs (or was refused, and the next event
+        // says what happens instead).
+        "PermissionReplied" => tool().map_or(Hint::Working, Hint::Tool),
+        "Stop" => Hint::Done,
+        "StopFailure" => Hint::Error,
+        // The user interrupted the turn and is presumably about to type.
+        "Interrupt" => Hint::WaitingInput,
+        _ => Hint::Ignore,
+    }
 }
 
 /// Reads a string field of a hook event.

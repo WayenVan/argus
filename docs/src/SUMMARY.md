@@ -10,6 +10,7 @@
 - [Claude Code](agents/claude.md)
 - [Codex](agents/codex.md)
 - [opencode](agents/opencode.md)
+- [pi](agents/pi.md)
 - [Other programs](agents/generic.md)
 
 # Guides
