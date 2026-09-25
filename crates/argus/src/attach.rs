@@ -9,7 +9,8 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
@@ -17,6 +18,8 @@ use argus_proto::msg::{
     AttachRequest, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request, Response, ScreenMode,
 };
 use argus_proto::{HOLDER_PROTOCOL_VERSION, paths};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::isatty;
 use signal_hook::SigId;
@@ -42,8 +45,22 @@ const CLEAR: &str = "\x1b[H\x1b[2J";
 /// of sitting in a buffered frame until the terminal's own timeout), kitty
 /// keyboard flags (popped before leaving the alternate screen, which has its
 /// own stack), modifyOtherKeys, focus reporting, alternate screen, mouse
-/// modes, bracketed paste, colour scheme reports, hidden cursor, colours.
-const RESET: &str = "\x1b[?2026l\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m";
+/// modes, bracketed paste, colour scheme reports, hidden cursor, cursor
+/// colour, colours. The cursor shape is restored separately, to what it was
+/// before argus started: see [`remember_cursor_shape`].
+const RESET: &str = "\x1b[?2026l\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b]112\x07\x1b[0m";
+/// DECRQSS for the cursor shape (DECSCUSR), then DA1. Every terminal answers
+/// DA1, and replies come back in order, so its arrival means any DECRQSS
+/// answer is already in; a terminal that ignores DECRQSS costs no timeout.
+const CURSOR_SHAPE_QUERY: &str = "\x1bP$q q\x1b\\\x1b[c";
+/// Upper bound for a terminal that answers neither query.
+const QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// The caller's cursor shape (DECSCUSR parameter) from before argus took
+/// over the terminal. Neither the alternate screen nor anything else scopes
+/// the shape, so one agent's (Codex resets it to the terminal default every
+/// frame) would otherwise carry into the tree and the next agent attached.
+static CURSOR_SHAPE: OnceLock<Option<u16>> = OnceLock::new();
 
 pub struct Options {
     pub readonly: bool,
@@ -71,6 +88,7 @@ pub fn attach(target: &Target, opts: Options) -> Result<()> {
     if !isatty(io::stdin().as_raw_fd())? {
         bail!("attach needs a terminal on stdin");
     }
+    remember_cursor_shape();
     let (rows, cols) = crate::client::terminal_size();
     let restore = target.id.and_then(fetch_screen);
 
@@ -171,12 +189,16 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
     // terminals only report focus when it changes.
     frame::write_frame(&mut *writer.lock().unwrap(), ty::FOCUS, &[1])?;
 
-    // Keyboard → holder.
-    {
+    // Keyboard → holder. The input thread must be gone before this returns:
+    // left blocked on stdin, it would keep eating keystrokes meant for the
+    // caller (the TUI, or the next attach) and send them to this holder,
+    // which lingers after its agent exits. Dropping `stop_tx` wakes it.
+    let (stop_rx, stop_tx) = UnixStream::pair()?;
+    let input = {
         let writer = writer.clone();
         let detached = detached.clone();
-        std::thread::spawn(move || forward_input(writer, detached, readonly));
-    }
+        std::thread::spawn(move || forward_input(writer, detached, readonly, stop_rx))
+    };
     // Window size changes → holder. Keep the registration in this function's
     // scope: dropping it unregisters SIGWINCH and closes the pipe writer.
     let (winch, _winch_registration) = winch_pipe()?;
@@ -185,8 +207,17 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
         std::thread::spawn(move || forward_resizes(winch, writer));
     }
 
-    // Holder → screen, on this thread. Blocking writes to stdout push back on
-    // the holder, which drops the backlog instead of stalling the agent.
+    let ending = forward_output(&stream, &detached);
+    drop(stop_tx);
+    // Also unblocks an input thread stuck writing to a holder that stopped reading.
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = input.join();
+    ending
+}
+
+/// Holder → screen, on the calling thread. Blocking writes to stdout push
+/// back on the holder, which drops the backlog instead of stalling the agent.
+fn forward_output(stream: &UnixStream, detached: &AtomicBool) -> Result<Ending> {
     let mut reader = stream;
     let mut out = io::stdout().lock();
     loop {
@@ -216,13 +247,30 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
     }
 }
 
-fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, readonly: bool) {
-    let mut stdin = io::stdin().lock();
+/// Reads fd 0 directly rather than through `io::stdin()`: its lock and buffer
+/// would outlive this session, and `stop` could not interrupt a blocked read.
+fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, readonly: bool, stop: UnixStream) {
+    let stdin = io::stdin();
     let mut buf = [0u8; 4096];
     loop {
-        let n = match stdin.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN), PollFd::new(stop.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(Errno::EINTR) => continue,
+            Err(_) => return,
+        }
+        // Any event on `stop` means its other end was dropped.
+        if fds[1].revents().is_some_and(|r| !r.is_empty()) {
+            return;
+        }
+        if fds[0].revents().is_none_or(|r| r.is_empty()) {
+            continue;
+        }
+        let n = match nix::unistd::read(stdin.as_raw_fd(), &mut buf) {
+            Ok(0) => return,
             Ok(n) => n,
+            Err(Errno::EINTR | Errno::EAGAIN) => continue,
+            Err(_) => return,
         };
         let mut chunk = &buf[..n];
         let detach_at = find_detach(chunk);
@@ -394,7 +442,64 @@ impl DisplaySession {
 impl Drop for DisplaySession {
     fn drop(&mut self) {
         print_raw(RESET);
+        // Unknown means the terminal could not say; its default is the best guess.
+        let shape = CURSOR_SHAPE.get().copied().flatten().unwrap_or(0);
+        print_raw(&format!("\x1b[{shape} q"));
     }
+}
+
+/// Asks the terminal for the current cursor shape, once per process, so that
+/// every attach can hand it back on the way out. Call before anything else
+/// changes the shape: `argus tree` does so at startup, since by its second
+/// attach the terminal holds whatever the first agent left.
+pub fn remember_cursor_shape() {
+    CURSOR_SHAPE.get_or_init(query_cursor_shape);
+}
+
+fn query_cursor_shape() -> Option<u16> {
+    let _raw = RawMode::enter().ok()?;
+    print_raw(CURSOR_SHAPE_QUERY);
+    let stdin = io::stdin();
+    let deadline = Instant::now() + QUERY_TIMEOUT;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 256];
+    while !has_da1_reply(&reply) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::try_from(left).unwrap_or(PollTimeout::ZERO)) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+        match nix::unistd::read(stdin.as_raw_fd(), &mut buf) {
+            Ok(0) => break,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(Errno::EINTR | Errno::EAGAIN) => {}
+            Err(_) => break,
+        }
+    }
+    parse_cursor_shape(&reply)
+}
+
+/// Whether `reply` holds a complete DA1 answer, `ESC [ ? … c`.
+fn has_da1_reply(reply: &[u8]) -> bool {
+    find(reply, b"\x1b[?").is_some_and(|i| reply[i + 3..].contains(&b'c'))
+}
+
+/// The shape in a DECRQSS answer, `ESC P 1 $ r <n> SP q ESC \`. tmux echoes
+/// the request in front (`… $ r SP q <n> SP q …`), so the number is taken as
+/// the digits right before the final `SP q`.
+fn parse_cursor_shape(reply: &[u8]) -> Option<u16> {
+    let start = find(reply, b"\x1bP1$r")? + 5;
+    let end = start + find(&reply[start..], b"\x1b\\")?;
+    let body = std::str::from_utf8(&reply[start..end]).ok()?.strip_suffix(" q")?;
+    let digits = body.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
+    body[digits..].parse().ok().filter(|&n| n <= 6)
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Manager snapshots already begin by selecting the alternate screen. Attach
@@ -447,7 +552,19 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
-    use super::{find_detach, only_mouse_reports, snapshot_body, winch_pipe};
+    use super::{find_detach, has_da1_reply, only_mouse_reports, parse_cursor_shape, snapshot_body, winch_pipe};
+
+    #[test]
+    fn cursor_shape_replies() {
+        assert_eq!(parse_cursor_shape(b"\x1bP1$r6 q\x1b\\\x1b[?62;22c"), Some(6));
+        assert_eq!(parse_cursor_shape(b"\x1bP1$r q2 q\x1b\\"), Some(2), "tmux");
+        assert_eq!(parse_cursor_shape(b"\x1bP1$r0 q\x1b\\"), Some(0));
+        assert_eq!(parse_cursor_shape(b"\x1bP0$r\x1b\\\x1b[?1;2c"), None, "not supported");
+        assert_eq!(parse_cursor_shape(b"\x1b[?1;2c"), None, "ignored");
+        assert_eq!(parse_cursor_shape(b"\x1bP1$r9 q\x1b\\"), None, "out of range");
+        assert!(has_da1_reply(b"\x1bP1$r6 q\x1b\\\x1b[?62;22c"));
+        assert!(!has_da1_reply(b"\x1bP1$r6 q\x1b\\\x1b[?62;2"));
+    }
 
     #[test]
     fn detach_key_in_every_encoding() {

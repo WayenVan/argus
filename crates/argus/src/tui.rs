@@ -76,6 +76,8 @@ pub fn run(mode: Mode, prefix: Option<String>, labels: Vec<(String, String)>) ->
     if !conn.supports(Capability::StyledPreview) {
         anyhow::bail!("the running manager does not support styled previews; restart it with `argus manager restart`");
     }
+    // Before ratatui takes stdin; see `remember_cursor_shape`.
+    attach::remember_cursor_shape();
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut conn, &opts, mode);
     ratatui::restore();
