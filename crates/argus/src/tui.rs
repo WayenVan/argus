@@ -17,17 +17,18 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use argus_proto::msg::{AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response};
+use argus_proto::msg::{AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response, RunRequest};
+use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::attach;
 use crate::client::{Conn, PsOptions};
-use crate::{stream, term};
+use crate::{Cli, Command, stream, term};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
 /// list (pushed by Watch, applied as it arrives), preview bytes are always a
@@ -39,6 +40,10 @@ const INPUT_POLL: Duration = Duration::from_millis(100);
 /// The one accent color used for focus/selection everywhere, so the whole
 /// app reads as one thing rather than a pile of differently-styled widgets.
 const ACCENT: Color = Color::Cyan;
+/// Color for destructive-action chrome (the kill confirm popup).
+const DANGER: Color = Color::Red;
+/// How long a one-shot status line (rename/kill/copy result) stays on screen.
+const STATUS_TTL: Duration = Duration::from_millis(800);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -111,6 +116,197 @@ enum Row {
     Agent { info: AgentInfo, depth: usize },
 }
 
+/// A modal covering the whole loop's key handling until it resolves. Shared
+/// by Grid and Tree since both act on "whatever agent is selected right now".
+#[derive(Default)]
+enum Overlay {
+    #[default]
+    None,
+    Edit { id: u64, kind: EditKind, input: String, cursor: usize },
+    KillConfirm { id: u64, name: String },
+    /// The input line is whatever would follow `argus run` on a command
+    /// line; submitting parses it with the same clap definition `argus run`
+    /// itself uses (see `submit_new_agent`), so any flag it accepts here.
+    /// `error` holds a local (pre-send) parse problem, shown inline instead
+    /// of closing the overlay, so a typo doesn't lose what was typed.
+    NewAgent { input: String, cursor: usize, error: Option<String> },
+}
+
+/// What a text-edit overlay's input means once submitted: `Rename` replaces
+/// the agent's whole path-shaped name; `Move` replaces just the group,
+/// keeping the leaf (an empty input ungroups it), the same as `argus mv`.
+#[derive(Clone, Copy)]
+enum EditKind {
+    Rename,
+    Move,
+}
+
+impl EditKind {
+    fn title(self) -> &'static str {
+        match self {
+            EditKind::Rename => " rename (enter confirm · esc cancel) ",
+            EditKind::Move => " move to group (enter confirm · esc cancel) ",
+        }
+    }
+}
+
+/// The agent under the cursor in whichever mode is on screen, or `None` when
+/// nothing is selected or a Tree group heading is (r/x/c are agent-only).
+fn selected_agent<'a>(mode: Mode, grid: &'a GridState, rows: &'a [Row], tree_selected: usize) -> Option<&'a AgentInfo> {
+    match mode {
+        Mode::Grid => grid.tiles.get(grid.selected).map(|t| &t.info),
+        Mode::Tree => match rows.get(tree_selected) {
+            Some(Row::Agent { info, .. }) => Some(info),
+            _ => None,
+        },
+    }
+}
+
+/// Byte offset of the `char_idx`-th character, for editing a `String` by
+/// character position (input is short, so a linear scan is fine).
+fn byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+}
+
+/// The group the cursor is "inside" right now, to prefill `a`'s `--in`: the
+/// selected group's own path, or the selected agent's group. `None` in Grid
+/// (it has no notion of a current group) or when nothing is selected.
+fn current_group(mode: Mode, rows: &[Row], tree_selected: usize) -> Option<String> {
+    match mode {
+        Mode::Grid => None,
+        Mode::Tree => match rows.get(tree_selected)? {
+            Row::Group { path, .. } => Some(path.clone()),
+            Row::Agent { info, .. } => info.name.rsplit_once('/').map(|(g, _)| g.to_string()),
+        },
+    }
+}
+
+/// Splits a typed command line into argv the way a shell would: single quotes
+/// are literal, double quotes allow `\"`/`\\`/`\$` escapes, and a bare `\`
+/// escapes the next character outside quotes. Just enough to let `-l
+/// msg="hello world"` or similar work; not a full shell grammar.
+fn shell_split(input: &str) -> Result<Vec<String>, String> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut have_token = false;
+    let mut quote = Quote::None;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Quote::None => match c {
+                ' ' | '\t' => {
+                    if have_token {
+                        tokens.push(std::mem::take(&mut cur));
+                        have_token = false;
+                    }
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    have_token = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    have_token = true;
+                }
+                '\\' => match chars.next() {
+                    Some(next) => {
+                        cur.push(next);
+                        have_token = true;
+                    }
+                    None => return Err("trailing backslash".to_string()),
+                },
+                _ => {
+                    cur.push(c);
+                    have_token = true;
+                }
+            },
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            Quote::Double => match c {
+                '"' => quote = Quote::None,
+                '\\' if matches!(chars.peek(), Some('"' | '\\' | '$')) => {
+                    cur.push(chars.next().expect("peeked"));
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    if quote != Quote::None {
+        return Err("unterminated quote".to_string());
+    }
+    if have_token {
+        tokens.push(cur);
+    }
+    Ok(tokens)
+}
+
+/// The first line of a (possibly multi-line) clap error, compact enough for
+/// the overlay's one-line error slot.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or(s).trim_end().to_string()
+}
+
+/// Parses `input` the same way `argus run <input>` would, and — if that
+/// succeeds — creates the agent detached (never attaches from inside the
+/// TUI; `Enter` on the resulting tile does that already). `Err` means the
+/// problem never reached the manager (bad shell quoting, a bad flag, a
+/// nonexistent `--cwd`) and the overlay should stay open so it can be fixed;
+/// `Ok` covers both success and a manager-side rejection (e.g. name taken),
+/// since either way the overlay is done and the result belongs in the
+/// status line.
+fn submit_new_agent(conn: &mut Conn, input: &str, area: Rect) -> Result<String, String> {
+    let tokens = shell_split(input)?;
+    if tokens.is_empty() {
+        return Err("enter a command, e.g. `claude`".to_string());
+    }
+    let mut argv = vec!["argus".to_string(), "run".to_string()];
+    argv.extend(tokens);
+    let cli = Cli::try_parse_from(argv).map_err(|e| first_line(&e.to_string()))?;
+    let Command::Run { name, group, cwd, label, kind, program, args, .. } = cli.command else {
+        return Err("internal error: expected a run command".to_string());
+    };
+    let cwd = match cwd {
+        Some(dir) => {
+            std::fs::canonicalize(&dir).map_err(|_| format!("no such directory: {}", dir.display()))?
+        }
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let group = group.or_else(|| std::env::var("ARGUS_GROUP").ok()).filter(|g| !g.is_empty());
+    let mut command = vec![program];
+    command.extend(args);
+    let req = RunRequest {
+        command,
+        name,
+        group,
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: std::env::vars().collect(),
+        rows: area.height,
+        cols: area.width,
+        labels: label.into_iter().collect(),
+        kind,
+        colors: term::profile().colors.clone(),
+    };
+    Ok(match conn.request(&Request::Run(req)) {
+        Ok(Response::Agent { agent, warnings }) => match warnings.first() {
+            Some(w) => format!("created {} ({w})", agent.name),
+            None => format!("created {}", agent.name),
+        },
+        Ok(_) => "created".to_string(),
+        Err(e) => format!("create failed: {e}"),
+    })
+}
+
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     conn: &mut Conn,
@@ -119,6 +315,8 @@ fn event_loop(
 ) -> Result<()> {
     let mut grid = GridState::default();
     let mut tree = TreeState::default();
+    let mut overlay = Overlay::None;
+    let mut status: Option<(String, Instant)> = None;
     // Due immediately, so the first frame is not empty.
     let mut last_tick = Instant::now() - PREVIEW_TICK;
 
@@ -153,8 +351,8 @@ fn event_loop(
             tree.selected = tree.selected.min(rows.len().saturating_sub(1));
         }
 
+        let area: Rect = terminal.size()?.into();
         if last_tick.elapsed() >= PREVIEW_TICK {
-            let area: Rect = terminal.size()?.into();
             match mode {
                 Mode::Grid => {
                     grid.tiles = refresh_grid(conn, &table, opts, area).unwrap_or_default();
@@ -168,7 +366,8 @@ fn event_loop(
             last_tick = Instant::now();
         }
 
-        terminal.draw(|frame| draw(frame, mode, &grid, &tree, &rows))?;
+        let status_line = status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TTL).map(|(msg, _)| msg.as_str());
+        terminal.draw(|frame| draw(frame, mode, &grid, &tree, &rows, &overlay, status_line))?;
 
         let timeout = INPUT_POLL.min(PREVIEW_TICK.saturating_sub(last_tick.elapsed()));
         if !event::poll(timeout)? {
@@ -176,6 +375,11 @@ fn event_loop(
         }
         let Event::Key(key) = event::read()? else { continue };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if !matches!(overlay, Overlay::None) {
+            handle_overlay_key(conn, &mut overlay, &mut status, key.code, area);
             continue;
         }
 
@@ -192,6 +396,45 @@ fn event_loop(
             }
             KeyCode::Char('1') => mode = Mode::Grid,
             KeyCode::Char('2') => mode = Mode::Tree,
+            KeyCode::Char('r') => {
+                if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
+                    let input = info.name.clone();
+                    let cursor = input.chars().count();
+                    overlay = Overlay::Edit { id: info.id, kind: EditKind::Rename, input, cursor };
+                }
+            }
+            KeyCode::Char('m') => {
+                if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
+                    let input = info.name.rsplit_once('/').map(|(g, _)| g.to_string()).unwrap_or_default();
+                    let cursor = input.chars().count();
+                    overlay = Overlay::Edit { id: info.id, kind: EditKind::Move, input, cursor };
+                }
+            }
+            KeyCode::Char('a') => {
+                let input = match current_group(mode, &rows, tree.selected) {
+                    Some(group) => format!("--in {group} "),
+                    None => String::new(),
+                };
+                let cursor = input.chars().count();
+                overlay = Overlay::NewAgent { input, cursor, error: None };
+            }
+            KeyCode::Char('x') => {
+                if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
+                    overlay = Overlay::KillConfirm { id: info.id, name: info.name.clone() };
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
+                    let name = info.name.clone();
+                    status = Some((
+                        match term::copy_to_clipboard(&name) {
+                            Ok(()) => format!("copied {name}"),
+                            Err(e) => format!("copy failed: {e}"),
+                        },
+                        Instant::now(),
+                    ));
+                }
+            }
             code => match mode {
                 Mode::Grid => {
                     let cols = grid_cols(grid.tiles.len());
@@ -248,6 +491,118 @@ fn event_loop(
                 },
             },
         }
+    }
+}
+
+/// Applies one keypress to an open Edit/KillConfirm overlay, issuing the
+/// request and leaving a status line behind once it resolves. Takes
+/// `overlay` by value (via `mem::take`) rather than matching through the
+/// `&mut` so the request call and the reassignment aren't fighting over the
+/// same borrow.
+fn handle_overlay_key(
+    conn: &mut Conn,
+    overlay: &mut Overlay,
+    status: &mut Option<(String, Instant)>,
+    code: KeyCode,
+    area: Rect,
+) {
+    *overlay = match std::mem::take(overlay) {
+        Overlay::Edit { id, kind, mut input, mut cursor } => match code {
+            KeyCode::Esc => Overlay::None,
+            KeyCode::Enter => {
+                let msg = match kind {
+                    EditKind::Rename => rename_status(conn, id, &input),
+                    EditKind::Move => move_status(conn, id, &input),
+                };
+                *status = Some((msg, Instant::now()));
+                Overlay::None
+            }
+            _ => {
+                edit_text(&mut input, &mut cursor, code);
+                Overlay::Edit { id, kind, input, cursor }
+            }
+        },
+        Overlay::KillConfirm { id, name } => match code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                *status = Some((kill_status(conn, id, &name), Instant::now()));
+                Overlay::None
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Overlay::None,
+            _ => Overlay::KillConfirm { id, name },
+        },
+        Overlay::NewAgent { mut input, mut cursor, .. } => match code {
+            KeyCode::Esc => Overlay::None,
+            KeyCode::Enter => match submit_new_agent(conn, &input, area) {
+                Ok(msg) => {
+                    *status = Some((msg, Instant::now()));
+                    Overlay::None
+                }
+                Err(e) => Overlay::NewAgent { input, cursor, error: Some(e) },
+            },
+            _ => {
+                // Any edit clears a stale error rather than leaving it
+                // pinned under text the user has since changed.
+                edit_text(&mut input, &mut cursor, code);
+                Overlay::NewAgent { input, cursor, error: None }
+            }
+        },
+        Overlay::None => Overlay::None,
+    };
+}
+
+/// Applies one line-editing keypress (typing, backspace, delete, arrows,
+/// home/end) to `input`/`cursor`. Unrecognized keys are a no-op, so callers
+/// can route everything they don't handle themselves straight through.
+fn edit_text(input: &mut String, cursor: &mut usize, code: KeyCode) {
+    match code {
+        KeyCode::Backspace if *cursor > 0 => {
+            let end = byte_index(input, *cursor);
+            let start = byte_index(input, *cursor - 1);
+            input.replace_range(start..end, "");
+            *cursor -= 1;
+        }
+        KeyCode::Delete if *cursor < input.chars().count() => {
+            let start = byte_index(input, *cursor);
+            let end = byte_index(input, *cursor + 1);
+            input.replace_range(start..end, "");
+        }
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(input.chars().count()),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = input.chars().count(),
+        KeyCode::Char(c) => {
+            let at = byte_index(input, *cursor);
+            input.insert(at, c);
+            *cursor += 1;
+        }
+        _ => {}
+    }
+}
+
+fn rename_status(conn: &mut Conn, id: u64, name: &str) -> String {
+    match conn.request(&Request::Rename { target: id.to_string(), name: name.to_string() }) {
+        Ok(Response::Agent { agent, .. }) => format!("renamed to {}", agent.name),
+        Ok(_) => "renamed".to_string(),
+        Err(e) => format!("rename failed: {e}"),
+    }
+}
+
+/// A trailing `/` tells the manager's `Rename` handler to keep the agent's
+/// leaf and replace only its group — the same trick `argus mv` uses.
+fn move_status(conn: &mut Conn, id: u64, group: &str) -> String {
+    let name = format!("{}/", group.trim_matches('/'));
+    match conn.request(&Request::Rename { target: id.to_string(), name }) {
+        Ok(Response::Agent { agent, .. }) => format!("moved to {}", agent.name),
+        Ok(_) => "moved".to_string(),
+        Err(e) => format!("move failed: {e}"),
+    }
+}
+
+fn kill_status(conn: &mut Conn, id: u64, name: &str) -> String {
+    match conn.request(&Request::Kill { target: id.to_string(), signal: None }) {
+        Ok(Response::Killed { .. }) => format!("killed {name}"),
+        Ok(_) => format!("killed {name}"),
+        Err(e) => format!("kill failed: {e}"),
     }
 }
 
@@ -486,7 +841,8 @@ fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], selected: usiz
 /// a status bar reads as a bar without needing a drawn border around it.
 const CHROME_BG: Color = Color::Indexed(236);
 
-fn draw(frame: &mut Frame, mode: Mode, grid: &GridState, tree: &TreeState, rows: &[Row]) {
+#[allow(clippy::too_many_arguments)]
+fn draw(frame: &mut Frame, mode: Mode, grid: &GridState, tree: &TreeState, rows: &[Row], overlay: &Overlay, status: Option<&str>) {
     let area = frame.area();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(area);
     let blink = blink_on();
@@ -495,7 +851,8 @@ fn draw(frame: &mut Frame, mode: Mode, grid: &GridState, tree: &TreeState, rows:
         Mode::Grid => draw_grid(frame, chunks[1], &grid.tiles, grid.selected, blink),
         Mode::Tree => draw_tree(frame, chunks[1], rows, tree.selected, &tree.preview, blink),
     }
-    draw_footer(frame, chunks[2], mode);
+    draw_footer(frame, chunks[2], mode, status);
+    draw_overlay(frame, area, overlay);
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode) {
@@ -512,14 +869,100 @@ fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(CHROME_BG)), area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode) {
+fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, status: Option<&str>) {
+    // A fresh status line (rename/kill/copy result) briefly takes over the
+    // footer instead of the hint, so the user notices it without a popup.
+    if let Some(msg) = status {
+        frame.render_widget(
+            Paragraph::new(format!(" {msg}")).style(Style::default().fg(Color::Black).bg(ACCENT)),
+            area,
+        );
+        return;
+    }
     let hint = match mode {
-        Mode::Grid => " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   [/]/tab switch   q quit",
+        Mode::Grid => {
+            " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+        }
         Mode::Tree => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   enter attach/toggle   [/]/tab switch   q quit"
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   enter attach/toggle   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::Gray).bg(CHROME_BG)), area);
+}
+
+/// The Rename input box or the Kill confirm popup, floating centered over
+/// whatever `draw` already painted. No-op for `Overlay::None`.
+fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
+    match overlay {
+        Overlay::None => {}
+        Overlay::Edit { kind, input, cursor, .. } => {
+            let rect = centered_rect(area, 46, 3);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT))
+                .title(kind.title());
+            frame.render_widget(Paragraph::new(cursor_line(input, *cursor)).block(block), rect);
+        }
+        Overlay::KillConfirm { name, .. } => {
+            let rect = centered_rect(area, 46, 3);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DANGER))
+                .title(" kill? ");
+            let text = format!("kill {name}?  y/enter confirm · n/esc cancel");
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(DANGER)).block(block),
+                rect,
+            );
+        }
+        Overlay::NewAgent { input, cursor, error } => {
+            let mut lines = vec![
+                cursor_line(input, *cursor),
+                Line::styled(
+                    "--in G  --name N  --kind K  -l K=V  PROGRAM [-- ARGS]  (detached)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if let Some(err) = error {
+                lines.push(Line::styled(err.clone(), Style::default().fg(DANGER)));
+            }
+            let height = lines.len() as u16 + 2;
+            let rect = centered_rect(area, 64, height);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if error.is_some() { DANGER } else { ACCENT }))
+                .title(" new agent (enter run · esc cancel) ");
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
+    }
+}
+
+/// A single line of editable text with a reversed-video block marking the
+/// cursor position, shared by every text-edit overlay.
+fn cursor_line(input: &str, cursor: usize) -> Line<'static> {
+    let before = input.chars().take(cursor).collect::<String>();
+    let at = input.chars().nth(cursor);
+    let after = input.chars().skip(cursor + 1).collect::<String>();
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(at.map(String::from).unwrap_or_else(|| " ".into()), Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(after),
+    ])
+}
+
+/// A `width`x`height` box centered in `area`, clamped so it never exceeds it.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width, height }
 }
 
 /// Status-colored dot: gray once exited, otherwise colored by `activity` —
@@ -603,6 +1046,20 @@ fn grid_cols(n: usize) -> usize {
 mod tests {
     use super::*;
     use argus_proto::msg::AgentStatus;
+
+    #[test]
+    fn shell_split_handles_quotes_and_escapes() {
+        assert_eq!(shell_split("claude --model opus").unwrap(), vec!["claude", "--model", "opus"]);
+        assert_eq!(
+            shell_split(r#"-l msg="hello world" claude"#).unwrap(),
+            vec!["-l", "msg=hello world", "claude"]
+        );
+        assert_eq!(shell_split("'a b' c").unwrap(), vec!["a b", "c"]);
+        assert_eq!(shell_split(r"a\ b c").unwrap(), vec!["a b", "c"]);
+        assert_eq!(shell_split("  ").unwrap(), Vec::<String>::new());
+        assert!(shell_split("'unterminated").is_err());
+        assert!(shell_split(r"trailing\").is_err());
+    }
 
     fn agent(id: u64, name: &str) -> AgentInfo {
         AgentInfo {

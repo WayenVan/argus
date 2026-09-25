@@ -123,6 +123,31 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Writes an OSC 52 clipboard-set sequence for `text` straight to stdout.
+/// Safe to call while ratatui owns the terminal (alternate screen, raw
+/// mode): it's a plain escape sequence, the same kind an attached agent
+/// would emit itself, just not routed through a holder.
+pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    write!(out, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))?;
+    out.flush()
+}
+
+const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        let sextets = [(n >> 18) & 0x3f, (n >> 12) & 0x3f, (n >> 6) & 0x3f, n & 0x3f];
+        for (i, s) in sextets.iter().enumerate() {
+            out.push(if i <= chunk.len() { BASE64_ALPHABET[*s as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
 /// Puts the terminal in raw mode and restores it on drop, including on panic.
 pub struct RawMode {
     saved: Termios,
@@ -147,7 +172,17 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_da1_reply, parse_cursor_shape, parse_osc_color, parse_profile};
+    use super::{base64_encode, has_da1_reply, parse_cursor_shape, parse_osc_color, parse_profile};
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"research/claude-1"), "cmVzZWFyY2gvY2xhdWRlLTE=");
+    }
 
     #[test]
     fn a_full_reply() {
