@@ -2,6 +2,7 @@
 //! them requests. Also the `by-name` symlinks that point at their sockets.
 
 use std::fs::{self, OpenOptions};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -125,12 +126,13 @@ pub async fn follow(id: u64, on_event: impl Fn(HolderEvent)) -> Result<Option<i3
 
 /// Like [`follow`], but at [`SubscribeLevel::Output`]: also passes output
 /// bytes to `on_data` as `(offset_of_first_byte, bytes)`, for the manager's
-/// virtual-terminal tracking.
+/// virtual-terminal tracking. Breaks as soon as a callback does; continues
+/// once the agent exits or the holder closes the connection.
 pub async fn follow_screen(
     id: u64,
-    on_event: impl Fn(HolderEvent),
-    mut on_data: impl FnMut(u64, &[u8]),
-) -> Result<Option<i32>> {
+    on_event: impl Fn(HolderEvent) -> ControlFlow<()>,
+    mut on_data: impl FnMut(u64, &[u8]) -> ControlFlow<()>,
+) -> Result<ControlFlow<()>> {
     let mut stream = connect(id).await?;
     // `from_offset: Some(0)` backfills everything the ring buffer still has:
     // without it, a `Screens` tracker that subscribes after the agent's
@@ -140,27 +142,29 @@ pub async fn follow_screen(
     call(&mut stream, &HolderRequest::Subscribe { level: SubscribeLevel::Output, from_offset: Some(0) }).await?;
     let mut stream = tokio::io::BufReader::with_capacity(frame::READ_BUFFER, stream);
     while let Some((t, payload)) = aio::read_frame(&mut stream).await? {
-        match t {
-            ty::EXIT if payload.len() == 4 => return Ok(Some(i32::from_be_bytes(payload[..4].try_into().unwrap()))),
-            ty::CONTROL => {
-                if let Ok(event) = serde_json::from_slice(&payload) {
-                    on_event(event);
-                }
-            }
+        let flow = match t {
+            ty::EXIT => break,
+            ty::CONTROL => match serde_json::from_slice(&payload) {
+                Ok(event) => on_event(event),
+                Err(_) => ControlFlow::Continue(()),
+            },
             // Output subscribers get every DATA frame tagged with the offset
             // of its first byte (see argus-holder's `publish`).
             ty::DATA if payload.len() >= 8 => {
                 let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
-                on_data(offset, &payload[8..]);
+                on_data(offset, &payload[8..])
             }
             ty::SKIPPED if payload.len() == 16 => {
                 let to = u64::from_be_bytes(payload[8..16].try_into().unwrap());
-                on_data(to, &[]); // Resyncs the tracked offset; the gap is lived with.
+                on_data(to, &[]) // Resyncs the tracked offset; the gap is lived with.
             }
-            _ => {}
+            _ => ControlFlow::Continue(()),
+        };
+        if flow.is_break() {
+            return Ok(flow);
         }
     }
-    Ok(None)
+    Ok(ControlFlow::Continue(()))
 }
 
 /// How many bytes of output the agent has produced so far.

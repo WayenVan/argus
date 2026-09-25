@@ -9,11 +9,17 @@
 //! synthetic redraw — see [`ScreenMode::Replay`].
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use argus_proto::msg::{HolderEvent, PreviewColor, PreviewLine, PreviewSpan, ScreenMode};
 
-use super::holder;
+use super::{holder, log};
+
+/// Pause before re-subscribing a tracker that failed, so a failure that
+/// repeats on every attempt cannot spin.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
 
 struct State {
     parser: vt100::Parser,
@@ -21,6 +27,10 @@ struct State {
     /// been brought up to date with.
     offset: u64,
 }
+
+/// Runs once, the first time the agent shows a cursor on its alternate
+/// screen; shared so it survives a tracker restart.
+type OnCursor = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 pub struct ScreenReply {
     pub mode: ScreenMode,
@@ -30,8 +40,11 @@ pub struct ScreenReply {
     pub bytes: Vec<u8>,
 }
 
+/// Each agent's state has its own lock, and the map's lock is never held
+/// while vt100 runs: a panic in one agent's parser poisons only that agent,
+/// whose tracker then starts over from a fresh parser.
 pub struct Screens {
-    states: Mutex<HashMap<u64, State>>,
+    states: Mutex<HashMap<u64, Arc<Mutex<State>>>>,
 }
 
 impl Screens {
@@ -44,79 +57,92 @@ impl Screens {
     /// lost. A separate holder connection from the lifecycle `follow` task,
     /// kept simple rather than threading screen state through it.
     ///
-    /// `on_cursor` runs once, the first time the agent shows a cursor on its
-    /// alternate screen.
+    /// A tracker that panics or finds its state poisoned is started over:
+    /// re-subscribing backfills from the holder's ring buffer, the same way
+    /// a tracker that starts late catches up.
     pub fn track(self: &Arc<Self>, id: u64, on_cursor: Option<Box<dyn FnOnce() + Send>>) {
         let screens = self.clone();
-        let mut on_cursor = on_cursor;
+        let on_cursor: OnCursor = Arc::new(Mutex::new(on_cursor));
         tokio::spawn(async move {
-            let on_event = |event: HolderEvent| screens.on_event(id, event);
-            let on_data = |start: u64, bytes: &[u8]| {
-                if screens.on_data(id, start, bytes)
-                    && let Some(f) = on_cursor.take()
-                {
-                    f();
-                }
-            };
-            let _ = holder::follow_screen(id, on_event, on_data).await;
+            loop {
+                // Its own task, so a panic ends the attempt and not this loop.
+                let attempt = tokio::spawn(screens.clone().follow(id, on_cursor.clone()));
+                let failure = match attempt.await {
+                    Ok(Ok(ControlFlow::Break(()))) => "its screen state was poisoned",
+                    Err(e) if e.is_panic() => "it panicked",
+                    // The agent exited or its holder went away.
+                    _ => break,
+                };
+                screens.states.lock().unwrap().remove(&id);
+                log(&format!("screen tracking for agent {id} stopped because {failure}; restarting it"));
+                tokio::time::sleep(RESTART_DELAY).await;
+            }
             screens.states.lock().unwrap().remove(&id);
         });
     }
 
-    fn on_event(&self, id: u64, event: HolderEvent) {
-        let HolderEvent::Resized { rows, cols } = event else { return };
-        let mut states = self.states.lock().unwrap();
-        match states.get_mut(&id) {
-            Some(state) => state.parser.screen_mut().set_size(rows, cols),
+    async fn follow(self: Arc<Self>, id: u64, on_cursor: OnCursor) -> anyhow::Result<ControlFlow<()>> {
+        let on_event = |event: HolderEvent| self.on_event(id, event);
+        let on_data = |start: u64, bytes: &[u8]| {
+            if self.on_data(id, start, bytes)? {
+                let f = on_cursor.lock().unwrap().take();
+                if let Some(f) = f {
+                    f();
+                }
+            }
+            ControlFlow::Continue(())
+        };
+        holder::follow_screen(id, on_event, on_data).await
+    }
+
+    fn state(&self, id: u64) -> Option<Arc<Mutex<State>>> {
+        self.states.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Runs `f` on `id`'s state. `None` when nothing is tracked for it, or
+    /// when its parser panicked earlier and cannot be trusted.
+    fn read<R>(&self, id: u64, f: impl FnOnce(&State) -> R) -> Option<R> {
+        let state = self.state(id)?;
+        let guard = state.lock().ok()?;
+        Some(f(&guard))
+    }
+
+    /// Breaks when the state is poisoned, so the tracker starts over.
+    fn on_event(&self, id: u64, event: HolderEvent) -> ControlFlow<()> {
+        let HolderEvent::Resized { rows, cols } = event else { return ControlFlow::Continue(()) };
+        match self.state(id) {
+            Some(state) => lock(&state)?.parser.screen_mut().set_size(rows, cols),
             // The holder pushes the current size right after a subscribe
             // succeeds, so this is always the first event for a fresh state.
             None => {
-                states.insert(id, State { parser: vt100::Parser::new(rows, cols, 0), offset: 0 });
+                let state = State { parser: vt100::Parser::new(rows, cols, 0), offset: 0 };
+                self.states.lock().unwrap().insert(id, Arc::new(Mutex::new(state)));
             }
         }
+        ControlFlow::Continue(())
     }
 
-    /// Returns whether the agent is showing a cursor on its alternate screen.
-    fn on_data(&self, id: u64, start: u64, bytes: &[u8]) -> bool {
-        let mut states = self.states.lock().unwrap();
-        let Some(state) = states.get_mut(&id) else { return false }; // No size yet.
+    /// Continues with whether the agent is showing a cursor on its alternate
+    /// screen; breaks when the state is poisoned.
+    fn on_data(&self, id: u64, start: u64, bytes: &[u8]) -> ControlFlow<(), bool> {
+        let Some(state) = self.state(id) else { return ControlFlow::Continue(false) }; // No size yet.
+        let mut state = lock(&state)?;
         state.parser.process(bytes);
         state.offset = start + bytes.len() as u64;
         let screen = state.parser.screen();
-        screen.alternate_screen() && !screen.hide_cursor()
+        ControlFlow::Continue(screen.alternate_screen() && !screen.hide_cursor())
     }
 
     /// How `id`'s screen should be restored. `since_offset` lets a caller
     /// that already has the screen at that offset skip the bytes.
     pub fn get(&self, id: u64, since_offset: Option<u64>) -> ScreenReply {
-        let states = self.states.lock().unwrap();
-        let Some(state) = states.get(&id) else {
-            return ScreenReply { mode: ScreenMode::Unavailable, rows: 0, cols: 0, offset: 0, bytes: vec![] };
-        };
-        let screen = state.parser.screen();
-        let (rows, cols) = screen.size();
-        if !screen.alternate_screen() {
-            // 0 tells the holder to replay from its oldest retained byte:
-            // there is no screen-owned history to fall back on instead.
-            return ScreenReply { mode: ScreenMode::Replay, rows, cols, offset: 0, bytes: vec![] };
-        }
-        if since_offset == Some(state.offset) {
-            return ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes: vec![] };
-        }
-        // `state_formatted` covers cell contents, cursor position/visibility
-        // and input modes (mouse reporting, bracketed paste, keypad); the
-        // alternate-screen switch itself is not part of it.
-        let mut bytes = b"\x1b[?1049h".to_vec();
-        bytes.extend(screen.state_formatted());
-        // vt100 represents blank styled cells with ECH/EL. Some nested
-        // terminals (notably editor terminals) erase with their default
-        // background instead of the active SGR background. Paint those cells
-        // again as literal spaces so input boxes and other filled regions
-        // survive a synthetic attach restore everywhere.
-        append_styled_blanks(screen, &mut bytes);
-        bytes.extend(screen.cursor_state_formatted());
-        bytes.extend(screen.attributes_formatted());
-        ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes }
+        self.read(id, |state| snapshot(state, since_offset)).unwrap_or(ScreenReply {
+            mode: ScreenMode::Unavailable,
+            rows: 0,
+            cols: 0,
+            offset: 0,
+            bytes: vec![],
+        })
     }
 
     /// A one-shot rendering of `id`'s current screen — alternate or primary
@@ -124,64 +150,101 @@ impl Screens {
     /// alternate screen itself: it is a readback, not an attach restore
     /// hint, so the caller's own screen (whatever it is) is left alone.
     pub fn dump(&self, id: u64) -> Option<(u16, u16, Vec<u8>)> {
-        let states = self.states.lock().unwrap();
-        let state = states.get(&id)?;
-        let screen = state.parser.screen();
-        let (rows, cols) = screen.size();
-        let mut bytes = screen.state_formatted();
-        append_styled_blanks(screen, &mut bytes);
-        bytes.extend(screen.cursor_state_formatted());
-        bytes.extend(screen.attributes_formatted());
-        Some((rows, cols, bytes))
+        self.read(id, |state| {
+            let screen = state.parser.screen();
+            let (rows, cols) = screen.size();
+            let mut bytes = screen.state_formatted();
+            append_styled_blanks(screen, &mut bytes);
+            bytes.extend(screen.cursor_state_formatted());
+            bytes.extend(screen.attributes_formatted());
+            (rows, cols, bytes)
+        })
     }
 
     /// Whether `id` has turned on bracketed paste; `None` when nothing is
     /// tracked for it yet.
     pub fn bracketed_paste(&self, id: u64) -> Option<bool> {
-        self.states.lock().unwrap().get(&id).map(|s| s.parser.screen().bracketed_paste())
+        self.read(id, |state| state.parser.screen().bracketed_paste())
     }
 
     /// A styled crop of `id`'s screen to `rows`x`cols`, left-aligned from its
     /// top-left corner. Empty when nothing is tracked for it yet.
     pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<PreviewLine> {
-        let states = self.states.lock().unwrap();
-        let Some(state) = states.get(&id) else { return vec![] };
-        let screen = state.parser.screen();
-        let (screen_rows, screen_cols) = screen.size();
-        let rows = rows.min(screen_rows);
-        let cols = cols.min(screen_cols);
-        (0..rows)
-            .map(|row| {
-                let mut spans: PreviewLine = Vec::new();
-                for col in 0..cols {
-                    let Some(cell) = screen.cell(row, col) else { continue };
-                    if cell.is_wide_continuation() {
-                        continue;
-                    }
-                    let text = if cell.has_contents() { cell.contents() } else { " " };
-                    let span = PreviewSpan {
-                        text: text.to_owned(),
-                        fg: preview_color(cell.fgcolor()),
-                        bg: preview_color(cell.bgcolor()),
-                        bold: cell.bold(),
-                        dim: cell.dim(),
-                        italic: cell.italic(),
-                        underline: cell.underline(),
-                        inverse: cell.inverse(),
-                    };
-                    if let Some(last) = spans.last_mut().filter(|last| same_style(last, &span)) {
-                        last.text.push_str(text);
-                    } else {
-                        spans.push(span);
-                    }
-                }
-                while spans.last().is_some_and(|span| span.text.chars().all(|c| c == ' ') && is_default(span)) {
-                    spans.pop();
-                }
-                spans
-            })
-            .collect()
+        self.read(id, |state| preview(state, rows, cols)).unwrap_or_default()
     }
+}
+
+/// Locks one agent's state, breaking when an earlier panic poisoned it.
+fn lock(state: &Mutex<State>) -> ControlFlow<(), MutexGuard<'_, State>> {
+    match state.lock() {
+        Ok(guard) => ControlFlow::Continue(guard),
+        Err(_) => ControlFlow::Break(()),
+    }
+}
+
+fn snapshot(state: &State, since_offset: Option<u64>) -> ScreenReply {
+    let screen = state.parser.screen();
+    let (rows, cols) = screen.size();
+    if !screen.alternate_screen() {
+        // 0 tells the holder to replay from its oldest retained byte:
+        // there is no screen-owned history to fall back on instead.
+        return ScreenReply { mode: ScreenMode::Replay, rows, cols, offset: 0, bytes: vec![] };
+    }
+    if since_offset == Some(state.offset) {
+        return ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes: vec![] };
+    }
+    // `state_formatted` covers cell contents, cursor position/visibility
+    // and input modes (mouse reporting, bracketed paste, keypad); the
+    // alternate-screen switch itself is not part of it.
+    let mut bytes = b"\x1b[?1049h".to_vec();
+    bytes.extend(screen.state_formatted());
+    // vt100 represents blank styled cells with ECH/EL. Some nested
+    // terminals (notably editor terminals) erase with their default
+    // background instead of the active SGR background. Paint those cells
+    // again as literal spaces so input boxes and other filled regions
+    // survive a synthetic attach restore everywhere.
+    append_styled_blanks(screen, &mut bytes);
+    bytes.extend(screen.cursor_state_formatted());
+    bytes.extend(screen.attributes_formatted());
+    ScreenReply { mode: ScreenMode::Snapshot, rows, cols, offset: state.offset, bytes }
+}
+
+fn preview(state: &State, rows: u16, cols: u16) -> Vec<PreviewLine> {
+    let screen = state.parser.screen();
+    let (screen_rows, screen_cols) = screen.size();
+    let rows = rows.min(screen_rows);
+    let cols = cols.min(screen_cols);
+    (0..rows)
+        .map(|row| {
+            let mut spans: PreviewLine = Vec::new();
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else { continue };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let text = if cell.has_contents() { cell.contents() } else { " " };
+                let span = PreviewSpan {
+                    text: text.to_owned(),
+                    fg: preview_color(cell.fgcolor()),
+                    bg: preview_color(cell.bgcolor()),
+                    bold: cell.bold(),
+                    dim: cell.dim(),
+                    italic: cell.italic(),
+                    underline: cell.underline(),
+                    inverse: cell.inverse(),
+                };
+                if let Some(last) = spans.last_mut().filter(|last| same_style(last, &span)) {
+                    last.text.push_str(text);
+                } else {
+                    spans.push(span);
+                }
+            }
+            while spans.last().is_some_and(|span| span.text.chars().all(|c| c == ' ') && is_default(span)) {
+                spans.pop();
+            }
+            spans
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -328,6 +391,14 @@ mod tests {
         Screens { states: Mutex::new(HashMap::new()) }
     }
 
+    fn resize(s: &Screens, id: u64, rows: u16, cols: u16) {
+        assert!(s.on_event(id, HolderEvent::Resized { rows, cols }).is_continue());
+    }
+
+    fn feed(s: &Screens, id: u64, start: u64, bytes: &[u8]) {
+        assert!(s.on_data(id, start, bytes).is_continue());
+    }
+
     #[test]
     fn unavailable_before_any_state() {
         let s = screens();
@@ -339,24 +410,25 @@ mod tests {
     #[test]
     fn data_before_a_size_is_known_is_dropped() {
         let s = screens();
-        s.on_data(1, 0, b"too early");
+        feed(&s, 1, 0, b"too early");
         assert_eq!(s.get(1, None).mode, ScreenMode::Unavailable);
     }
 
     #[test]
     fn cursor_counts_only_once_shown_on_the_alternate_screen() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        assert!(!s.on_data(1, 0, b"$ "), "the primary screen's default cursor is not a prompt");
-        assert!(!s.on_data(1, 2, b"\x1b[?1049h\x1b[?25l"), "entered, cursor hidden while loading");
-        assert!(s.on_data(1, 16, b"\x1b[?25h"));
+        resize(&s, 1, 24, 80);
+        let shown = |flow| flow == ControlFlow::Continue(true);
+        assert!(!shown(s.on_data(1, 0, b"$ ")), "the primary screen's default cursor is not a prompt");
+        assert!(!shown(s.on_data(1, 2, b"\x1b[?1049h\x1b[?25l")), "entered, cursor hidden while loading");
+        assert!(shown(s.on_data(1, 16, b"\x1b[?25h")));
     }
 
     #[test]
     fn replay_mode_without_alternate_screen() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_data(1, 0, b"conversation line\r\n");
+        resize(&s, 1, 24, 80);
+        feed(&s, 1, 0, b"conversation line\r\n");
         let r = s.get(1, None);
         assert_eq!(r.mode, ScreenMode::Replay);
         assert_eq!((r.rows, r.cols), (24, 80));
@@ -369,8 +441,8 @@ mod tests {
     #[test]
     fn snapshot_mode_in_alternate_screen() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_data(1, 0, b"\x1b[?1049hHELLO");
+        resize(&s, 1, 24, 80);
+        feed(&s, 1, 0, b"\x1b[?1049hHELLO");
         let r = s.get(1, None);
         assert_eq!(r.mode, ScreenMode::Snapshot);
         assert_eq!((r.rows, r.cols), (24, 80));
@@ -381,9 +453,9 @@ mod tests {
     #[test]
     fn snapshot_writes_styled_blanks_as_literal_spaces() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 3, cols: 12 });
+        resize(&s, 1, 3, 12);
         let input = b"\x1b[?1049h\x1b[2;3H\x1b[48;2;10;20;30m\x1b[5X";
-        s.on_data(1, 0, input);
+        feed(&s, 1, 0, input);
 
         let r = s.get(1, None);
         assert!(r.bytes.windows(5).any(|window| window == b"     "));
@@ -400,8 +472,8 @@ mod tests {
     #[test]
     fn since_offset_dedupes_an_unchanged_snapshot() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_data(1, 0, b"\x1b[?1049hHELLO");
+        resize(&s, 1, 24, 80);
+        feed(&s, 1, 0, b"\x1b[?1049hHELLO");
         let first = s.get(1, None);
         assert!(!first.bytes.is_empty());
         let second = s.get(1, Some(first.offset));
@@ -413,17 +485,59 @@ mod tests {
     #[test]
     fn resize_updates_the_tracked_size_in_place() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_event(1, HolderEvent::Resized { rows: 30, cols: 100 });
+        resize(&s, 1, 24, 80);
+        resize(&s, 1, 30, 100);
         let r = s.get(1, None);
         assert_eq!((r.rows, r.cols), (30, 100));
+    }
+
+    /// vt100 0.16.2 panicked here (patched in vendor/vt100): a shrink or an
+    /// insert that pushes a wide character's second half off the row, then
+    /// a write or an erase over what is left of it.
+    #[test]
+    fn wide_char_cut_by_a_shrink_does_not_panic() {
+        for tail in [&b"\x1b[1;5Hx"[..], b"\x1b[1;5H\x1b[K"] {
+            let s = screens();
+            resize(&s, 1, 2, 6);
+            feed(&s, 1, 0, "abcd中".as_bytes());
+            resize(&s, 1, 2, 5);
+            feed(&s, 1, 7, tail);
+            assert!(!s.preview(1, 2, 5).is_empty());
+        }
+        let s = screens();
+        resize(&s, 1, 2, 6);
+        feed(&s, 1, 0, "abc中\x1b[1;1H\x1b[@\x1b[1;6Hx".as_bytes());
+        assert!(!s.preview(1, 2, 6).is_empty());
+    }
+
+    #[test]
+    fn a_poisoned_state_is_unavailable_and_stops_only_its_tracker() {
+        let s = screens();
+        for id in [1, 2] {
+            resize(&s, id, 24, 80);
+            feed(&s, id, 0, b"\x1b[?1049hHELLO");
+        }
+        let state = s.state(1).unwrap();
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("a parser bug");
+        })
+        .join();
+
+        assert_eq!(s.get(1, None).mode, ScreenMode::Unavailable);
+        assert!(s.preview(1, 24, 80).is_empty());
+        assert!(s.on_data(1, 13, b"more").is_break());
+        assert!(s.on_event(1, HolderEvent::Resized { rows: 30, cols: 80 }).is_break());
+
+        assert_eq!(s.get(2, None).mode, ScreenMode::Snapshot);
+        assert!(s.on_data(2, 13, b"more").is_continue());
     }
 
     #[test]
     fn agents_are_tracked_independently() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_data(1, 0, b"\x1b[?1049hone");
+        resize(&s, 1, 24, 80);
+        feed(&s, 1, 0, b"\x1b[?1049hone");
         // Agent 2 has never been heard from.
         assert_eq!(s.get(2, None).mode, ScreenMode::Unavailable);
         assert_eq!(s.get(1, None).mode, ScreenMode::Snapshot);
@@ -432,8 +546,8 @@ mod tests {
     #[test]
     fn preview_preserves_terminal_styles() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 2, cols: 20 });
-        s.on_data(1, 0, b"plain \x1b[1;38;2;10;20;30mbright\x1b[0m");
+        resize(&s, 1, 2, 20);
+        feed(&s, 1, 0, b"plain \x1b[1;38;2;10;20;30mbright\x1b[0m");
 
         let lines = s.preview(1, 1, 20);
         assert_eq!(lines[0][0].text, "plain ");
@@ -452,8 +566,8 @@ mod tests {
     #[test]
     fn dump_never_enters_the_alternate_screen() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_data(1, 0, b"\x1b[?1049hHELLO");
+        resize(&s, 1, 24, 80);
+        feed(&s, 1, 0, b"\x1b[?1049hHELLO");
         let (rows, cols, bytes) = s.dump(1).unwrap();
         assert_eq!((rows, cols), (24, 80));
         assert!(!bytes.starts_with(b"\x1b[?1049h"), "a readback must not toggle the caller's own screen: {bytes:?}");
@@ -466,8 +580,8 @@ mod tests {
     #[test]
     fn dump_works_on_the_primary_screen_too() {
         let s = screens();
-        s.on_event(1, HolderEvent::Resized { rows: 24, cols: 80 });
-        s.on_data(1, 0, b"conversation line\r\n");
+        resize(&s, 1, 24, 80);
+        feed(&s, 1, 0, b"conversation line\r\n");
         let (_, _, bytes) = s.dump(1).unwrap();
 
         let mut restored = vt100::Parser::new(24, 80, 0);

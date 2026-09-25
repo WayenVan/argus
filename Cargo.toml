@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/argus-proto", "crates/argus-holder", "crates/argus-hook", "crates/argus"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -19,3 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "sync", "signal", "process"] }
 vte = "0.15"
+
+# vt100 0.16.2 with a fix for a panic after a row is shortened through a wide
+# character (see vendor/vt100/PATCHES.md). Drop once upstream ships the fix.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }

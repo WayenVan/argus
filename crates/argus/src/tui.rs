@@ -27,7 +27,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::attach;
-use crate::client::{Conn, PsOptions};
+use crate::client::{Conn, ManagerError, PsOptions};
 use crate::theme::theme;
 use crate::{Cli, Command, stream, term, tmux};
 
@@ -402,18 +402,25 @@ fn event_loop(
 
         let area: Rect = terminal.size()?.into();
         if last_tick.elapsed() >= PREVIEW_TICK {
-            match mode {
-                Mode::Grid => {
-                    grid.tiles = refresh_grid(conn, &table, opts, area).unwrap_or_default();
-                    grid.selected = grid.selected.min(grid.tiles.len().saturating_sub(1));
-                }
-                Mode::Tree => {
-                    if !tree.expanded {
-                        tree.preview = refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(area))
-                            .unwrap_or_default();
-                    }
+            let refreshed = match mode {
+                Mode::Grid => refresh_grid(conn, &table, opts, area).map(|tiles| grid.tiles = tiles),
+                Mode::Tree if tree.expanded => Ok(()),
+                Mode::Tree => refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(area))
+                    .map(|preview| tree.preview = preview),
+            };
+            if let Err(e) = refreshed {
+                grid.tiles.clear();
+                tree.preview.clear();
+                // Not a refusal: the connection itself is gone (a manager
+                // restart). The watch reconnects on its own; this one has to
+                // be replaced here, or every later request fails with it.
+                if e.downcast_ref::<ManagerError>().is_none()
+                    && let Ok(Some(fresh)) = Conn::open(false)
+                {
+                    *conn = fresh;
                 }
             }
+            grid.selected = grid.selected.min(grid.tiles.len().saturating_sub(1));
             last_tick = Instant::now();
         }
 
