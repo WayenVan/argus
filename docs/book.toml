@@ -1,0 +1,6 @@
+[book]
+title = "argus"
+language = "en"
+src = "src"
+
+[output.html]

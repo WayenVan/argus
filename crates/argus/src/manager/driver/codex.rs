@@ -50,6 +50,9 @@ impl Driver for Codex {
         // A user's own `-c developer_instructions=` comes later in argv and
         // wins, same as any other config override; that's a soft loss (the
         // agent just won't know the label convention), not worth a warning.
+        // Same soft loss on `codex resume` of a session started outside
+        // argus: Codex replays the instructions stored with the session and
+        // ignores this override (see docs/src/agents/codex.md).
         launch.command.splice(1..1, developer_instructions_override());
 
         let Some(hook_exe) = &ctx.hook_exe else {
