@@ -290,4 +290,25 @@ mod tests {
         assert!(parse_age("3w").is_err());
         assert!(parse_age("h").is_err());
     }
+
+    /// `docs/src/reference/cli.md` is generated from the clap definitions.
+    /// Regenerate with `ARGUS_UPDATE_DOCS=1 cargo test -p argus cli_reference`.
+    #[test]
+    fn cli_reference_is_current() {
+        let options = clap_markdown::MarkdownOptions::new()
+            .title("CLI".into())
+            .show_footer(false)
+            .show_table_of_contents(false);
+        let generated = clap_markdown::help_markdown_custom::<super::Cli>(&options);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/src/reference/cli.md");
+        if std::env::var_os("ARGUS_UPDATE_DOCS").is_some() {
+            std::fs::write(path, &generated).unwrap();
+            return;
+        }
+        let current = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            current == generated,
+            "docs/src/reference/cli.md is stale; run `ARGUS_UPDATE_DOCS=1 cargo test -p argus cli_reference`"
+        );
+    }
 }
