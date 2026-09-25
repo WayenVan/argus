@@ -28,6 +28,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListSt
 
 use crate::attach;
 use crate::client::{Conn, PsOptions};
+use crate::theme::theme;
 use crate::{Cli, Command, stream, term, tmux};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
@@ -37,11 +38,6 @@ const PREVIEW_TICK: Duration = Duration::from_millis(500);
 /// Upper bound on how long one loop iteration blocks on keyboard input, so a
 /// pending watch event never waits behind a slow poll to be drawn.
 const INPUT_POLL: Duration = Duration::from_millis(100);
-/// The one accent color used for focus/selection everywhere, so the whole
-/// app reads as one thing rather than a pile of differently-styled widgets.
-const ACCENT: Color = Color::Cyan;
-/// Color for destructive-action chrome (the kill confirm popup).
-const DANGER: Color = Color::Red;
 /// How long a one-shot status line (rename/kill/copy result) stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(3);
 
@@ -85,7 +81,11 @@ pub fn run(mode: Mode, prefix: Option<String>, labels: Vec<(String, String)>) ->
     // see `term::profile`.
     term::profile();
     let mut terminal = ratatui::init();
+    // Focus reports let the tree dim its selection while the window is in
+    // the background; terminals that lack them just never send any.
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
     let result = event_loop(&mut terminal, &mut conn, &opts, mode);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
     ratatui::restore();
     result
 }
@@ -109,6 +109,9 @@ struct TreeState {
     preview: Vec<PreviewLine>,
     /// Show the tree across the whole content area instead of beside details.
     expanded: bool,
+    /// The terminal window lost focus: the selection is drawn faintly so it
+    /// does not drown out the activity colors of the row under it.
+    blurred: bool,
 }
 
 /// One flattened, orderable line of the tree: either a group heading or a
@@ -205,7 +208,7 @@ fn jump_marker(info: &AgentInfo, socket: Option<&str>) -> Option<Span<'static>> 
     let count = jumpable_count(info, socket);
     (count > 0).then(|| {
         let label = if count == 1 { " ↗".to_string() } else { format!(" ↗{count}") };
-        Span::styled(label, Style::default().fg(ACCENT))
+        Span::styled(label, Style::default().fg(theme().lavender))
     })
 }
 
@@ -421,7 +424,18 @@ fn event_loop(
         if !event::poll(timeout)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::FocusGained => {
+                tree.blurred = false;
+                continue;
+            }
+            Event::FocusLost => {
+                tree.blurred = true;
+                continue;
+            }
+            _ => continue,
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -715,7 +729,13 @@ fn attach_to(terminal: &mut ratatui::DefaultTerminal, id: u64, name: String) -> 
         shared_screen: true,
     };
     let ending = attach::session(&target, opts).unwrap_or_else(|e| format!("attach failed: {e}"));
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    // The session's reset turned focus reports off; the user just came back
+    // here, so this window has focus.
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableFocusChange
+    )?;
     terminal.clear()?;
     Ok(ending)
 }
@@ -756,8 +776,7 @@ fn refresh_grid(conn: &mut Conn, table: &BTreeMap<u64, AgentInfo>, opts: &PsOpti
 
 fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, blink: bool, jump_socket: Option<&str>) {
     if tiles.is_empty() {
-        let block =
-            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" no running agents ");
+        let block = panel(" no running agents ");
         frame.render_widget(Paragraph::new("").block(block), area);
         return;
     }
@@ -784,7 +803,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
             }
             spans.push(Span::raw(format!(" · {}", tile.info.activity)));
             let title = Line::from(spans);
-            let border_color = if idx == selected { ACCENT } else { Color::DarkGray };
+            let border_color = if idx == selected { theme().mauve } else { theme().surface2 };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -867,11 +886,11 @@ fn refresh_tree_preview(conn: &mut Conn, rows: &[Row], selected: usize, area: Re
 fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, blink: bool, jump_socket: Option<&str>) {
     let (selected, preview) = (tree.selected, &tree.preview);
     if tree.expanded {
-        draw_tree_list(frame, area, rows, selected, blink, jump_socket, true);
+        draw_tree_list(frame, area, rows, tree, blink, jump_socket);
         return;
     }
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
-    draw_tree_list(frame, cols[0], rows, selected, blink, jump_socket, false);
+    draw_tree_list(frame, cols[0], rows, tree, blink, jump_socket);
 
     let detail =
         Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(cols[1]);
@@ -884,37 +903,70 @@ fn draw_tree_list(
     frame: &mut Frame,
     area: Rect,
     rows: &[Row],
-    selected: usize,
+    tree: &TreeState,
     blink: bool,
     jump_socket: Option<&str>,
-    expanded: bool,
 ) {
+    let TreeState { selected, blurred, expanded, .. } = *tree;
     let title = if expanded { " agents · expanded (e restore) " } else { " agents " };
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title);
+    let block = panel(title);
     if rows.is_empty() {
         frame.render_widget(Paragraph::new("no agents").block(block), area);
         return;
     }
-    let items: Vec<ListItem> = rows.iter().map(|row| tree_row_item(row, blink, jump_socket)).collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD));
+    let highlight = if blurred { blurred_selection() } else { selection() };
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| tree_row_item(row, blink, jump_socket, (idx == selected).then_some(highlight)))
+        .collect();
+    // The selection is styled per row by `tree_row_item`; the state only
+    // keeps it scrolled into view.
+    let list = List::new(items).block(block).style(Style::default().fg(theme().text));
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>) -> ListItem<'static> {
+/// `highlight` marks the selected row. On an agent the activity dot keeps its
+/// own color and pulse on top of the highlight background.
+/// A plain framed pane: a quiet border that leaves the accent to whatever
+/// has focus.
+fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme().surface2))
+        .title_style(Style::default().fg(theme().text))
+        .title(title)
+}
+
+/// The selected row of a list: a raised surface, not the accent, so the
+/// colored dots and markers on it stay readable.
+fn selection() -> Style {
+    Style::default().bg(theme().surface1).fg(theme().text).add_modifier(Modifier::BOLD)
+}
+
+/// The selection while the terminal window is in the background: only a
+/// faint surface, every span keeps its own color.
+fn blurred_selection() -> Style {
+    Style::default().bg(theme().surface0)
+}
+
+fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>, highlight: Option<Style>) -> ListItem<'static> {
     match row {
         Row::Group { name, depth, count, expanded, .. } => {
             let indent = "  ".repeat(*depth);
             let icon = if *expanded { "▾" } else { "▸" };
             let line = Line::from(vec![
                 Span::raw(indent),
-                Span::styled(format!("{icon} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{icon} "), Style::default().fg(theme().overlay0)),
                 Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({count})"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  ({count})"), Style::default().fg(theme().overlay0)),
             ]);
-            ListItem::new(line)
+            match highlight {
+                Some(style) => ListItem::new(line.patch_style(style)).style(style),
+                None => ListItem::new(line),
+            }
         }
         Row::Agent { info, depth } => {
             let indent = "  ".repeat(depth + 1);
@@ -927,7 +979,15 @@ fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>) -> ListItem<
             if let Some(marker) = jump_marker(info, jump_socket) {
                 spans.push(marker);
             }
-            spans.push(Span::styled(format!("  {}", info.activity), Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(format!("  {}", info.activity), Style::default().fg(theme().overlay0)));
+            if let Some(style) = highlight {
+                // Skip the indent and the dot; the item style below still
+                // gives both the background.
+                for span in &mut spans[2..] {
+                    span.style = span.style.patch(style);
+                }
+                return ListItem::new(Line::from(spans)).style(style);
+            }
             ListItem::new(Line::from(spans))
         }
     }
@@ -939,7 +999,7 @@ fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], selected: us
         Some(Row::Group { name, count, .. }) => format!(" {name} ({count}) — select an agent to preview its screen "),
         None => " no agents ".to_string(),
     };
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title);
+    let block = panel(title);
     let text = Text::from(preview.iter().map(render_line).collect::<Vec<_>>());
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
@@ -948,12 +1008,12 @@ fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], selected: us
 /// maintain via `SELF_LABEL_INSTRUCTIONS` — a plain readback of
 /// `AgentInfo.labels`, not a separate data source.
 fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, key: &str) {
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(format!(" {key} "));
+    let block = panel(format!(" {key} "));
     let value = match rows.get(selected) {
         Some(Row::Agent { info, .. }) => info.labels.get(key).map(String::as_str).unwrap_or("none"),
         _ => "none",
     };
-    let paragraph = Paragraph::new(value).style(Style::default().fg(Color::Gray)).block(block);
+    let paragraph = Paragraph::new(value).style(Style::default().fg(theme().subtext0)).block(block);
     let paragraph = if key == "recap" { paragraph.wrap(Wrap { trim: false }) } else { paragraph };
     frame.render_widget(paragraph, area);
 }
@@ -961,11 +1021,6 @@ fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], selected: usiz
 // ---------------------------------------------------------------------------
 // Shared chrome
 // ---------------------------------------------------------------------------
-
-/// The muted band behind the top tab bar and bottom hint bar — chrome that
-/// frames the content without boxing it in, the way a browser's tab strip or
-/// a status bar reads as a bar without needing a drawn border around it.
-const CHROME_BG: Color = Color::Indexed(236);
 
 #[allow(clippy::too_many_arguments)]
 fn draw(
@@ -991,25 +1046,27 @@ fn draw(
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode) {
-    let mut spans = vec![Span::styled(" argus ", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD))];
+    let mut spans = vec![Span::styled(" argus ", Style::default().fg(theme().mauve).add_modifier(Modifier::BOLD))];
     for m in Mode::ALL {
         spans.push(Span::raw(" "));
         let style = if m == mode {
-            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme().crust).bg(theme().mauve).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme().subtext0)
         };
         spans.push(Span::styled(format!(" {} ", m.label()), style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(CHROME_BG)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme().mantle)), area);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, status: Option<&str>) {
     // A fresh status line (rename/kill/copy result) briefly takes over the
     // footer instead of the hint, so the user notices it without a popup.
     if let Some(msg) = status {
-        frame
-            .render_widget(Paragraph::new(format!(" {msg}")).style(Style::default().fg(Color::Black).bg(ACCENT)), area);
+        frame.render_widget(
+            Paragraph::new(format!(" {msg}")).style(Style::default().fg(theme().crust).bg(theme().mauve)),
+            area,
+        );
         return;
     }
     let hint = match mode {
@@ -1023,7 +1080,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, s
             " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e expand tree   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
     };
-    frame.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::Gray).bg(CHROME_BG)), area);
+    frame.render_widget(Paragraph::new(hint).style(Style::default().fg(theme().subtext0).bg(theme().mantle)), area);
 }
 
 /// The Rename input box or the Kill confirm popup, floating centered over
@@ -1037,7 +1094,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(theme().mauve))
                 .title(kind.title());
             frame.render_widget(Paragraph::new(cursor_line(input, *cursor)).block(block), rect);
         }
@@ -1047,10 +1104,10 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(DANGER))
+                .border_style(Style::default().fg(theme().red))
                 .title(" kill? ");
             let text = format!("kill {name}?  y/enter confirm · n/esc cancel");
-            frame.render_widget(Paragraph::new(text).style(Style::default().fg(DANGER)).block(block), rect);
+            frame.render_widget(Paragraph::new(text).style(Style::default().fg(theme().red)).block(block), rect);
         }
         Overlay::Jump { targets, selected } => {
             let height = (targets.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -1064,7 +1121,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
                         .border_type(BorderType::Rounded)
                         .title(" jump to tmux pane "),
                 )
-                .highlight_style(Style::default().bg(ACCENT).fg(Color::Black));
+                .highlight_style(selection());
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, rect, &mut state);
         }
@@ -1073,11 +1130,11 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
                 cursor_line(input, *cursor),
                 Line::styled(
                     "--in G  --name N  --kind K  -l K=V  PROGRAM [-- ARGS]  (detached)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme().overlay0),
                 ),
             ];
             if let Some(err) = error {
-                lines.push(Line::styled(err.clone(), Style::default().fg(DANGER)));
+                lines.push(Line::styled(err.clone(), Style::default().fg(theme().red)));
             }
             let height = lines.len() as u16 + 2;
             let rect = centered_rect(area, 64, height);
@@ -1085,7 +1142,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(if error.is_some() { DANGER } else { ACCENT }))
+                .border_style(Style::default().fg(if error.is_some() { theme().red } else { theme().mauve }))
                 .title(" new agent (enter run · esc cancel) ");
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
@@ -1123,21 +1180,22 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 /// (`tool:<name>` falls through to the active/pulsing case) since new
 /// activity strings are added on the driver side over time.
 fn activity_color(info: &AgentInfo, blink: bool) -> Color {
+    let t = theme();
     if !info.status.is_live() {
-        return Color::DarkGray;
+        return t.surface2;
     }
     match info.activity.as_str() {
-        "error" => Color::Red,
-        "done" => Color::Green,
-        "idle" | "blocked" => Color::Yellow,
-        "quiet" | "unknown" => Color::DarkGray,
+        "error" => t.red,
+        "done" => t.green,
+        "idle" | "blocked" => t.yellow,
+        "quiet" | "unknown" => t.overlay0,
         // working / tool:<name> / busy: actively running, pulse to draw the
         // eye toward what's currently in motion.
         _ => {
             if blink {
-                Color::Green
+                t.green
             } else {
-                Color::DarkGray
+                t.overlay0
             }
         }
     }
@@ -1308,5 +1366,26 @@ mod tests {
         assert_eq!(grid_cols(5), 3);
         assert_eq!(grid_cols(9), 3);
         assert_eq!(grid_cols(10), 4);
+    }
+
+    #[test]
+    fn selected_agent_row_keeps_its_activity_dot_color() {
+        let mut info = agent(1, "a");
+        info.activity = "done".into();
+        let row = Row::Agent { info, depth: 0 };
+        let rows = std::slice::from_ref(&row);
+        for blurred in [false, true] {
+            let tree = TreeState { blurred, expanded: true, ..TreeState::default() };
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 3)).unwrap();
+            terminal.draw(|frame| draw_tree_list(frame, frame.area(), rows, &tree, true, None)).unwrap();
+            let buf = terminal.backend().buffer();
+            // Border, two-space indent, then the dot.
+            let dot = &buf[(3, 1)];
+            assert_eq!(dot.symbol(), "●");
+            let expected_bg = if blurred { theme().surface0 } else { theme().surface1 };
+            assert_eq!((dot.fg, dot.bg), (theme().green, expected_bg));
+            assert_eq!(buf[(1, 1)].bg, expected_bg, "band starts at the row's edge");
+            assert_eq!(buf[(18, 1)].bg, expected_bg, "band fills the row");
+        }
     }
 }

@@ -9,6 +9,7 @@ mod manager;
 mod naming;
 mod stream;
 mod term;
+mod theme;
 mod tmux;
 mod tui;
 
