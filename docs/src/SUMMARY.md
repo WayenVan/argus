@@ -11,6 +11,7 @@
 - [Codex](agents/codex.md)
 - [opencode](agents/opencode.md)
 - [pi](agents/pi.md)
+- [omp](agents/omp.md)
 - [Other programs](agents/generic.md)
 
 # Guides

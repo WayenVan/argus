@@ -9,6 +9,7 @@
 mod claude;
 mod codex;
 mod generic;
+mod omp;
 mod opencode;
 mod pi;
 
@@ -81,6 +82,7 @@ pub trait Driver: Send + Sync {
 static CLAUDE: claude::Claude = claude::Claude;
 static CODEX: codex::Codex = codex::Codex;
 static GENERIC: generic::Generic = generic::Generic;
+static OMP: omp::Omp = omp::Omp;
 static OPENCODE: opencode::Opencode = opencode::Opencode;
 static PI: pi::Pi = pi::Pi;
 
@@ -89,6 +91,7 @@ pub fn for_kind(kind: &str) -> &'static dyn Driver {
     match kind {
         "claude" => &CLAUDE,
         "codex" => &CODEX,
+        "omp" => &OMP,
         "opencode" => &OPENCODE,
         "pi" => &PI,
         _ => &GENERIC,
@@ -101,7 +104,8 @@ pub fn for_kind(kind: &str) -> &'static dyn Driver {
 pub fn install_shared_files(ctx: &Context) -> Result<()> {
     claude::write_shared_settings(ctx)?;
     opencode::write_shared_files(ctx)?;
-    pi::write_shared_files(ctx)
+    pi::write_shared_files(ctx)?;
+    omp::write_shared_files(ctx)
 }
 
 /// Injected as a system-prompt/developer-instruction addition at launch, so
@@ -145,7 +149,7 @@ pub fn hook_command(hook_exe: &Path, source: &str) -> String {
 }
 
 /// Interprets an event from one of argus's own in-process plugins (opencode,
-/// pi), which flatten their agent's events into Claude-style hook events.
+/// pi, omp), which flatten their agent's events into Claude-style hook events.
 /// Events in any other format `version` are ignored: an agent keeps the
 /// plugin it started with while the manager may be upgraded underneath it.
 fn plugin_hint(event: &Value, version: u64) -> Hint {

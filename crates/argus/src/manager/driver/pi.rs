@@ -41,27 +41,40 @@ impl Driver for Pi {
     }
 
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
-        if launch.command.get(1).is_some_and(|arg| SUBCOMMANDS.contains(&arg.as_str())) {
-            return Ok(None);
-        }
-        // Independent of the extension, like the other drivers' instructions.
-        let mut args = vec!["--append-system-prompt".to_string(), SELF_LABEL_INSTRUCTIONS.to_string()];
-        let warning = match &ctx.hook_exe {
-            Some(hook_exe) => {
-                args.extend(["-e".to_string(), ctx.dir.join(EXTENSION_FILE).to_string_lossy().into_owned()]);
-                launch.env.retain(|(k, _)| k != HOOK_ENV);
-                launch.env.push((HOOK_ENV.into(), hook_exe.to_string_lossy().into_owned()));
-                None
-            }
-            None => Some("argus-hook is not installed next to argus; activity will not be tracked".into()),
-        };
-        launch.command.splice(1..1, args);
-        Ok(warning)
+        Ok(inject(launch, ctx, SUBCOMMANDS, EXTENSION_FILE, HOOK_ENV))
     }
 
     fn interpret(&self, event: &Value) -> Hint {
         plugin_hint(event, EVENT_VERSION)
     }
+}
+
+/// Puts the label instructions and, with argus-hook installed, the extension
+/// right after the program name, for pi and its forks, which take any number
+/// of both. Leaves `subcommands` alone. Returns the warning for `prepare`.
+pub(super) fn inject(
+    launch: &mut Launch,
+    ctx: &Context,
+    subcommands: &[&str],
+    extension_file: &str,
+    hook_env: &str,
+) -> Option<String> {
+    if launch.command.get(1).is_some_and(|arg| subcommands.contains(&arg.as_str())) {
+        return None;
+    }
+    // Independent of the extension, like the other drivers' instructions.
+    let mut args = vec!["--append-system-prompt".to_string(), SELF_LABEL_INSTRUCTIONS.to_string()];
+    let warning = match &ctx.hook_exe {
+        Some(hook_exe) => {
+            args.extend(["-e".to_string(), ctx.dir.join(extension_file).to_string_lossy().into_owned()]);
+            launch.env.retain(|(k, _)| k != hook_env);
+            launch.env.push((hook_env.into(), hook_exe.to_string_lossy().into_owned()));
+            None
+        }
+        None => Some("argus-hook is not installed next to argus; activity will not be tracked".into()),
+    };
+    launch.command.splice(1..1, args);
+    warning
 }
 
 /// Writes the extension the agents load.

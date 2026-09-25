@@ -25,6 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   your own `-e` and `--no-extensions` leave them alone. The extension reports
   working, tools, extension dialogs as `blocked`, and the end of each run as
   done, error, or interrupted.
+- A driver for omp (oh-my-pi), wired in like pi with its own extension. It
+  reports tool approvals and the `ask` tool as `blocked`, including while
+  parallel tool calls wait for approval one after another.
 
 ### Fixed
 

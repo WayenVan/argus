@@ -1,6 +1,6 @@
 # argus
 
-argus runs coding agents (Claude Code, Codex, opencode, pi, or any
+argus runs coding agents (Claude Code, Codex, opencode, pi, omp, or any
 terminal program) in the background, and shows what each one is doing.
 
 - Agents keep running when you detach, close the terminal, or restart argus.
