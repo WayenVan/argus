@@ -90,8 +90,8 @@ pub fn codex(yes: bool, remove: bool, json: bool) -> Result<()> {
 pub fn all(yes: bool, remove: bool, json: bool) -> Result<()> {
     let found: Vec<_> = AGENTS.iter().map(|&(agent, step)| (agent, step, find_program(agent))).collect();
     // Fail before doing anything rather than halfway through.
-    let codex_pending = found.iter().any(|(agent, _, program)| *agent == "codex" && program.is_some())
-        && !codex::rules_installed();
+    let codex_pending =
+        found.iter().any(|(agent, _, program)| *agent == "codex" && program.is_some()) && !codex::rules_installed();
     if codex_pending && !yes && !remove && (json || !io::stdin().is_terminal()) {
         bail!("pass --yes to set up without asking");
     }

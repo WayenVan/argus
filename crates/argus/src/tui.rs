@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use argus_proto::msg::{
-    Activity, AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response, RunRequest,
+    Activity, AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response, RunRequest, now_secs,
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -29,7 +29,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::attach;
-use crate::client::{Conn, PsOptions};
+use crate::client::{self, Conn, PsOptions};
 use crate::errors::CodedError;
 use crate::theme::theme;
 use crate::{Cli, Command, stream, term, tmux};
@@ -143,6 +143,10 @@ enum Overlay {
     Jump {
         targets: Vec<tmux::JumpTarget>,
         selected: usize,
+    },
+    Details {
+        id: u64,
+        scroll: u16,
     },
     /// The input line is whatever would follow `argus run` on a command
     /// line; submitting parses it with the same clap definition `argus run`
@@ -404,11 +408,12 @@ fn event_loop(
         }
 
         let area: Rect = terminal.size()?.into();
+        let content_area = dashboard_content_rect(area);
         if last_tick.elapsed() >= PREVIEW_TICK {
             let refreshed = match mode {
-                Mode::Grid => refresh_grid(conn, &table, opts, area).map(|tiles| grid.tiles = tiles),
+                Mode::Grid => refresh_grid(conn, &table, opts, content_area).map(|tiles| grid.tiles = tiles),
                 Mode::Tree if tree.expanded => Ok(()),
-                Mode::Tree => refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(area))
+                Mode::Tree => refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(content_area))
                     .map(|preview| tree.preview = preview),
             };
             if let Err(e) = refreshed {
@@ -430,7 +435,7 @@ fn event_loop(
         let status_line = status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TTL).map(|(msg, _)| msg.as_str());
         let stale = conn.stale_manager().is_some();
         terminal.draw(|frame| {
-            draw(frame, mode, &grid, &tree, &rows, &overlay, status_line, jump_socket.as_deref(), stale)
+            draw(frame, mode, &grid, &tree, &rows, &table, &overlay, status_line, jump_socket.as_deref(), stale)
         })?;
 
         let timeout = INPUT_POLL.min(PREVIEW_TICK.saturating_sub(last_tick.elapsed()));
@@ -454,7 +459,7 @@ fn event_loop(
         }
 
         if !matches!(overlay, Overlay::None) {
-            handle_overlay_key(conn, &mut overlay, &mut status, key.code, area);
+            handle_overlay_key(conn, &mut overlay, &mut status, key.code, area, &table);
             continue;
         }
 
@@ -471,6 +476,11 @@ fn event_loop(
             }
             KeyCode::Char('1') => mode = Mode::Grid,
             KeyCode::Char('2') => mode = Mode::Tree,
+            KeyCode::Char('K') => {
+                if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
+                    overlay = Overlay::Details { id: info.id, scroll: 0 };
+                }
+            }
             KeyCode::Char('r') => {
                 if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
                     let input = info.name.clone();
@@ -602,6 +612,7 @@ fn handle_overlay_key(
     status: &mut Option<(String, Instant)>,
     code: KeyCode,
     area: Rect,
+    table: &BTreeMap<u64, AgentInfo>,
 ) {
     *overlay = match std::mem::take(overlay) {
         Overlay::Edit { id, kind, mut input, mut cursor } => match code {
@@ -648,6 +659,29 @@ fn handle_overlay_key(
                 Overlay::None
             }
             _ => Overlay::Jump { targets, selected },
+        },
+        Overlay::Details { id, mut scroll } => match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('K') => Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                scroll = scroll.saturating_sub(1);
+                Overlay::Details { id, scroll }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = table.get(&id).map_or(0, |info| details_scroll_limit(info, area));
+                scroll = scroll.saturating_add(1).min(max);
+                Overlay::Details { id, scroll }
+            }
+            KeyCode::PageUp => Overlay::Details { id, scroll: scroll.saturating_sub(details_page_height(area)) },
+            KeyCode::PageDown => {
+                let max = table.get(&id).map_or(0, |info| details_scroll_limit(info, area));
+                Overlay::Details { id, scroll: scroll.saturating_add(details_page_height(area)).min(max) }
+            }
+            KeyCode::Home => Overlay::Details { id, scroll: 0 },
+            KeyCode::End => {
+                let scroll = table.get(&id).map_or(0, |info| details_scroll_limit(info, area));
+                Overlay::Details { id, scroll }
+            }
+            _ => Overlay::Details { id, scroll },
         },
         Overlay::NewAgent { mut input, mut cursor, .. } => match code {
             KeyCode::Esc => Overlay::None,
@@ -740,6 +774,7 @@ fn attach_to(terminal: &mut ratatui::DefaultTerminal, id: u64, name: String) -> 
         replay: false,
         allow_clipboard_replay: false,
         shared_screen: true,
+        alt_screen: false,
     };
     let ending = attach::session(&target, opts).unwrap_or_else(|e| format!("attach failed: {e}"));
     // The session's reset turned focus reports off; the user just came back
@@ -766,18 +801,13 @@ fn refresh_grid(conn: &mut Conn, table: &BTreeMap<u64, AgentInfo>, opts: &PsOpti
     if agents.is_empty() {
         return Ok(vec![]);
     }
-    let cols = grid_cols(agents.len());
-    let rows = agents.len().div_ceil(cols);
-    // Inside the border (2 cols) and title line (1 row) of each cell.
-    let cell_cols = (area.width as usize / cols).saturating_sub(2).max(1) as u16;
-    let cell_rows = (area.height as usize / rows).saturating_sub(3).max(1) as u16;
-
+    let areas = grid_tile_rects(area, agents.len());
     let mut tiles = Vec::with_capacity(agents.len());
-    for info in agents {
+    for (info, cell) in agents.into_iter().zip(areas) {
         let lines = match conn.request(&Request::ScreenPreview {
             target: info.id.to_string(),
-            rows: cell_rows,
-            cols: cell_cols,
+            rows: cell.height.saturating_sub(2),
+            cols: cell.width.saturating_sub(2),
         })? {
             Response::ScreenPreview { lines } => lines,
             _ => vec![],
@@ -793,44 +823,48 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
         frame.render_widget(Paragraph::new("").block(block), area);
         return;
     }
-    let cols = grid_cols(tiles.len());
-    let rows = tiles.len().div_ceil(cols);
-    let row_areas = Layout::vertical(row_constraints(rows)).split(area);
-
-    for (r, row_area) in row_areas.iter().enumerate() {
-        let start = r * cols;
-        let n = (tiles.len() - start).min(cols);
-        if n == 0 {
-            continue;
+    for (idx, cell_area) in grid_tile_rects(area, tiles.len()).into_iter().enumerate() {
+        let tile = &tiles[idx];
+        let mut spans = vec![
+            Span::styled(activity_symbol(&tile.info), Style::default().fg(activity_color(&tile.info, blink))),
+            Span::raw(tile.info.name.clone()),
+        ];
+        if let Some(marker) = jump_marker(&tile.info, jump_socket) {
+            spans.push(marker);
         }
-        let col_areas = Layout::horizontal(row_constraints(n)).split(*row_area);
-        for (c, cell_area) in col_areas.iter().enumerate() {
-            let idx = start + c;
-            let tile = &tiles[idx];
-            let mut spans = vec![
-                Span::styled(activity_symbol(&tile.info), Style::default().fg(activity_color(&tile.info, blink))),
-                Span::raw(tile.info.name.clone()),
-            ];
-            if let Some(marker) = jump_marker(&tile.info, jump_socket) {
-                spans.push(marker);
-            }
-            let activity = format!(" · {}", tile.info.activity);
-            spans.push(if is_blocked(&tile.info) {
-                Span::styled(activity, activity_text_style(&tile.info))
-            } else {
-                Span::raw(activity)
-            });
-            let title = Line::from(spans);
-            let border_color = if idx == selected { theme().mauve } else { theme().surface2 };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .title(title);
-            let text = Text::from(tile.lines.iter().map(render_line).collect::<Vec<_>>());
-            frame.render_widget(Paragraph::new(text).block(block), *cell_area);
-        }
+        let activity = format!(" · {}", tile.info.activity);
+        spans.push(if is_blocked(&tile.info) {
+            Span::styled(activity, activity_text_style(&tile.info))
+        } else {
+            Span::raw(activity)
+        });
+        let title = Line::from(spans);
+        let border_color = if idx == selected { theme().mauve } else { theme().surface2 };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(title);
+        let text = preview_text(&tile.lines, cell_area.height.saturating_sub(2));
+        frame.render_widget(Paragraph::new(text).block(block), cell_area);
     }
+}
+
+fn grid_tile_rects(area: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let cols = grid_cols(count);
+    let rows = count.div_ceil(cols);
+    Layout::vertical(row_constraints(rows))
+        .split(area)
+        .iter()
+        .enumerate()
+        .flat_map(|(row, row_area)| {
+            let n = (count - row * cols).min(cols);
+            Layout::horizontal(row_constraints(n)).split(*row_area).iter().copied().collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -887,14 +921,19 @@ fn count_agents(node: &GroupNode) -> usize {
 /// `ScreenPreview` request is sized for the box it will actually fill.
 fn detail_preview_rect(area: Rect) -> Rect {
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
-    let detail = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(cols[1]);
+    let detail = tree_detail_rects(cols[1]);
     detail[0]
+}
+
+fn tree_detail_rects(area: Rect) -> [Rect; 3] {
+    let parts = Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(area);
+    [parts[0], parts[1], parts[2]]
 }
 
 fn refresh_tree_preview(conn: &mut Conn, rows: &[Row], selected: usize, area: Rect) -> Result<Vec<PreviewLine>> {
     let Some(Row::Agent { info, .. }) = rows.get(selected) else { return Ok(vec![]) };
-    let cols = area.width.saturating_sub(2).max(1);
-    let rows = area.height.saturating_sub(2).max(1);
+    let cols = area.width.saturating_sub(2);
+    let rows = area.height.saturating_sub(2);
     match conn.request(&Request::ScreenPreview { target: info.id.to_string(), rows, cols })? {
         Response::ScreenPreview { lines } => Ok(lines),
         _ => Ok(vec![]),
@@ -910,8 +949,7 @@ fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, blin
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
     draw_tree_list(frame, cols[0], rows, tree, blink, jump_socket);
 
-    let detail =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(cols[1]);
+    let detail = tree_detail_rects(cols[1]);
     draw_detail_preview(frame, detail[0], rows, selected, preview);
     draw_detail_label(frame, detail[1], rows, selected, "title");
     draw_detail_label(frame, detail[2], rows, selected, "recap");
@@ -1023,8 +1061,15 @@ fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], selected: us
         None => " no agents ".to_string(),
     };
     let block = panel(title);
-    let text = Text::from(preview.iter().map(render_line).collect::<Vec<_>>());
+    let text = preview_text(preview, area.height.saturating_sub(2));
     frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn preview_text(preview: &[PreviewLine], height: u16) -> Text<'static> {
+    let pad = usize::from(height).saturating_sub(preview.len());
+    Text::from(
+        std::iter::repeat_with(|| Line::raw("")).take(pad).chain(preview.iter().map(render_line)).collect::<Vec<_>>(),
+    )
 }
 
 /// One of the self-reported labels (`title`, `recap`) an agent is taught to
@@ -1052,6 +1097,7 @@ fn draw(
     grid: &GridState,
     tree: &TreeState,
     rows: &[Row],
+    table: &BTreeMap<u64, AgentInfo>,
     overlay: &Overlay,
     status: Option<&str>,
     jump_socket: Option<&str>,
@@ -1066,7 +1112,11 @@ fn draw(
         Mode::Tree => draw_tree(frame, chunks[1], rows, tree, blink, jump_socket),
     }
     draw_footer(frame, chunks[2], mode, tree.expanded, status);
-    draw_overlay(frame, area, overlay);
+    draw_overlay(frame, area, overlay, table);
+}
+
+fn dashboard_content_rect(area: Rect) -> Rect {
+    Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(area)[1]
 }
 
 /// `stale_manager`: the manager is another build (see `Conn::stale_manager`),
@@ -1103,13 +1153,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, s
     }
     let hint = match mode {
         Mode::Grid => {
-            " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+            " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   K details   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
         Mode::Tree if tree_expanded => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e restore split   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e restore split   enter attach/toggle   K details   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
         Mode::Tree => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e expand tree   enter attach/toggle   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e expand tree   enter attach/toggle   K details   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
         }
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(theme().subtext0).bg(theme().mantle)), area);
@@ -1117,7 +1167,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, s
 
 /// The Rename input box or the Kill confirm popup, floating centered over
 /// whatever `draw` already painted. No-op for `Overlay::None`.
-fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
+fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, table: &BTreeMap<u64, AgentInfo>) {
     match overlay {
         Overlay::None => {}
         Overlay::Edit { kind, input, cursor, .. } => {
@@ -1157,6 +1207,24 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, rect, &mut state);
         }
+        Overlay::Details { id, scroll } => {
+            let rect = details_rect(area);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme().mauve))
+                .title(" agent details ")
+                .title_bottom(" ↑/↓ scroll · PgUp/PgDn · K/Esc close ")
+                .style(Style::default().fg(theme().text).bg(theme().mantle));
+            let lines = table.get(id).map(details_lines).unwrap_or_else(|| {
+                vec![Line::styled("  This agent is no longer available.", Style::default().fg(theme().subtext0))]
+            });
+            frame.render_widget(
+                Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((*scroll, 0)),
+                rect,
+            );
+        }
         Overlay::NewAgent { input, cursor, error } => {
             let mut lines = vec![
                 cursor_line(input, *cursor),
@@ -1179,6 +1247,98 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
     }
+}
+
+fn details_rect(area: Rect) -> Rect {
+    centered_rect(area, area.width.saturating_sub(4).min(82), area.height.saturating_sub(2).min(24))
+}
+
+fn details_page_height(area: Rect) -> u16 {
+    details_rect(area).height.saturating_sub(2).max(1)
+}
+
+fn details_scroll_limit(info: &AgentInfo, area: Rect) -> u16 {
+    let width = usize::from(details_rect(area).width.saturating_sub(2).max(1));
+    let height = usize::from(details_page_height(area));
+    // Wrapped lines can break before the edge at a word boundary, so allow
+    // one extra display row for each line that needs wrapping.
+    let displayed: usize = details_lines(info)
+        .iter()
+        .map(|line| {
+            let columns = line.width().max(1);
+            columns.div_ceil(width) + usize::from(columns > width)
+        })
+        .sum();
+    displayed.saturating_sub(height).min(usize::from(u16::MAX)) as u16
+}
+
+fn detail_field(lines: &mut Vec<Line<'static>>, label: &'static str, value: impl Into<String>) {
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {label:<15}"), Style::default().fg(theme().subtext0)),
+        Span::styled(value.into(), Style::default().fg(theme().text)),
+    ]));
+}
+
+fn detail_section(lines: &mut Vec<Line<'static>>, title: &'static str) {
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!("  {title}"), Style::default().fg(theme().lavender).add_modifier(Modifier::BOLD)));
+}
+
+fn details_lines(info: &AgentInfo) -> Vec<Line<'static>> {
+    let now = now_secs();
+    let ago = |t: u64| format!("{} ago", client::age(now.saturating_sub(t)));
+    let status = match info.exit_code {
+        Some(code) => format!("{} (code {code})", info.status.as_str()),
+        None => info.status.as_str().to_string(),
+    };
+    let activity = match info.activity_since {
+        Some(since) => format!("{} (since {})", info.activity, ago(since)),
+        None => info.activity.to_string(),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("  {}", info.name), Style::default().fg(theme().mauve).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  #{}", info.id), Style::default().fg(theme().overlay0)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ● ", Style::default().fg(activity_color(info, true))),
+            Span::styled(
+                info.availability().to_string(),
+                Style::default().fg(activity_color(info, true)).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  ·  {activity}"), Style::default().fg(theme().subtext0)),
+        ]),
+    ];
+    detail_section(&mut lines, "IDENTITY");
+    detail_field(&mut lines, "id", info.id.to_string());
+    detail_field(&mut lines, "name", info.name.clone());
+    detail_field(&mut lines, "group", info.name.rsplit_once('/').map_or("-", |(group, _)| group));
+    detail_field(&mut lines, "kind", info.kind.clone());
+    detail_section(&mut lines, "STATE");
+    detail_field(&mut lines, "status", status);
+    detail_field(&mut lines, "activity", activity);
+    detail_field(&mut lines, "availability", info.availability().to_string());
+    detail_field(&mut lines, "turns", info.turns.to_string());
+    detail_field(&mut lines, "created", ago(info.created_at));
+    if let Some(exited) = info.exited_at {
+        detail_field(&mut lines, "exited", ago(exited));
+    }
+    detail_section(&mut lines, "PROCESS");
+    detail_field(&mut lines, "cwd", info.cwd.clone());
+    detail_field(&mut lines, "command", info.command.join(" "));
+    if info.status.is_live() {
+        detail_field(&mut lines, "attached", info.attached.to_string());
+    }
+    if let (Some(holder), Some(agent)) = (info.holder_pid, info.agent_pid) {
+        detail_field(&mut lines, "pids", format!("holder {holder}, agent {agent}"));
+    }
+    if !info.labels.is_empty() {
+        detail_section(&mut lines, "LABELS");
+        for (key, value) in &info.labels {
+            detail_field(&mut lines, "label", format!("{key}={value}"));
+        }
+    }
+    lines
 }
 
 /// A single line of editable text with a reversed-video block marking the
@@ -1333,6 +1493,7 @@ mod tests {
             turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
+            pending_interactions: Vec::new(),
             labels: BTreeMap::new(),
         }
     }
@@ -1417,6 +1578,31 @@ mod tests {
     }
 
     #[test]
+    fn preview_content_uses_dashboard_height_and_sits_at_bottom() {
+        let screen = Rect::new(0, 0, 80, 24);
+        let content = dashboard_content_rect(screen);
+        assert_eq!(content.height, 22);
+        let tiles = grid_tile_rects(content, 5);
+        assert_eq!(tiles.len(), 5);
+        assert!(tiles.iter().all(|rect| rect.bottom() <= content.bottom()));
+
+        let line = vec![PreviewSpan {
+            text: "latest".into(),
+            fg: PreviewColor::Default,
+            bg: PreviewColor::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }];
+        let text = preview_text(&[line], 3);
+        assert!(text.lines[0].spans.is_empty());
+        assert!(text.lines[1].spans.is_empty());
+        assert_eq!(text.lines[2].spans[0].content, "latest");
+    }
+
+    #[test]
     fn selected_agent_row_keeps_its_activity_dot_color() {
         let mut info = agent(1, "a");
         info.activity = "done".into();
@@ -1470,5 +1656,58 @@ mod tests {
         assert!(line.starts_with(" argus "), "{line:?}");
         assert!(line.contains(" Tree "), "{line:?}");
         assert!(line.trim_end().ends_with("argus manager restart"), "{line:?}");
+    }
+
+    #[test]
+    fn details_include_inspect_fields_and_labels() {
+        let mut info = agent(156, "team/codex-1");
+        info.kind = "codex".into();
+        info.command = vec!["codex".into(), "--sandbox".into(), "workspace-write".into()];
+        info.cwd = "/work/project".into();
+        info.turns = 2;
+        info.attached = 1;
+        info.holder_pid = Some(123);
+        info.agent_pid = Some(124);
+        info.labels.insert("title".into(), "TUI details".into());
+        let text = details_lines(&info)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "156",
+            "team/codex-1",
+            "team",
+            "codex",
+            "running",
+            "working",
+            "active",
+            "2",
+            "/work/project",
+            "codex --sandbox workspace-write",
+            "1",
+            "holder 123, agent 124",
+            "title=TUI details",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+    }
+
+    #[test]
+    fn details_popup_renders_on_a_small_terminal() {
+        let mut info = agent(156, "codex-1");
+        info.labels.insert("recap".into(), "A long recap that should remain accessible when the popup is short".into());
+        let agents = table(vec![info.clone()]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(42, 12)).unwrap();
+        let overlay = Overlay::Details { id: info.id, scroll: 0 };
+        terminal.draw(|frame| draw_overlay(frame, frame.area(), &overlay, &agents)).unwrap();
+        let first: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+        assert!(first.contains("agent details"), "{first:?}");
+        assert!(first.contains("codex-1"), "{first:?}");
+
+        let overlay = Overlay::Details { id: info.id, scroll: details_scroll_limit(&info, Rect::new(0, 0, 42, 12)) };
+        terminal.draw(|frame| draw_overlay(frame, frame.area(), &overlay, &agents)).unwrap();
+        let last: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+        assert!(last.contains("recap="), "{last:?}");
     }
 }

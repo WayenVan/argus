@@ -23,7 +23,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
-use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint};
+use super::{
+    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint, plugin_interaction,
+};
 
 pub struct Opencode;
 
@@ -76,7 +78,14 @@ impl Driver for Opencode {
     }
 
     fn interpret(&self, event: &Value) -> Hint {
-        plugin_hint(event, EVENT_VERSION)
+        match plugin_hint(event, EVENT_VERSION) {
+            Hint::WaitingApproval => Hint::Ignore,
+            other => other,
+        }
+    }
+
+    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
+        plugin_interaction(event, EVENT_VERSION, Some(Duration::from_secs(3)))
     }
 }
 
@@ -127,7 +136,7 @@ mod tests {
         assert_eq!(ev(e("SessionStart")), Hint::SessionStart);
         assert_eq!(ev(e("UserPromptSubmit")), Hint::Working);
         assert_eq!(ev(json!({"v":1,"hook_event_name":"PreToolUse","tool_name":"bash"})), Hint::Tool("bash".into()));
-        assert_eq!(ev(e("PermissionRequest")), Hint::WaitingApproval);
+        assert_eq!(ev(e("PermissionRequest")), Hint::Ignore);
         assert_eq!(
             ev(json!({"v":1,"hook_event_name":"PermissionReplied","tool_name":"task"})),
             Hint::Tool("task".into())

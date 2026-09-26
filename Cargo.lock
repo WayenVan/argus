@@ -112,6 +112,7 @@ dependencies = [
  "nix",
  "serde_json",
  "signal-hook",
+ "vte",
 ]
 
 [[package]]

@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `argus guide [core|labels|coordination]` prints the instructions argus gives
+  each agent it starts, or one part of them. For sessions they never reached,
+  such as a Codex session started outside argus and resumed in it.
 - `argus setup` without an agent finds each supported agent on `PATH` and runs
   its setup, asking before each change as `argus setup <agent>` does. `--yes`
   and `--remove` apply to all of them. For Codex it also says whether argus's
@@ -54,6 +57,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   should and should not change each label, so agents stop relabeling every
   turn. The core section
   now notes that a prompt may come from another agent through `argus send`.
+- A Codex permission request becomes `needs_user`, and the agent `blocked`,
+  once Codex's approval prompt appears on screen. Before, it stayed `observed`
+  even while a person had to answer, since the hook fires before Codex's
+  automatic reviewer decides. The prompt is recognized by its structure
+  (choices, key hints, enter/esc footer) and the requested command from the
+  hook, not by its wording.
 
 ## [0.1.0] - 2026-09-25
 

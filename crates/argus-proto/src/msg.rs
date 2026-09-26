@@ -47,7 +47,7 @@ pub enum Activity {
     Working,
     /// Running the named tool.
     Tool(String),
-    /// Waiting for a permission answer.
+    /// Waiting for a person's answer to an interaction prompt.
     Blocked,
     Error,
     #[default]
@@ -69,7 +69,7 @@ pub enum Availability {
     /// apart from the `idle` activity, which is only one of the activities
     /// that map here.
     Free,
-    /// Waiting on a person: a permission prompt or an error.
+    /// Waiting on a person: an interaction prompt or an error.
     Attention,
     /// No reliable signal.
     Unknown,
@@ -92,7 +92,10 @@ impl Activity {
     pub fn send_refusal(&self) -> Option<String> {
         Some(match self {
             _ if self.awaits_prompt() => return None,
-            Activity::Blocked => "needs attention (blocked on a permission prompt); attach to answer it".into(),
+            Activity::Blocked => {
+                "needs attention (blocked on an interaction prompt); use `argus pending` for details and `argus attach` to answer"
+                    .into()
+            }
             Activity::Quiet => {
                 "is quiet (no hooks, so it may still be working); use --force if it is at its prompt".into()
             }
@@ -224,9 +227,47 @@ pub struct AgentInfo {
     /// Live tmux attachments, rebuilt from the holder after a manager restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tmux_locations: Vec<TmuxLocation>,
+    /// Live requests reported by the agent's hooks. Cleared on manager restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_interactions: Vec<PendingInteraction>,
     /// Free-form `key=value` tags, orthogonal to the group path.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+}
+
+/// A native request observed by a driver. `needs_user` means the manager has
+/// evidence it is still waiting; `observed` may resolve automatically.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionPhase {
+    Observed,
+    NeedsUser,
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for InteractionPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Observed => "observed",
+            Self::NeedsUser => "needs_user",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PendingInteraction {
+    pub id: String,
+    pub kind: String,
+    pub phase: InteractionPhase,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// Unix milliseconds, to distinguish repeated native request IDs.
+    pub created_at: u64,
 }
 
 impl AgentInfo {
@@ -351,11 +392,16 @@ pub enum Request {
     /// The manager's own idea of the agent's current screen, for `attach` to
     /// restore without depending on the agent redrawing itself. `since_offset`
     /// lets a caller that already has the screen at that offset skip the
-    /// bytes.
+    /// bytes. `current` requests a primary-screen snapshot instead of a
+    /// history replay, for dashboard attaches.
     Screen {
         target: String,
         #[serde(default)]
         since_offset: Option<u64>,
+        /// For TUI attach, restore the current primary screen instead of
+        /// replaying its retained output history.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        current: bool,
     },
     /// A styled crop of the agent's current screen to `rows`x`cols`, for
     /// dashboard thumbnails. Unlike `Screen`, it contains structured spans,
@@ -541,8 +587,11 @@ pub enum ScreenMode {
     /// redraw of the current screen and terminal modes. Apply it only if the
     /// caller's terminal size matches `rows`/`cols`.
     Snapshot,
-    /// The agent has never entered the alternate screen: recovering earlier
-    /// output means replaying the holder's ring buffer from `offset`
+    /// A redraw of the current primary screen with a matching output offset.
+    /// It has no alternate-screen switch or scrollback history.
+    PrimarySnapshot,
+    /// The agent is on the primary screen: recovering earlier output means
+    /// replaying the holder's ring buffer from `offset`
     /// (usually its oldest retained byte) instead of a synthetic redraw.
     Replay,
     /// The manager has no screen state for this agent yet (just started) or
@@ -693,6 +742,16 @@ pub enum HolderEvent {
     /// The PTY's size actually changed. Not sent for a jiggle (resize and
     /// back) that leaves the size unchanged, since nothing to track moved.
     Resized { rows: u16, cols: u16 },
+    /// Alternate-screen state immediately before the retained output starts.
+    /// Sent before an output subscriber's ring replay, so a late screen
+    /// tracker can parse that replay even when its opening escape was evicted.
+    ScreenMode {
+        alternate: bool,
+        /// Input modes active before the retained output, especially mouse
+        /// reporting. Otherwise tmux cannot forward wheel events to the TUI.
+        #[serde(default)]
+        input_modes: Vec<u16>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -744,6 +803,15 @@ mod compatibility_tests {
     use super::*;
 
     #[test]
+    fn screen_current_flag_defaults_to_history_replay() {
+        let old = serde_json::json!({"type": "Screen", "target": "1", "since_offset": null});
+        let request: Request = serde_json::from_value(old).unwrap();
+        assert!(matches!(request, Request::Screen { current: false, .. }));
+        let request = Request::Screen { target: "1".into(), since_offset: None, current: true };
+        assert_eq!(serde_json::to_value(request).unwrap()["current"], true);
+    }
+
+    #[test]
     fn activity_is_a_plain_string_on_the_wire() {
         for text in
             ["idle", "done", "working", "tool:Bash", "tool:mcp__x__y", "blocked", "error", "unknown", "busy", "quiet"]
@@ -754,6 +822,15 @@ mod compatibility_tests {
         // A newer manager's activity reads as unknown instead of failing.
         let activity: Activity = serde_json::from_str(r#""pondering""#).unwrap();
         assert_eq!(activity, Activity::Unknown);
+    }
+
+    #[test]
+    fn interaction_phase_is_stable_on_the_wire() {
+        for (wire, phase) in [("observed", InteractionPhase::Observed), ("needs_user", InteractionPhase::NeedsUser)] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), serde_json::json!(wire));
+            assert_eq!(serde_json::from_value::<InteractionPhase>(serde_json::json!(wire)).unwrap(), phase);
+        }
+        assert_eq!(serde_json::from_str::<InteractionPhase>(r#""new_phase""#).unwrap(), InteractionPhase::Unknown);
     }
 
     #[test]

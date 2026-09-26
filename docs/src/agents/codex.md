@@ -8,6 +8,15 @@ Selected when the program is `codex`, or with `--kind codex`.
   background except `Stop`, whose answer Codex waits for, so argus can hold a
   turn that ends without labels (see [Labels](../concepts.md#labels)).
 - The label instructions are passed as `-c developer_instructions=…`.
+- Activity, turns, and pending interactions follow the main session. A `/btw`
+  side conversation has its own session ID and does not replace that state.
+- A permission hook records an `observed` request. It fires before Codex's
+  automatic reviewer, so it cannot prove a human prompt is visible. Argus
+  promotes it to `needs_user` (and the agent to `blocked`) once Codex's
+  approval prompt appears on screen, recognized by its list of choices, key
+  hints, enter/esc footer, and the requested command. The next hook event
+  clears it. If a request stays `observed`, use `argus inspect <id> --screen`
+  to see whether a person must answer.
 
 No user file is modified.
 
@@ -76,7 +85,8 @@ argus warns when you start the agent.
   session is created. On resume, it replays the stored session and ignores
   new `-c developer_instructions`.
 - *What to do:* start the session in argus. For a session that already
-  exists, set the labels yourself with `argus label`.
+  exists, set the labels yourself with `argus label`, or tell the agent to
+  run `argus guide` and follow it.
 
 Sessions started in argus keep the instructions when you resume them, in
 argus or anywhere else.

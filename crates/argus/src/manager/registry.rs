@@ -104,6 +104,7 @@ pub struct Restore {
 fn reset(info: &mut AgentInfo, settled: &Settled) -> Option<Restore> {
     info.attached = 0;
     info.tmux_locations.clear();
+    info.pending_interactions.clear();
     if !info.status.is_live() {
         return None;
     }
@@ -218,6 +219,7 @@ mod tests {
             turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
+            pending_interactions: Vec::new(),
             labels: Default::default(),
         }
     }
@@ -253,6 +255,23 @@ mod tests {
         let mut unsettled = AgentInfo { activity: "idle".into(), ..agent(2, "b", AgentStatus::Running) };
         assert!(reset(&mut unsettled, &settled).is_none(), "crashed manager: no offset");
         assert_eq!(unsettled.activity, Activity::Unknown);
+    }
+
+    #[test]
+    fn pending_interactions_are_discarded_on_restart() {
+        let mut info = agent(1, "a", AgentStatus::Running);
+        info.pending_interactions.push(argus_proto::msg::PendingInteraction {
+            id: "native".into(),
+            kind: "permission".into(),
+            phase: argus_proto::msg::InteractionPhase::NeedsUser,
+            session_id: "s".into(),
+            summary: None,
+            choices: vec![],
+            created_at: 1,
+        });
+        reset(&mut info, &Settled::new());
+        assert!(info.pending_interactions.is_empty());
+        assert_eq!(info.activity, Activity::Unknown);
     }
 
     #[test]

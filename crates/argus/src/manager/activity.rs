@@ -16,17 +16,18 @@
 //!   [`super::directive`]): the agent keeps working on them, and only the
 //!   end that follows counts as the turn.
 //!
-//! Everything is event-driven; the only timers are the per-agent watchdog
-//! (armed only while `working`) and the poller for hook-less agents.
+//! Hook events drive transitions. Timers cover the working silence watchdog,
+//! hook-less agents, and a short grace period for automatically resolved
+//! approval requests.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argus_proto::msg::{Activity, TmuxLocation, now_secs};
+use argus_proto::msg::{Activity, InteractionPhase, TmuxLocation, now_secs};
 use argus_proto::text;
 use serde_json::Value;
 
-use super::driver::{self, Driver, Hint};
+use super::driver::{self, Driver, Hint, InteractionChange, ScreenCheck};
 use super::registry::AgentRecord;
 use super::{Manager, directive, holder, log};
 use crate::turns::{self, Turn};
@@ -35,6 +36,21 @@ use crate::turns::{self, Turn};
 const SILENCE: Duration = Duration::from_secs(15);
 /// How often hook-less agents are checked for output.
 const GENERIC_POLL: Duration = Duration::from_secs(2);
+/// How often the screen of an agent with an observed request is checked
+/// for it, while the request stays observed.
+const SCREEN_POLL: Duration = Duration::from_millis(250);
+
+/// How an observed request may later be promoted to `needs_user`.
+struct Confirm {
+    request_id: String,
+    created_at: u64,
+    how: ConfirmBy,
+}
+
+enum ConfirmBy {
+    Delay(Duration),
+    Screen(ScreenCheck),
+}
 
 impl Manager {
     /// Handles a hook event forwarded by `argus-hook`. Returns what the hook
@@ -50,7 +66,8 @@ impl Manager {
             log(&format!("dropping {source} hook event for {} ({})", rec.info.name, rec.info.kind));
             return None;
         }
-        let mut hint = driver.interpret(event);
+        let translated = driver.translate(event);
+        let mut hint = translated.hint;
         if !bind_session(rec, event, &hint) {
             return None;
         }
@@ -62,7 +79,11 @@ impl Manager {
         // manager restart.
         let finished = count_turn(rec, &hint);
         let turn = track_turn(rec, event, &hint, stdout.is_some());
-        let changed = apply(rec, hint) || finished;
+        let (interaction_changed, confirm) = update_interactions(rec, translated.interaction, &hint);
+        let activity_changed = apply(rec, hint);
+        let still_blocked = rec.info.pending_interactions.iter().any(|p| p.phase == InteractionPhase::NeedsUser)
+            && set(rec, Activity::Blocked);
+        let changed = activity_changed || still_blocked || finished || interaction_changed;
         let arm = rec.info.activity == Activity::Working;
         if arm && changed {
             rec.runtime.working_gen += 1;
@@ -90,7 +111,52 @@ impl Manager {
             let manager = self.clone();
             tokio::spawn(async move { manager.watchdog(agent_id).await });
         }
+        if let Some(confirm) = confirm {
+            let manager = self.clone();
+            tokio::spawn(async move { manager.confirm_interaction(agent_id, confirm).await });
+        }
         stdout
+    }
+
+    /// Promotes an observed request to `needs_user` after the driver's grace
+    /// period for automatic resolution, or once its screen check sees the
+    /// request in front of a person. Ends as soon as the request is gone or
+    /// no longer observed; other hook events clear it.
+    async fn confirm_interaction(&self, agent_id: u64, confirm: Confirm) {
+        match confirm.how {
+            ConfirmBy::Delay(delay) => {
+                tokio::time::sleep(delay).await;
+                self.promote_interaction(agent_id, &confirm.request_id, confirm.created_at, true);
+            }
+            ConfirmBy::Screen(check) => loop {
+                tokio::time::sleep(SCREEN_POLL).await;
+                let shown = self.screens.inspect(agent_id, |screen| check(screen)).unwrap_or(false);
+                if !self.promote_interaction(agent_id, &confirm.request_id, confirm.created_at, shown) || shown {
+                    return;
+                }
+            },
+        }
+    }
+
+    /// Promotes the request when `promote`. Returns whether it was still
+    /// observed on a live agent.
+    fn promote_interaction(&self, agent_id: u64, request_id: &str, created_at: u64, promote: bool) -> bool {
+        let mut reg = self.registry.lock().unwrap();
+        let Some(rec) = reg.agents.get_mut(&agent_id) else { return false };
+        let Some(pending) =
+            rec.info.pending_interactions.iter_mut().find(|p| p.id == request_id && p.created_at == created_at)
+        else {
+            return false;
+        };
+        if pending.phase != InteractionPhase::Observed || !rec.info.status.is_live() {
+            return false;
+        }
+        if promote {
+            pending.phase = InteractionPhase::NeedsUser;
+            set(rec, Activity::Blocked);
+            reg.changed(agent_id);
+        }
+        true
     }
 
     /// Applies a holder fact or a user action to one agent.
@@ -112,12 +178,9 @@ impl Manager {
                 rec.runtime.last_input = Some(Instant::now());
                 match rec.info.activity {
                     Activity::Done => set(rec, Activity::Idle),
-                    // Answering a permission prompt takes a keypress; the
-                    // tool that asked now runs.
-                    Activity::Blocked => {
-                        let next = rec.runtime.last_tool.clone().map_or(Activity::Working, Activity::Tool);
-                        set(rec, next)
-                    }
+                    // Arrow keys and typing may only navigate a dialog.
+                    // Wait for the agent's reply or next tool event.
+                    Activity::Blocked => false,
                     _ => false,
                 }
             }
@@ -254,9 +317,11 @@ pub enum Fact {
 /// report under the same ID; its events carry a different session.
 fn bind_session(rec: &mut AgentRecord, event: &Value, hint: &Hint) -> bool {
     let Some(session) = event.get("session_id").and_then(Value::as_str) else { return true };
-    // `/clear` and resume start a new session inside the same agent; a nested
-    // agent that just launched says `startup`, so it cannot take over.
-    let restarted = *hint == Hint::SessionStart && event.get("source").and_then(Value::as_str) != Some("startup");
+    // Only explicit main-session switches may replace the binding. Codex's
+    // `/btw` side conversation starts with `source: "fork"`; treating every
+    // non-startup source as a restart lets it steal the main agent's state.
+    let restarted = *hint == Hint::SessionStart
+        && matches!(event.get("source").and_then(Value::as_str), Some("clear" | "resume" | "reload"));
     match &rec.runtime.session_id {
         Some(bound) if bound == session => true,
         Some(_) if !restarted => false,
@@ -264,6 +329,67 @@ fn bind_session(rec: &mut AgentRecord, event: &Value, hint: &Hint) -> bool {
             rec.runtime.session_id = Some(session.to_string());
             true
         }
+    }
+}
+
+/// Reduces driver-translated request changes into the public pending list.
+/// A request may remain observed while an automatic reviewer is working.
+fn update_interactions(
+    rec: &mut AgentRecord,
+    change: Option<InteractionChange>,
+    hint: &Hint,
+) -> (bool, Option<Confirm>) {
+    let pending = &mut rec.info.pending_interactions;
+    match change {
+        Some(InteractionChange::Opened { request, confirm_after, on_screen }) => {
+            if pending.iter().any(|p| p.id == request.id && p.session_id == request.session_id) {
+                return (false, None);
+            }
+            let how = confirm_after.map(ConfirmBy::Delay).or(on_screen.map(ConfirmBy::Screen));
+            let confirm = how.filter(|_| request.phase == InteractionPhase::Observed).map(|how| Confirm {
+                request_id: request.id.clone(),
+                created_at: request.created_at,
+                how,
+            });
+            pending.push(request);
+            (true, confirm)
+        }
+        Some(InteractionChange::NeedsUser { fallback }) => {
+            if pending.iter().any(|p| p.phase == InteractionPhase::NeedsUser) {
+                return (false, None);
+            }
+            if let Some(p) = pending.iter_mut().rev().find(|p| p.phase == InteractionPhase::Observed) {
+                p.phase = InteractionPhase::NeedsUser;
+            } else {
+                pending.push(fallback);
+            }
+            (true, None)
+        }
+        Some(InteractionChange::Closed { id, session_id }) => {
+            let before = pending.len();
+            if let Some(id) = id {
+                pending.retain(|p| p.id != id || session_id.as_ref().is_some_and(|s| p.session_id != *s));
+            } else {
+                pending.clear();
+            }
+            (before != pending.len(), None)
+        }
+        None if matches!(
+            hint,
+            Hint::Working
+                | Hint::Tool(_)
+                | Hint::SessionStart
+                | Hint::Done
+                | Hint::Error
+                | Hint::Interrupted
+                | Hint::WaitingInput
+        ) =>
+        {
+            let had_pending = !pending.is_empty();
+            pending.clear();
+            (had_pending, None)
+        }
+        None => (false, None),
     }
 }
 
@@ -383,8 +509,123 @@ mod tests {
             turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
+            pending_interactions: Vec::new(),
             labels: Default::default(),
         })
+    }
+
+    fn translated_interaction(rec: &mut AgentRecord, event: &Value) -> (bool, Option<Confirm>) {
+        let report = driver::for_kind(&rec.info.kind).translate(event);
+        update_interactions(rec, report.interaction, &report.hint)
+    }
+
+    #[test]
+    fn claude_request_is_observed_until_notification() {
+        let mut rec = record();
+        let request = json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"Bash"});
+        let (changed, confirm) = translated_interaction(&mut rec, &request);
+        assert!(changed);
+        assert!(confirm.is_none());
+        assert_eq!(rec.info.pending_interactions[0].phase, InteractionPhase::Observed);
+        assert_eq!(rec.info.pending_interactions[0].summary.as_deref(), Some("Bash"));
+
+        let notification =
+            json!({"hook_event_name":"Notification","session_id":"s","notification_type":"permission_prompt"});
+        assert!(translated_interaction(&mut rec, &notification).0);
+        assert_eq!(rec.info.pending_interactions[0].phase, InteractionPhase::NeedsUser);
+        assert!(!translated_interaction(&mut rec, &notification).0);
+
+        let progress = json!({"hook_event_name":"PostToolUse","session_id":"s"});
+        assert!(translated_interaction(&mut rec, &progress).0);
+        assert!(rec.info.pending_interactions.is_empty());
+    }
+
+    #[test]
+    fn claude_notification_without_request_still_records_a_wait() {
+        let mut rec = record();
+        let notification =
+            json!({"hook_event_name":"Notification","session_id":"s","notification_type":"permission_prompt"});
+        assert!(translated_interaction(&mut rec, &notification).0);
+        let pending = &rec.info.pending_interactions[0];
+        assert_eq!(pending.id, "s:permission_prompt");
+        assert_eq!(pending.phase, InteractionPhase::NeedsUser);
+    }
+
+    #[test]
+    fn open_code_requests_keep_native_ids_and_options() {
+        let mut rec = record();
+        rec.info.kind = "opencode".into();
+        for id in ["p1", "p2"] {
+            let request = json!({"v":1,"hook_event_name":"PermissionRequest","session_id":"root",
+                "request_session_id":"child","request_id":id,"interaction_kind":"question",
+                "question_text":"Continue?","choices":["Yes","No"]});
+            let (changed, confirm) = translated_interaction(&mut rec, &request);
+            assert!(changed);
+            assert_eq!(confirm.unwrap().request_id, id);
+        }
+        assert_eq!(rec.info.pending_interactions.len(), 2);
+        assert_eq!(rec.info.pending_interactions[0].choices, ["Yes", "No"]);
+        assert_eq!(rec.info.pending_interactions[0].summary.as_deref(), Some("Continue?"));
+        assert_eq!(rec.info.pending_interactions[0].session_id, "child");
+        let reply = json!({"v":1,"hook_event_name":"PermissionReplied","request_id":"p1"});
+        assert!(translated_interaction(&mut rec, &reply).0);
+        assert_eq!(rec.info.pending_interactions[0].id, "p2");
+    }
+
+    #[test]
+    fn old_or_unknown_opencode_plugin_events_do_not_open_requests() {
+        let mut rec = record();
+        rec.info.kind = "opencode".into();
+        let request = json!({"v":2,"hook_event_name":"PermissionRequest","session_id":"s"});
+        assert!(!translated_interaction(&mut rec, &request).0);
+        assert!(rec.info.pending_interactions.is_empty());
+    }
+
+    #[test]
+    fn pi_dialog_reports_title_and_closes() {
+        let mut rec = record();
+        rec.info.kind = "pi".into();
+        let start = json!({"v":1,"hook_event_name":"PermissionRequest","session_id":"s",
+            "interaction_kind":"confirm","question_text":"Allow deployment?"});
+        let (changed, confirm) = translated_interaction(&mut rec, &start);
+        assert!(changed);
+        assert!(confirm.is_none());
+        let pending = &rec.info.pending_interactions[0];
+        assert_eq!(pending.phase, InteractionPhase::NeedsUser);
+        assert_eq!(pending.kind, "confirm");
+        assert_eq!(pending.summary.as_deref(), Some("Allow deployment?"));
+        let end = json!({"v":1,"hook_event_name":"PermissionReplied","session_id":"s"});
+        assert!(translated_interaction(&mut rec, &end).0);
+        assert!(rec.info.pending_interactions.is_empty());
+    }
+
+    #[test]
+    fn omp_parallel_requests_close_by_tool_call_id() {
+        let mut rec = record();
+        rec.info.kind = "omp".into();
+        for (id, kind) in [("call-1", "permission"), ("call-2", "question")] {
+            let start = json!({"v":1,"hook_event_name":"PermissionRequest","session_id":"s",
+                "request_id":id,"interaction_kind":kind,"tool_name":"ask"});
+            assert!(translated_interaction(&mut rec, &start).0);
+        }
+        assert_eq!(rec.info.pending_interactions.len(), 2);
+        assert!(rec.info.pending_interactions.iter().all(|p| p.phase == InteractionPhase::NeedsUser));
+        let end = json!({"v":1,"hook_event_name":"PermissionReplied","session_id":"s","request_id":"call-1"});
+        assert!(translated_interaction(&mut rec, &end).0);
+        assert_eq!(rec.info.pending_interactions[0].id, "call-2");
+    }
+
+    #[test]
+    fn codex_request_stays_observed_until_its_screen_or_progress_settles_it() {
+        let mut rec = record();
+        rec.info.kind = "codex".into();
+        let request = json!({"hook_event_name":"PermissionRequest","session_id":"s"});
+        let confirm = translated_interaction(&mut rec, &request).1.unwrap();
+        assert!(matches!(confirm.how, ConfirmBy::Screen(_)));
+        assert_eq!(rec.info.pending_interactions[0].phase, InteractionPhase::Observed);
+        let progress = json!({"hook_event_name":"PostToolUse"});
+        translated_interaction(&mut rec, &progress);
+        assert!(rec.info.pending_interactions.is_empty());
     }
 
     #[test]
@@ -503,7 +744,11 @@ mod tests {
             !bind_session(&mut rec, &start("nested", "startup"), &Hint::SessionStart),
             "nested agents cannot take over"
         );
+        assert!(!bind_session(&mut rec, &start("side", "fork"), &Hint::SessionStart), "/btw cannot take over");
+        assert!(!bind_session(&mut rec, &start("unknown", "other"), &Hint::SessionStart));
+        assert!(bind_session(&mut rec, &stop("a"), &Hint::Done), "main session still reports after /btw");
         assert!(bind_session(&mut rec, &start("b", "clear"), &Hint::SessionStart), "/clear rebinds");
         assert!(!bind_session(&mut rec, &stop("a"), &Hint::Done));
+        assert!(bind_session(&mut rec, &start("c", "resume"), &Hint::SessionStart), "resume rebinds");
     }
 }

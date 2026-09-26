@@ -7,7 +7,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use argus_proto::msg::{Activity, AgentInfo, Availability};
+use argus_proto::msg::{Activity, AgentInfo, Availability, InteractionPhase};
 
 use crate::client::Conn;
 use crate::errors::{EXITED, STUCK, TIMEOUT, code_of, coded};
@@ -20,9 +20,10 @@ use crate::{naming, stream};
 
 /// How long `send --then-wait` gives a sent prompt to show up as activity.
 const PICKUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long an agent stays `blocked` before a wait mentions it. Codex reports
-/// approvals it then grants by itself, which clear within about a second.
+/// How long a confirmed block stays visible before a wait mentions it.
 const BLOCKED_NOTICE_DELAY: Duration = Duration::from_secs(2);
+/// An unconfirmed request deserves a heads-up, but must not be called blocked.
+const OBSERVED_NOTICE_DELAY: Duration = Duration::from_secs(10);
 
 /// What `--until` or `--until-activity` asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -121,7 +122,7 @@ pub fn wait(waited: Waited, goal: Goal, after: Option<u64>, timeout: Option<u64>
     let mut table: BTreeMap<u64, AgentInfo> = agents.into_iter().map(|a| (a.id, a)).collect();
     // Whether an agent is in the directory; its cwd never changes.
     let mut inside: HashMap<u64, bool> = HashMap::new();
-    let mut notices = BlockedNotices::new(&goal, !json);
+    let mut notices = InteractionNotices::new(&goal, !json);
     loop {
         let check = match &ids {
             Some(ids) => check_targets(ids, &table, &goal)?,
@@ -170,7 +171,7 @@ pub struct Pickup {
 /// or the agent goes unknown on the way (e.g. interrupted with Esc, which ends
 /// a turn without `Stop`). Being unknown already at the start, as every agent
 /// is right after a manager restart, does not count. `blocked` keeps waiting,
-/// with a notice on stderr when `notify` (see [`BlockedNotices`]).
+/// with a notice on stderr when `notify` (see [`InteractionNotices`]).
 pub fn after_turn(
     mut current: AgentInfo,
     rx: &Messages,
@@ -188,7 +189,7 @@ pub fn after_turn(
     }
     let mut known = false;
     let mut picked_up = pickup.is_none();
-    let mut notices = BlockedNotices::new(goal, notify);
+    let mut notices = InteractionNotices::new(goal, notify);
     loop {
         notices.observe(&current, Instant::now());
         if current.turns > after && goal.reached(&current) {
@@ -222,21 +223,24 @@ pub fn after_turn(
     }
 }
 
-/// Tells whoever watches a wait, on stderr, when an agent it waits for has
-/// reported `blocked` for [`BLOCKED_NOTICE_DELAY`], and when that ends. Waits
-/// keep going through `blocked`: argus cannot tell a prompt waiting on a person
-/// from one the agent approves by itself, which can stay reported as blocked
-/// until the approved tool finishes. Off under `--json`, whose stderr carries
-/// only the error object, and when the goal is `blocked` itself.
-struct BlockedNotices {
+/// Reports confirmed blocks and long-lived unconfirmed requests on stderr.
+/// Waits keep going through both. Off under `--json`, whose stderr carries
+/// only the error object, and when the goal is attention itself.
+struct InteractionNotices {
     on: bool,
-    /// Agents reporting blocked: since when, and whether that was announced.
+    /// Agents reporting blocked or an observed request: since when, and
+    /// whether that was announced.
     blocked: HashMap<u64, (Instant, bool)>,
+    observed: HashMap<u64, (Instant, bool)>,
 }
 
-impl BlockedNotices {
+impl InteractionNotices {
     fn new(goal: &Goal, notify: bool) -> Self {
-        BlockedNotices { on: notify && !goal.accepts(Availability::Attention), blocked: HashMap::new() }
+        InteractionNotices {
+            on: notify && !goal.accepts(Availability::Attention),
+            blocked: HashMap::new(),
+            observed: HashMap::new(),
+        }
     }
 
     fn observe(&mut self, agent: &AgentInfo, now: Instant) {
@@ -251,12 +255,14 @@ impl BlockedNotices {
         for agent in agents {
             self.observe(agent, now);
         }
-        let gone: Vec<u64> = self.blocked.keys().copied().filter(|id| !listed.contains(id)).collect();
+        let gone: BTreeSet<u64> =
+            self.blocked.keys().chain(self.observed.keys()).copied().filter(|id| !listed.contains(id)).collect();
         for id in gone {
             match table.get(&id) {
                 Some(agent) => self.observe(agent, now),
                 None => {
                     self.blocked.remove(&id);
+                    self.observed.remove(&id);
                 }
             }
         }
@@ -268,25 +274,41 @@ impl BlockedNotices {
             return None;
         }
         if agent.status.is_live() && agent.activity == Activity::Blocked {
+            self.observed.remove(&agent.id);
             let (since, announced) = self.blocked.entry(agent.id).or_insert((now, false));
             if *announced || now.duration_since(*since) < BLOCKED_NOTICE_DELAY {
                 return None;
             }
             *announced = true;
-            return Some(format!("{} reports blocked (may be waiting on a person); still waiting", agent.name));
+            return Some(format!(
+                "{} is waiting for your action; still waiting. Run `argus pending {}` for details, then `argus attach {}` to respond",
+                agent.name, agent.id, agent.id
+            ));
         }
-        match self.blocked.remove(&agent.id) {
+        let no_longer_blocked = match self.blocked.remove(&agent.id) {
             Some((since, true)) => {
                 Some(format!("{} is no longer blocked (after {}s)", agent.name, now.duration_since(since).as_secs()))
             }
             _ => None,
+        };
+        if agent.status.is_live() && agent.pending_interactions.iter().any(|p| p.phase == InteractionPhase::Observed) {
+            let (since, announced) = self.observed.entry(agent.id).or_insert((now, false));
+            if !*announced && now.duration_since(*since) >= OBSERVED_NOTICE_DELAY {
+                *announced = true;
+                return Some(format!(
+                    "{} has an approval request (may resolve automatically); still waiting. Run `argus pending {}` for details",
+                    agent.name, agent.id
+                ));
+            }
+            return no_longer_blocked;
         }
+        let cleared = self.observed.remove(&agent.id).is_some_and(|(_, announced)| announced);
+        no_longer_blocked.or_else(|| cleared.then(|| format!("{}'s approval request cleared", agent.name)))
     }
 
-    /// Whether an agent is blocked but not announced yet, so the wait has to
-    /// wake to announce it even without an update.
+    /// Whether a notice is due later without another agent update.
     fn pending(&self) -> bool {
-        self.blocked.values().any(|(_, announced)| !announced)
+        self.blocked.values().chain(self.observed.values()).any(|(_, announced)| !announced)
     }
 }
 
@@ -439,7 +461,7 @@ mod tests {
     #[test]
     fn blocked_notices() {
         let free = Goal::Availability(Availability::Free);
-        let mut n = BlockedNotices::new(&free, true);
+        let mut n = InteractionNotices::new(&free, true);
         let t = Instant::now();
         let at = |secs: u64| t + Duration::from_secs(secs);
         // A block that clears quickly says nothing.
@@ -450,17 +472,39 @@ mod tests {
         // One that lasts is announced once, then its end.
         assert_eq!(n.notice(&agent("blocked", true), at(10)), None);
         let line = n.notice(&agent("blocked", true), at(12)).unwrap();
-        assert!(line.starts_with("a reports blocked"), "{line}");
+        assert!(line.starts_with("a is waiting for your action"), "{line}");
+        assert!(line.contains("argus pending 1") && line.contains("argus attach 1"), "{line}");
         assert_eq!(n.notice(&agent("blocked", true), at(20)), None);
         assert_eq!(n.notice(&agent("done", true), at(55)).unwrap(), "a is no longer blocked (after 45s)");
         assert_eq!(n.notice(&agent("done", true), at(56)), None);
 
-        let mut quiet = BlockedNotices::new(&free, false);
+        let mut quiet = InteractionNotices::new(&free, false);
         quiet.notice(&agent("blocked", true), at(0));
         assert_eq!(quiet.notice(&agent("blocked", true), at(10)), None, "off under --json");
-        let mut quiet = BlockedNotices::new(&Goal::Availability(Availability::Attention), true);
+        let mut quiet = InteractionNotices::new(&Goal::Availability(Availability::Attention), true);
         quiet.notice(&agent("blocked", true), at(0));
         assert_eq!(quiet.notice(&agent("blocked", true), at(10)), None, "blocked is what it waits for");
+    }
+
+    #[test]
+    fn observed_request_gets_an_uncertain_notice_without_blocking() {
+        let free = Goal::Availability(Availability::Free);
+        let mut n = InteractionNotices::new(&free, true);
+        let t = Instant::now();
+        let mut a = agent("tool:Bash", true);
+        a.pending_interactions = serde_json::from_value(serde_json::json!([{
+            "id": "request-1", "kind": "permission", "phase": "observed",
+            "session_id": "s", "created_at": 1
+        }]))
+        .unwrap();
+        assert_eq!(n.notice(&a, t), None);
+        assert_eq!(n.notice(&a, t + Duration::from_secs(9)), None);
+        let line = n.notice(&a, t + OBSERVED_NOTICE_DELAY).unwrap();
+        assert!(line.contains("may resolve automatically") && line.contains("argus pending 1"), "{line}");
+        assert!(!line.contains("blocked"), "{line}");
+        assert_eq!(n.notice(&a, t + Duration::from_secs(20)), None);
+        a.pending_interactions.clear();
+        assert_eq!(n.notice(&a, t + Duration::from_secs(21)).unwrap(), "a's approval request cleared");
     }
 
     #[test]

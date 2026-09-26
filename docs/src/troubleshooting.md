@@ -27,3 +27,7 @@ with Esc. See [Claude Code](agents/claude.md#known-limitations).
 tmux sends the wheel to programs on the alternate screen instead of entering
 copy mode. Agents that use it (Claude Code, Codex, pi) handle it themselves. For
 omp, make sure argus is up to date: see [Attaching](concepts.md#attaching).
+If an older holder has produced more than 1 MiB of output since the manager
+restarted, the manager may have missed its alternate-screen entry. For that
+live session, use `argus attach <id> --alt-screen` to request a fresh redraw.
+New holders preserve the screen mode when their output ring is truncated.

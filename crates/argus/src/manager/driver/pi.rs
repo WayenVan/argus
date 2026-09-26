@@ -17,7 +17,9 @@ use std::fs;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint};
+use super::{
+    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint, plugin_interaction,
+};
 
 pub struct Pi;
 
@@ -46,6 +48,10 @@ impl Driver for Pi {
 
     fn interpret(&self, event: &Value) -> Hint {
         plugin_hint(event, EVENT_VERSION)
+    }
+
+    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
+        plugin_interaction(event, EVENT_VERSION, None)
     }
 }
 

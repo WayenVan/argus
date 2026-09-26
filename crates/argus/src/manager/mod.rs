@@ -284,9 +284,13 @@ impl Manager {
                 }
                 Ok(Response::Ok)
             }
-            Request::Screen { target, since_offset } => {
+            Request::Screen { target, since_offset, current } => {
                 let id = resolve_one(&self.registry.lock().unwrap(), &target, "screen")?;
-                let screen::ScreenReply { mode, rows, cols, offset, bytes } = self.screens.get(id, since_offset);
+                let screen::ScreenReply { mode, rows, cols, offset, bytes } = if current {
+                    self.screens.get_current(id, since_offset)
+                } else {
+                    self.screens.get(id, since_offset)
+                };
                 Ok(Response::Screen { mode, rows, cols, offset, bytes })
             }
             Request::ScreenPreview { target, rows, cols } => {
@@ -354,6 +358,7 @@ impl Manager {
                 turns: 0,
                 attached: 0,
                 tmux_locations: Vec::new(),
+                pending_interactions: Vec::new(),
                 labels: req.labels.clone(),
             };
             reg.agents.insert(id, AgentRecord::new(info.clone()));
@@ -551,7 +556,7 @@ impl Manager {
                 }
                 HolderEvent::Input => manager.on_fact(id, Fact::Input),
                 // Only the screen-tracking subscription cares about this.
-                HolderEvent::Resized { .. } => {}
+                HolderEvent::Resized { .. } | HolderEvent::ScreenMode { .. } => {}
             };
             let (status, code, exited_at) = match holder::follow(id, on_event).await {
                 Ok(Some(code)) => (AgentStatus::Exited, Some(code), Some(now_secs())),
@@ -566,6 +571,7 @@ impl Manager {
                 agent.exited_at = exited_at;
                 agent.attached = 0;
                 agent.tmux_locations.clear();
+                agent.pending_interactions.clear();
                 holder::unlink_name(&agent.name);
                 log(&format!("{} (id {id}) is {}", agent.name, status.as_str()));
                 reg.changed(id);

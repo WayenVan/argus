@@ -13,6 +13,7 @@ Lightweight manager for long-running terminal agents
 * `run` — Start an agent and attach to it (use -d to leave it running in the background)
 * `ps` — List agents
 * `inspect` — Show one agent in full
+* `pending` — Show pending interaction prompts for an agent or agents in this directory
 * `status` — Agents working in a directory, and whether they are all free. Leaves out the agent running this command
 * `grid` — Full-screen dashboard: a live thumbnail grid of every agent's screen
 * `tree` — Full-screen dashboard: a group-path tree with a live detail pane for the selected agent (same app as `argus grid`, opened on the tree mode)
@@ -28,6 +29,7 @@ Lightweight manager for long-running terminal agents
 * `kill` — Stop an agent (SIGTERM, then SIGKILL after 5s)
 * `rm` — Remove an exited agent
 * `prune` — Remove every exited agent
+* `guide` — Print the instructions argus gives each agent it starts
 * `manager` — Manage the manager process
 * `setup` — One-time changes to an agent's own configuration that widen what it may do; shows them and asks first. Without an agent, sets up every agent found on PATH
 
@@ -89,6 +91,22 @@ Show one agent in full
 
 * `--screen` — Also print its current screen as plain text
 * `--last <N>` — Also print its last N finished turns (default 1): each prompt and final reply, as its hooks reported them
+* `--json` — Print JSON (one object per line) instead of text
+
+
+
+## `argus pending`
+
+Show pending interaction prompts for an agent or agents in this directory
+
+**Usage:** `argus pending [OPTIONS] [TARGET]`
+
+###### **Arguments:**
+
+* `<TARGET>` — ID, name, or `self`; omitted lists agents in the current directory and below
+
+###### **Options:**
+
 * `--json` — Print JSON (one object per line) instead of text
 
 
@@ -326,6 +344,7 @@ Take over an agent's terminal (detach with Ctrl-\)
 * `--steal` — Disconnect every other attached terminal first
 * `--replay` — Print recent output before live output
 * `--allow-clipboard-replay` — Allow historical OSC 52 sequences to overwrite the clipboard
+* `--alt-screen` — Force an alternate-screen redraw if a restarted manager lost its state
 
 
 
@@ -376,6 +395,27 @@ Remove every exited agent
 
 * `--older-than <AGE>` — Only agents that ended longer ago than this, e.g. 30m, 24h, 7d
 * `--json` — Print JSON (one object per line) instead of text
+
+
+
+## `argus guide`
+
+Print the instructions argus gives each agent it starts
+
+**Usage:** `argus guide [SECTION]`
+
+###### **Arguments:**
+
+* `<SECTION>` — Only this part
+
+  Possible values:
+  - `core`:
+    What argus is and how to reach it
+  - `labels`:
+    Keeping your title and recap
+  - `coordination`:
+    Working with other agents
+
 
 
 

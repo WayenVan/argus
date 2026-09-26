@@ -227,6 +227,7 @@ pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
                     replay: false,
                     allow_clipboard_replay: false,
                     shared_screen: false,
+                    alt_screen: false,
                 },
             )
         }

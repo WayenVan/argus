@@ -20,7 +20,8 @@ export default function (pi) {
 
   let busy = false; // Between agent_start and the final agent_end.
   const tools = new Map(); // toolCallId -> name, for tools running in parallel.
-  const waiting = new Set(); // toolCallIds waiting on the user: approvals, `ask`.
+  const asking = new Set(); // toolCallIds with an open `ask` dialog.
+  const approvals = new Set(); // toolCallIds with an open tool approval.
   let prompt; // The prompt of the run about to start.
   let reply; // The run's final reply so far, sent with its end.
   let queue = Promise.resolve();
@@ -69,19 +70,21 @@ export default function (pi) {
     return undefined;
   };
 
-  // Parallel tool calls can each wait for approval, one dialog at a time,
-  // while others run, so what to show is worked out from all of them.
+  // Parallel tool calls can each wait for approval, one dialog at a time.
+  // Requests and replies carry their tool-call IDs; activity falls back to
+  // the remaining tool only after all dialogs have closed.
   const report = (ctx) => {
     if (!busy) return;
+    if (asking.size || approvals.size) return;
     const tool = [...tools.values()].pop();
-    if (waiting.size) send("PermissionRequest", ctx);
-    else if (tool) send("PreToolUse", ctx, { tool_name: tool });
+    if (tool) send("PreToolUse", ctx, { tool_name: tool });
     else send("PostToolUse", ctx);
   };
   const reset = () => {
     busy = false;
     tools.clear();
-    waiting.clear();
+    asking.clear();
+    approvals.clear();
   };
 
   // session_start fires once; `/new`, resume and fork switch sessions in place.
@@ -105,20 +108,44 @@ export default function (pi) {
   on("tool_execution_start", (event, ctx) => {
     tools.set(event.toolCallId, event.toolName);
     // `ask` puts a question to the user and waits for the answer.
-    if (event.toolName === "ask") waiting.add(event.toolCallId);
+    if (event.toolName === "ask") {
+      asking.add(event.toolCallId);
+      const question = Array.isArray(event.args?.questions) ? event.args.questions[0] : undefined;
+      send("PermissionRequest", ctx, {
+        request_id: `${event.toolCallId}:ask`,
+        interaction_kind: "question",
+        tool_name: event.toolName,
+        question_text: question?.question,
+        choices: Array.isArray(question?.options) ? question.options.map((option) => option?.label) : [],
+      });
+    }
     report(ctx);
   });
   on("tool_execution_end", (event, ctx) => {
+    if (asking.delete(event.toolCallId)) {
+      send("PermissionReplied", ctx, { request_id: `${event.toolCallId}:ask` });
+    }
+    if (approvals.delete(event.toolCallId)) {
+      send("PermissionReplied", ctx, { request_id: `${event.toolCallId}:approval` });
+    }
     tools.delete(event.toolCallId);
-    waiting.delete(event.toolCallId);
     report(ctx);
   });
   on("tool_approval_requested", (event, ctx) => {
-    waiting.add(event.toolCallId);
+    if (!approvals.has(event.toolCallId)) {
+      approvals.add(event.toolCallId);
+      send("PermissionRequest", ctx, {
+        request_id: `${event.toolCallId}:approval`,
+        interaction_kind: "permission",
+        tool_name: event.toolName ?? tools.get(event.toolCallId),
+      });
+    }
     report(ctx);
   });
   on("tool_approval_resolved", (event, ctx) => {
-    waiting.delete(event.toolCallId);
+    if (approvals.delete(event.toolCallId)) {
+      send("PermissionReplied", ctx, { request_id: `${event.toolCallId}:approval` });
+    }
     report(ctx);
   });
   // omp announces its own retries, compaction and other continuations with

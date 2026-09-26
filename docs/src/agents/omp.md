@@ -14,7 +14,9 @@ omp accepts both options more than once, so your own `-e` and
 argus's extension. No user file is modified.
 
 An agent shows `blocked` while omp waits for a tool approval or for your
-answer to its `ask` tool.
+answer to its `ask` tool. `argus inspect` lists pending requests by tool-call
+ID. For `ask`, it includes the first question and its option labels when omp
+provides them.
 
 ## Known limitations
 

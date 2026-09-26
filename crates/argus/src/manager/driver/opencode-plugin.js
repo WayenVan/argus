@@ -87,14 +87,31 @@ export const ArgusPlugin = async (_input, options) => {
       case "permission.asked":
       case "permission.updated":
       case "question.asked":
-        if (p.sessionID) send("PermissionRequest", root(p.sessionID));
+        if (p.sessionID) {
+          const questions = p.questions ?? [];
+          const choices = questions.flatMap((q) =>
+            (q.options ?? []).map((option) => option.label).filter((label) => typeof label === "string"),
+          );
+          send("PermissionRequest", root(p.sessionID), {
+            request_id: p.requestID ?? p.id,
+            request_session_id: p.sessionID,
+            interaction_kind: event.type === "question.asked" ? "question" : "permission",
+            permission: p.permission,
+            question_text: questions[0]?.question,
+            choices,
+          });
+        }
         return;
       case "permission.replied":
       case "question.replied":
       case "question.rejected": {
         if (!p.sessionID) return;
         const r = root(p.sessionID);
-        if (busy.has(r)) send("PermissionReplied", r, { tool_name: lastTool.get(r) });
+        if (busy.has(r)) send("PermissionReplied", r, {
+          request_id: p.requestID ?? p.id,
+          request_session_id: p.sessionID,
+          tool_name: lastTool.get(r),
+        });
         return;
       }
       case "session.error":

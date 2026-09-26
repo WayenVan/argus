@@ -1,10 +1,10 @@
-//! `argus inspect` and `argus status`: read-only views meant as much for
+//! `argus inspect`, `argus pending`, and `argus status`: read-only views meant as much for
 //! other agents deciding what to do as for people.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use argus_proto::msg::{AgentInfo, Availability, Request, Response, now_secs};
+use argus_proto::msg::{Activity, AgentInfo, Availability, InteractionPhase, Request, Response, now_secs};
 use serde::Serialize;
 
 use crate::client::{self, Conn};
@@ -136,8 +136,79 @@ fn describe(a: &AgentInfo) -> String {
     for (k, v) in &a.labels {
         rows.push(("label", format!("{k}={v}")));
     }
+    for p in &a.pending_interactions {
+        let detail = p.summary.as_deref().unwrap_or(&p.kind);
+        let options = if p.choices.is_empty() { String::new() } else { format!("; options: {}", p.choices.join(", ")) };
+        rows.push(("interaction", format!("{} ({}, id {}){options}", detail, p.phase, p.id)));
+    }
+    if a.pending_interactions.iter().any(|p| p.phase == InteractionPhase::NeedsUser) || a.activity == Activity::Blocked
+    {
+        rows.push((
+            "action",
+            format!("argus attach {} (or argus inspect {} --screen for the exact prompt)", a.id, a.id),
+        ));
+    }
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0) + 1;
     rows.iter().map(|(k, v)| format!("{:<width$} {v}\n", format!("{k}:"), width = width)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// pending
+// ---------------------------------------------------------------------------
+
+pub fn pending(target: Option<String>, json: bool) -> Result<()> {
+    let mut conn = Conn::connect()?;
+    let agents: Vec<AgentInfo> = match target {
+        Some(target) => vec![conn.find(&target)?],
+        None => {
+            let place = Place::new(None, Scope::Under)?;
+            conn.list(true)?.into_iter().filter(|a| a.status.is_live() && place.contains(a) && has_pending(a)).collect()
+        }
+    };
+    if json {
+        output::print(output::AgentList::new(&agents));
+        return Ok(());
+    }
+    if agents.is_empty() {
+        println!("No pending interactions in this directory.");
+        return Ok(());
+    }
+    for agent in &agents {
+        if agent.pending_interactions.is_empty() {
+            if agent.activity == Activity::Blocked {
+                println!("{} ({}): blocked; prompt details unavailable", agent.name, agent.id);
+                println!("  inspect: argus inspect {} --screen", agent.id);
+                println!("  answer:  argus attach {}", agent.id);
+            } else {
+                println!("{} ({}): no pending interactions", agent.name, agent.id);
+            }
+            continue;
+        }
+        println!("{} ({}):", agent.name, agent.id);
+        for p in &agent.pending_interactions {
+            let detail = p.summary.as_deref().unwrap_or(&p.kind);
+            println!("  {}: {} [id {}]", p.phase, one_line(detail), one_line(&p.id));
+            if !p.choices.is_empty() {
+                println!("    options: {}", p.choices.iter().map(|c| one_line(c)).collect::<Vec<_>>().join(", "));
+            }
+        }
+        if agent.pending_interactions.iter().any(|p| p.phase == InteractionPhase::NeedsUser)
+            || agent.activity == Activity::Blocked
+        {
+            println!("  answer: argus attach {}", agent.id);
+        } else if agent.pending_interactions.iter().any(|p| p.phase == InteractionPhase::Observed) {
+            println!("  check: argus inspect {} --screen (request may resolve automatically)", agent.id);
+        }
+    }
+    Ok(())
+}
+
+fn has_pending(agent: &AgentInfo) -> bool {
+    !agent.pending_interactions.is_empty() || agent.activity == Activity::Blocked
+}
+
+fn one_line(text: &str) -> String {
+    printable(text).replace(['\n', '\t'], " ")
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +345,9 @@ pub fn status(opts: StatusOptions) -> Result<()> {
     if !agents.is_empty() {
         println!();
         print!("{}", client::format_table(&agents));
+        if agents.iter().any(|a| a.activity == Activity::Blocked && a.status.is_live()) {
+            println!("Blocked agent: run argus pending <id> for details; argus attach <id> to answer.");
+        }
     }
     Ok(())
 }
@@ -325,6 +399,22 @@ mod tests {
             "created_at": 0, "status": if live { "running" } else { "exited" }, "activity": activity
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn pending_view_includes_reported_requests_and_blocked_fallback() {
+        let mut a = agent("working", true);
+        assert!(!has_pending(&a));
+        a.pending_interactions = serde_json::from_value(serde_json::json!([{
+            "id": "question-1", "kind": "question", "phase": "observed",
+            "session_id": "session-1", "created_at": 1
+        }]))
+        .unwrap();
+        assert!(has_pending(&a));
+        a.pending_interactions.clear();
+        a.activity = Activity::Blocked;
+        assert!(has_pending(&a));
+        assert_eq!(one_line("approve\n\u{1b}[31m yes\tno"), "approve [31m yes no");
     }
 
     #[test]

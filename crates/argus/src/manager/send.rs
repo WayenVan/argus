@@ -135,6 +135,7 @@ mod tests {
             turns: 0,
             attached: 0,
             tmux_locations: Vec::new(),
+            pending_interactions: Vec::new(),
             labels: Default::default(),
         })
     }

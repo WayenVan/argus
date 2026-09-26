@@ -352,6 +352,10 @@ impl Holder {
                 if level == SubscribeLevel::Output {
                     let (rows, cols) = self.size.current;
                     self.conns[i].push(frame::encode_json(&HolderEvent::Resized { rows, cols }));
+                    self.conns[i].push(frame::encode_json(&HolderEvent::ScreenMode {
+                        alternate: self.ring.alternate_at_start(),
+                        input_modes: self.ring.input_modes_at_start(),
+                    }));
                 }
                 if let (SubscribeLevel::Output, Some(offset)) = (level, from_offset) {
                     let (start, bytes) = self.ring.since(offset);

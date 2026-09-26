@@ -15,12 +15,16 @@
 //! it counts as ready only once its cursor has stayed up for `STEADY_CURSOR`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command};
+use super::{
+    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, ScreenCheck, field, hook_command,
+    interaction_request,
+};
 
 pub struct Codex;
 
@@ -90,12 +94,25 @@ impl Driver for Codex {
             },
             "UserPromptSubmit" | "PostToolUse" => Hint::Working,
             "PreToolUse" => Hint::Tool(field(event, "tool_name").unwrap_or("tool").to_string()),
-            "PermissionRequest" => Hint::WaitingApproval,
+            // Codex may route this to its automatic reviewer. This hook
+            // cannot establish that a human approval prompt is visible.
+            "PermissionRequest" => Hint::Ignore,
             "Stop" => Hint::Done,
             // The user interrupted the turn and is presumably about to type.
             "Interrupt" => Hint::Interrupted,
             _ => Hint::Ignore,
         }
+    }
+
+    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
+        (field(event, "hook_event_name") == Some("PermissionRequest")).then(|| InteractionChange::Opened {
+            request: interaction_request(event),
+            // This fires before Codex's reviewer decides whether a person
+            // must answer, and no later hook says it reached one: only the
+            // approval prompt on screen does.
+            confirm_after: None,
+            on_screen: Some(approval_check(event)),
+        })
     }
 
     /// Codex takes Claude's answer: a block with a reason continues the turn
@@ -106,6 +123,109 @@ impl Driver for Codex {
         }
         Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
     }
+}
+
+/// How many of the screen's last non-blank rows the approval prompt is
+/// looked for in. Codex draws it in place of the composer, at the bottom.
+const PROMPT_ROWS: usize = 16;
+/// How much of the requested command must appear on screen. A prefix, since
+/// Codex may shorten a long command.
+const COMMAND_PREFIX: usize = 40;
+
+/// Recognizes Codex's approval prompt for the request in `event`:
+///
+/// ```text
+///   Would you like to run the following command?
+///
+///   $ open -a Calculator
+///
+/// › 1. Yes, proceed (y)
+///   2. Yes, and don't ask again for commands that start with `open -a Calculator` (p)
+///   3. No, and tell Codex what to do differently (esc)
+///
+///   Press enter to confirm or esc to cancel
+/// ```
+///
+/// It checks the prompt's structure rather than its wording, which changes
+/// between Codex versions: a numbered list of choices with one selected, key
+/// hints after the choices, and an enter/esc footer. Two of them are enough,
+/// or one along with the requested command from the hook, which does not
+/// depend on Codex's wording at all.
+fn approval_check(event: &Value) -> ScreenCheck {
+    let command = event
+        .get("tool_input")
+        .and_then(|input| input.get("command"))
+        .and_then(Value::as_str)
+        .and_then(|c| c.lines().map(str::trim).find(|l| !l.is_empty()))
+        .map(|line| squeeze(line).chars().take(COMMAND_PREFIX).collect::<String>())
+        .filter(|c| c.chars().count() >= 3);
+    Arc::new(move |screen| shows_approval(screen, command.as_deref()))
+}
+
+fn shows_approval(screen: &vt100::Screen, command: Option<&str>) -> bool {
+    let (_, cols) = screen.size();
+    let mut rows: Vec<String> = screen.rows(0, cols).collect();
+    while rows.last().is_some_and(|r| r.trim().is_empty()) {
+        rows.pop();
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).filter(|r| !r.trim().is_empty()).collect();
+    let rows = &rows[rows.len().saturating_sub(PROMPT_ROWS)..];
+
+    let choices = choice_rows(rows);
+    let listed = choices.len() >= 2 && choices.iter().any(|&(_, selected)| selected);
+    let hinted = choices.iter().filter(|&&(i, _)| ends_with_key_hint(rows[i])).count() >= 2;
+    let footer = choices.last().is_some_and(|&(last, _)| {
+        rows[last + 1..].iter().any(|r| {
+            let r = r.to_lowercase();
+            r.contains("enter") && r.contains("esc")
+        })
+    });
+    let structure = [listed, hinted, footer].iter().filter(|&&f| f).count();
+    let shows_command = command.is_some_and(|c| squeeze(&rows.concat()).contains(c));
+    structure >= 2 || (structure >= 1 && shows_command)
+}
+
+/// The longest run of rows numbered `1.`, `2.`, … in order, as (row index,
+/// whether Codex marks it selected with `›`). Rows between numbered ones,
+/// such as a wrapped choice, do not break the run.
+fn choice_rows(rows: &[&str]) -> Vec<(usize, bool)> {
+    let mut best = Vec::new();
+    let mut run: Vec<(usize, bool)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut text = row.trim_start();
+        let selected = text.starts_with('›');
+        if selected {
+            text = text['›'.len_utf8()..].trim_start();
+        }
+        let digits = text.chars().take_while(char::is_ascii_digit).count();
+        let Some(n) = text[..digits].parse::<usize>().ok().filter(|_| text[digits..].starts_with(". ")) else {
+            continue;
+        };
+        if n == 1 {
+            run.clear();
+        } else if n != run.len() + 1 {
+            continue;
+        }
+        run.push((i, selected));
+        if run.len() > best.len() {
+            best = run.clone();
+        }
+    }
+    best
+}
+
+/// Whether a row ends with a short key hint such as `(y)` or `(esc)`.
+fn ends_with_key_hint(row: &str) -> bool {
+    let row = row.trim_end();
+    let Some(inner) = row.strip_suffix(')').and_then(|r| r.rsplit_once('(')).map(|(_, k)| k) else {
+        return false;
+    };
+    (1..=5).contains(&inner.len()) && inner.chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// `s` without whitespace, so text matches however the terminal wrapped it.
+fn squeeze(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// `-c hooks.<Event>=[…]` pairs. Frozen: see the module docs. The timeout is
@@ -180,9 +300,94 @@ mod tests {
         let hint = |v: Value| Codex.interpret(&v);
         assert_eq!(hint(json!({"hook_event_name":"UserPromptSubmit"})), Hint::Working);
         assert_eq!(hint(json!({"hook_event_name":"PreToolUse","tool_name":"shell"})), Hint::Tool("shell".into()));
-        assert_eq!(hint(json!({"hook_event_name":"PermissionRequest"})), Hint::WaitingApproval);
+        assert_eq!(hint(json!({"hook_event_name":"PermissionRequest"})), Hint::Ignore);
         assert_eq!(hint(json!({"hook_event_name":"Stop"})), Hint::Done);
         assert_eq!(hint(json!({"hook_event_name":"Interrupt"})), Hint::Interrupted);
+    }
+
+    fn screen(text: &str) -> vt100::Screen {
+        let mut parser = vt100::Parser::new(30, 100, 0);
+        parser.process(text.replace('\n', "\r\n").as_bytes());
+        parser.screen().clone()
+    }
+
+    fn check(event: Value, text: &str) -> bool {
+        approval_check(&event)(&screen(text))
+    }
+
+    fn request(command: &str) -> Value {
+        json!({"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":command}})
+    }
+
+    /// Captured from Codex 0.157.0.
+    const APPROVAL: &str = "\
+• Running open -a Calculator
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: 你要批准打开“计算器”来测试审批窗口吗？
+
+  $ open -a Calculator
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `open -a Calculator` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+";
+
+    #[test]
+    fn recognizes_the_approval_prompt() {
+        assert!(check(request("open -a Calculator"), APPROVAL));
+        // Without the command, the structure alone is enough.
+        assert!(check(json!({"hook_event_name":"PermissionRequest"}), APPROVAL));
+    }
+
+    #[test]
+    fn a_reworded_prompt_still_matches_with_the_command() {
+        let text = "\
+  $ cargo test --workspace
+
+› 1. Oui
+  2. Non
+
+";
+        assert!(check(request("cargo test --workspace"), text));
+        assert!(!check(request("rm -rf build"), text));
+    }
+
+    #[test]
+    fn a_wrapped_command_still_matches() {
+        let long = format!("echo {}", "x".repeat(120));
+        let text = format!("  $ {}\n    {}\n\n› 1. Yes\n  2. No\n", &long[..8], &long[8..]);
+        assert!(check(request(&long), &text));
+    }
+
+    #[test]
+    fn a_working_screen_does_not_match() {
+        let text = "\
+• Running open -a Calculator
+
+  Steps:
+  1. Open it
+  2. Check it
+
+◦ Working (4s • esc to interrupt)
+
+› Ask Codex to do anything
+";
+        assert!(!check(request("open -a Calculator"), text));
+    }
+
+    #[test]
+    fn only_the_bottom_of_the_screen_counts() {
+        let filler = "  output\n".repeat(PROMPT_ROWS);
+        let text = format!("{APPROVAL}{filler}› Ask Codex to do anything\n");
+        assert!(!check(request("open -a Calculator"), &text));
     }
 
     #[test]

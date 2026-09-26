@@ -62,6 +62,9 @@ pub struct Options {
     /// the TUI. Kept for an agent on its alternate screen, so the normal
     /// screen does not flash by; left for one on the normal screen.
     pub shared_screen: bool,
+    /// Override an incomplete manager screen reconstruction (for example,
+    /// after its restart lost an old holder's alternate-screen entry).
+    pub alt_screen: bool,
 }
 
 pub struct Target {
@@ -93,7 +96,11 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
     }
     let profile = term::profile();
     let (rows, cols) = crate::client::terminal_size();
-    let restore = target.id.and_then(fetch_screen);
+    let restore = if opts.alt_screen {
+        None
+    } else {
+        target.id.and_then(|id| fetch_screen(id, opts.shared_screen, (rows, cols)))
+    };
 
     let mut stream = UnixStream::connect(&target.socket)
         .with_context(|| format!("{} is not reachable (has it exited?)", target.name))?;
@@ -121,7 +128,7 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
         }),
     )?;
 
-    let screen = screen_for(restore.as_ref().map(|r| r.mode));
+    let screen = if opts.alt_screen { Screen::Alternate } else { screen_for(restore.as_ref().map(|r| r.mode)) };
     let ending = {
         let _raw = term::RawMode::enter()?;
         let _display = DisplaySession::enter(screen, opts.shared_screen);
@@ -129,7 +136,10 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
             // Only worth drawing if it is a real redraw of the size we are
             // about to show it at; otherwise the holder will resize the PTY
             // for real and the agent redraws itself for the new dimensions.
-            Some(r) if r.mode == ScreenMode::Snapshot && (r.rows, r.cols) == (rows, cols) => {
+            Some(r)
+                if matches!(r.mode, ScreenMode::Snapshot | ScreenMode::PrimarySnapshot)
+                    && (r.rows, r.cols) == (rows, cols) =>
+            {
                 print_raw_bytes(snapshot_body(&r.bytes))
             }
             _ => print_raw(CLEAR),
@@ -156,9 +166,17 @@ struct Restore {
 /// Asks the manager for a screen to restore `id` with. `None` if the manager
 /// is unreachable or the reply is not a screen; either way `attach` falls
 /// back to the first-stage clear-and-resize dance.
-fn fetch_screen(id: u64) -> Option<Restore> {
+fn fetch_screen(id: u64, current: bool, size: (u16, u16)) -> Option<Restore> {
     let mut conn = Conn::open(false).ok().flatten()?;
-    match conn.request(&Request::Screen { target: id.to_string(), since_offset: None }).ok()? {
+    let request = |current| Request::Screen { target: id.to_string(), since_offset: None, current };
+    let mut response = conn.request(&request(current)).ok()?;
+    // A primary snapshot at a different size cannot be rendered accurately.
+    // Fall back to the existing replay path, which also preserves history.
+    if matches!(&response, Response::Screen { mode: ScreenMode::PrimarySnapshot, rows, cols, .. } if (*rows, *cols) != size)
+    {
+        response = conn.request(&request(false)).ok()?;
+    }
+    match response {
         Response::Screen { mode, rows, cols, offset, bytes } => Some(Restore { mode, rows, cols, offset, bytes }),
         _ => None,
     }
@@ -434,7 +452,7 @@ enum Screen {
 fn screen_for(mode: Option<ScreenMode>) -> Screen {
     match mode {
         Some(ScreenMode::Snapshot) => Screen::Alternate,
-        Some(ScreenMode::Replay | ScreenMode::Unavailable) | None => Screen::Normal,
+        Some(ScreenMode::PrimarySnapshot | ScreenMode::Replay | ScreenMode::Unavailable) | None => Screen::Normal,
     }
 }
 
@@ -543,6 +561,7 @@ mod tests {
     #[test]
     fn only_an_alternate_screen_agent_gets_one() {
         assert_eq!(screen_for(Some(ScreenMode::Snapshot)), Screen::Alternate);
+        assert_eq!(screen_for(Some(ScreenMode::PrimarySnapshot)), Screen::Normal);
         assert_eq!(screen_for(Some(ScreenMode::Replay)), Screen::Normal);
         assert_eq!(screen_for(Some(ScreenMode::Unavailable)), Screen::Normal);
         assert_eq!(screen_for(None), Screen::Normal);

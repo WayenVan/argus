@@ -99,8 +99,11 @@ export default function (pi) {
   });
   // A dialog from some extension that waits on the user. Only one opened
   // mid-run blocks the agent; one opened at the prompt (a command) does not.
-  on("ui_prompt_start", (_event, ctx) => {
-    if (busy) send("PermissionRequest", ctx);
+  on("ui_prompt_start", (event, ctx) => {
+    if (busy) send("PermissionRequest", ctx, {
+      interaction_kind: event.kind ?? "dialog",
+      question_text: event.title,
+    });
   });
   on("ui_prompt_end", (_event, ctx) => {
     if (busy) send("PermissionReplied", ctx, { tool_name: [...tools.values()].pop() });

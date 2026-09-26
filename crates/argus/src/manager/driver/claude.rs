@@ -8,9 +8,12 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use argus_proto::msg::InteractionPhase;
 use serde_json::{Value, json};
 
-use super::{Context, Driver, Hint, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command};
+use super::{
+    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command, interaction_request,
+};
 
 pub struct Claude;
 
@@ -80,7 +83,9 @@ impl Driver for Claude {
             },
             "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" => Hint::Working,
             "PreToolUse" => Hint::Tool(field(event, "tool_name").unwrap_or("tool").to_string()),
-            "PermissionRequest" => Hint::WaitingApproval,
+            // Other permission hooks (or auto mode) may answer this without a
+            // person. The later permission_prompt notification confirms wait.
+            "PermissionRequest" => Hint::Ignore,
             "Notification" => match field(event, "notification_type") {
                 Some("permission_prompt") => Hint::WaitingApproval,
                 Some("idle_prompt" | "agent_needs_input") => Hint::WaitingInput,
@@ -89,6 +94,26 @@ impl Driver for Claude {
             "Stop" => Hint::Done,
             "StopFailure" => Hint::Error,
             _ => Hint::Ignore,
+        }
+    }
+
+    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
+        if event.get("agent_id").is_some() {
+            return None;
+        }
+        match field(event, "hook_event_name") {
+            Some("PermissionRequest") => Some(InteractionChange::Opened {
+                request: interaction_request(event),
+                confirm_after: None,
+                on_screen: None,
+            }),
+            Some("Notification") if field(event, "notification_type") == Some("permission_prompt") => {
+                let mut fallback = interaction_request(event);
+                fallback.id = format!("{}:permission_prompt", fallback.session_id);
+                fallback.phase = InteractionPhase::NeedsUser;
+                Some(InteractionChange::NeedsUser { fallback })
+            }
+            _ => None,
         }
     }
 

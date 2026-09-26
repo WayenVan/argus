@@ -92,6 +92,13 @@ enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// Show pending interaction prompts for an agent or agents in this directory
+    Pending {
+        /// ID, name, or `self`; omitted lists agents in the current directory and below
+        target: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Agents working in a directory, and whether they are all free.
     /// Leaves out the agent running this command
     Status {
@@ -262,6 +269,9 @@ enum Command {
         /// Allow historical OSC 52 sequences to overwrite the clipboard
         #[arg(long, requires = "replay")]
         allow_clipboard_replay: bool,
+        /// Force an alternate-screen redraw if a restarted manager lost its state
+        #[arg(long, conflicts_with_all = ["replay", "ro"])]
+        alt_screen: bool,
     },
     /// Stop an agent (SIGTERM, then SIGKILL after 5s)
     Kill {
@@ -289,6 +299,12 @@ enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// Print the instructions argus gives each agent it starts
+    Guide {
+        /// Only this part
+        #[arg(value_enum)]
+        section: Option<GuideSection>,
+    },
     /// Manage the manager process
     Manager {
         #[command(subcommand)]
@@ -309,6 +325,16 @@ enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GuideSection {
+    /// What argus is and how to reach it
+    Core,
+    /// Keeping your title and recap
+    Labels,
+    /// Working with other agents
+    Coordination,
 }
 
 /// One subcommand per agent that needs a lasting change argus will not make
@@ -381,6 +407,7 @@ impl Command {
             Command::Run { output, .. }
             | Command::Ps { output, .. }
             | Command::Inspect { output, .. }
+            | Command::Pending { output, .. }
             | Command::Status { output, .. }
             | Command::Send { output, .. }
             | Command::Rename { output, .. }
@@ -405,6 +432,7 @@ impl Command {
             | Command::Grid { .. }
             | Command::Tree { .. }
             | Command::Logs { .. }
+            | Command::Guide { .. }
             | Command::Manager { action: ManagerAction::Run } => None,
         }
     }
@@ -424,6 +452,7 @@ impl Command {
             | Command::Ack { target, .. }
             | Command::Kill { target, .. }
             | Command::Rm { target, .. } => vec![target],
+            Command::Pending { target, .. } => target.iter_mut().collect(),
             Command::Wait { targets, .. } => targets.iter_mut().collect(),
             Command::Run { .. }
             | Command::Ps { .. }
@@ -433,6 +462,7 @@ impl Command {
             | Command::Events { .. }
             | Command::Prune { .. }
             | Command::Setup { .. }
+            | Command::Guide { .. }
             | Command::Manager { .. } => vec![],
         }
     }
@@ -451,14 +481,15 @@ fn main() -> ExitCode {
             program,
             args,
         ),
-        Command::Attach { target, ro, steal, replay, allow_clipboard_replay } => client::attach(
+        Command::Attach { target, ro, steal, replay, allow_clipboard_replay, alt_screen } => client::attach(
             target,
-            attach::Options { readonly: ro, steal, replay, allow_clipboard_replay, shared_screen: false },
+            attach::Options { readonly: ro, steal, replay, allow_clipboard_replay, shared_screen: false, alt_screen },
         ),
         Command::Ps { prefix, all, label, watch, output } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json: output.json, watch })
         }
         Command::Inspect { target, screen, last, output } => query::inspect(target, screen, last, output.json),
+        Command::Pending { target, output } => query::pending(target, output.json),
         Command::Status { path, scope, all, include_self, label, output } => {
             query::status(query::StatusOptions { path, scope, all, include_self, labels: label, json: output.json })
         }
@@ -490,6 +521,18 @@ fn main() -> ExitCode {
         Command::Kill { target, signal, output } => client::kill(target, signal, output.json),
         Command::Rm { target, output } => client::rm(target, output.json),
         Command::Prune { prefix, older_than, output } => client::prune(prefix, older_than, output.json),
+        Command::Guide { section } => {
+            print!(
+                "{}",
+                match section {
+                    None => manager::driver::SELF_LABEL_INSTRUCTIONS,
+                    Some(GuideSection::Core) => include_str!("instructions/core.md"),
+                    Some(GuideSection::Labels) => include_str!("instructions/labels.md"),
+                    Some(GuideSection::Coordination) => include_str!("instructions/coordination.md"),
+                }
+            );
+            Ok(())
+        }
         Command::Manager { action } => match action {
             ManagerAction::Start { output } => client::manager_start(output.json),
             ManagerAction::Stop { kill_agents, output } => client::manager_stop(kill_agents, output.json),
@@ -527,7 +570,7 @@ mod tests {
 
     /// Commands that print nothing a script would parse: interactive or
     /// raw byte streams.
-    const NO_JSON: &[&str] = &["attach", "grid", "tree", "logs", "manager run"];
+    const NO_JSON: &[&str] = &["attach", "grid", "tree", "logs", "guide", "manager run"];
 
     fn leaf_commands(cmd: &clap::Command, path: &str, out: &mut Vec<(String, clap::Command)>) {
         for sub in cmd.get_subcommands() {

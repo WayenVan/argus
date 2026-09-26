@@ -4,9 +4,9 @@
 //!
 //! Only the current visible screen is tracked (no vt100 scrollback): once an
 //! agent has entered the alternate screen, replaying its history is neither
-//! possible (alt screen has none) nor useful. Before that, recovering
-//! earlier output means replaying the holder's own ring buffer instead of a
-//! synthetic redraw — see [`ScreenMode::Replay`].
+//! possible (alt screen has none) nor useful. On the primary screen a normal
+//! attach replays the holder's ring buffer for scrollback, while a dashboard
+//! attach can restore just the current screen and its output offset.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -110,15 +110,28 @@ impl Screens {
 
     /// Breaks when the state is poisoned, so the tracker starts over.
     fn on_event(&self, id: u64, event: HolderEvent) -> ControlFlow<()> {
-        let HolderEvent::Resized { rows, cols } = event else { return ControlFlow::Continue(()) };
-        match self.state(id) {
-            Some(state) => lock(&state)?.parser.screen_mut().set_size(rows, cols),
-            // The holder pushes the current size right after a subscribe
-            // succeeds, so this is always the first event for a fresh state.
-            None => {
-                let state = State { parser: vt100::Parser::new(rows, cols, 0), offset: 0 };
-                self.states.lock().unwrap().insert(id, Arc::new(Mutex::new(state)));
+        match event {
+            HolderEvent::Resized { rows, cols } => match self.state(id) {
+                Some(state) => lock(&state)?.parser.screen_mut().set_size(rows, cols),
+                // The holder pushes the current size right after a subscribe
+                // succeeds, so this is always the first event for a fresh state.
+                None => {
+                    let state = State { parser: vt100::Parser::new(rows, cols, 0), offset: 0 };
+                    self.states.lock().unwrap().insert(id, Arc::new(Mutex::new(state)));
+                }
+            },
+            HolderEvent::ScreenMode { alternate, input_modes } => {
+                if let Some(state) = self.state(id) {
+                    let mut state = lock(&state)?;
+                    if alternate {
+                        state.parser.process(b"\x1b[?1049h");
+                    }
+                    for mode in input_modes {
+                        state.parser.process(format!("\x1b[?{mode}h").as_bytes());
+                    }
+                }
             }
+            HolderEvent::Attached { .. } | HolderEvent::Input => {}
         }
         ControlFlow::Continue(())
     }
@@ -137,7 +150,17 @@ impl Screens {
     /// How `id`'s screen should be restored. `since_offset` lets a caller
     /// that already has the screen at that offset skip the bytes.
     pub fn get(&self, id: u64, since_offset: Option<u64>) -> ScreenReply {
-        self.read(id, |state| snapshot(state, since_offset)).unwrap_or(ScreenReply {
+        self.get_with_mode(id, since_offset, false)
+    }
+
+    /// A TUI attach needs the current primary screen, not a replay of up to
+    /// 1 MiB of history. The snapshot and output offset come from one lock.
+    pub fn get_current(&self, id: u64, since_offset: Option<u64>) -> ScreenReply {
+        self.get_with_mode(id, since_offset, true)
+    }
+
+    fn get_with_mode(&self, id: u64, since_offset: Option<u64>, current: bool) -> ScreenReply {
+        self.read(id, |state| snapshot(state, since_offset, current)).unwrap_or(ScreenReply {
             mode: ScreenMode::Unavailable,
             rows: 0,
             cols: 0,
@@ -162,14 +185,20 @@ impl Screens {
         })
     }
 
+    /// Runs `f` on `id`'s current screen; `None` when nothing is tracked
+    /// for it yet.
+    pub fn inspect<R>(&self, id: u64, f: impl FnOnce(&vt100::Screen) -> R) -> Option<R> {
+        self.read(id, |state| f(state.parser.screen()))
+    }
+
     /// Whether `id` has turned on bracketed paste; `None` when nothing is
     /// tracked for it yet.
     pub fn bracketed_paste(&self, id: u64) -> Option<bool> {
         self.read(id, |state| state.parser.screen().bracketed_paste())
     }
 
-    /// A styled crop of `id`'s screen to `rows`x`cols`, left-aligned from its
-    /// top-left corner. Empty when nothing is tracked for it yet.
+    /// A styled crop of the most recent visible part of `id`'s screen to
+    /// `rows`x`cols`. Empty when nothing is tracked for it yet.
     pub fn preview(&self, id: u64, rows: u16, cols: u16) -> Vec<PreviewLine> {
         self.read(id, |state| preview(state, rows, cols)).unwrap_or_default()
     }
@@ -183,10 +212,22 @@ fn lock(state: &Mutex<State>) -> ControlFlow<(), MutexGuard<'_, State>> {
     }
 }
 
-fn snapshot(state: &State, since_offset: Option<u64>) -> ScreenReply {
+fn snapshot(state: &State, since_offset: Option<u64>, current: bool) -> ScreenReply {
     let screen = state.parser.screen();
     let (rows, cols) = screen.size();
     if !screen.alternate_screen() {
+        if current {
+            let bytes = if since_offset == Some(state.offset) {
+                vec![]
+            } else {
+                let mut bytes = screen.state_formatted();
+                append_styled_blanks(screen, &mut bytes);
+                bytes.extend(screen.cursor_state_formatted());
+                bytes.extend(screen.attributes_formatted());
+                bytes
+            };
+            return ScreenReply { mode: ScreenMode::PrimarySnapshot, rows, cols, offset: state.offset, bytes };
+        }
         // 0 tells the holder to replay from its oldest retained byte:
         // there is no screen-owned history to fall back on instead.
         return ScreenReply { mode: ScreenMode::Replay, rows, cols, offset: 0, bytes: vec![] };
@@ -213,9 +254,28 @@ fn snapshot(state: &State, since_offset: Option<u64>) -> ScreenReply {
 fn preview(state: &State, rows: u16, cols: u16) -> Vec<PreviewLine> {
     let screen = state.parser.screen();
     let (screen_rows, screen_cols) = screen.size();
-    let rows = rows.min(screen_rows);
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
     let cols = cols.min(screen_cols);
-    (0..rows)
+    // Full-screen applications own the whole alternate screen. For ordinary
+    // streaming output, follow the cursor and the last written row instead
+    // of cropping a mostly empty lower half of a newly started screen.
+    let bottom = if screen.alternate_screen() {
+        screen_rows
+    } else {
+        let last_content = (0..screen_rows)
+            .rev()
+            .find(|&row| {
+                (0..screen_cols).any(|col| {
+                    screen.cell(row, col).is_some_and(|cell| cell.has_contents() && !cell.contents().trim().is_empty())
+                })
+            })
+            .map_or(0, |row| row + 1);
+        (screen.cursor_position().0 + 1).max(last_content).min(screen_rows)
+    };
+    let start = bottom.saturating_sub(rows);
+    (start..bottom)
         .map(|row| {
             let mut spans: PreviewLine = Vec::new();
             for col in 0..cols {
@@ -437,6 +497,70 @@ mod tests {
         // from wherever the manager's own tracking happens to be.
         assert_eq!(r.offset, 0);
         assert!(r.bytes.is_empty());
+    }
+
+    #[test]
+    fn holder_mode_restores_alternate_screen_after_ring_truncation() {
+        let s = screens();
+        resize(&s, 1, 5, 20);
+        assert!(
+            s.on_event(1, HolderEvent::ScreenMode { alternate: true, input_modes: vec![1000, 1006] }).is_continue()
+        );
+        feed(&s, 1, 1_000_000, b"redrawn");
+        assert_eq!(s.get(1, None).mode, ScreenMode::Snapshot);
+    }
+
+    #[test]
+    fn current_primary_snapshot_skips_history_and_keeps_its_offset() {
+        let s = screens();
+        resize(&s, 1, 5, 20);
+        let output = b"first\r\nsecond\r\nthird";
+        feed(&s, 1, 0, output);
+
+        let r = s.get_current(1, None);
+        assert_eq!(r.mode, ScreenMode::PrimarySnapshot);
+        assert_eq!(r.offset, output.len() as u64);
+        assert!(!r.bytes.starts_with(b"\x1b[?1049h"));
+        let mut restored = vt100::Parser::new(5, 20, 0);
+        restored.process(&r.bytes);
+        assert!(restored.screen().contents().contains("third"));
+        assert!(s.get_current(1, Some(r.offset)).bytes.is_empty());
+        assert_eq!(s.get(1, None).mode, ScreenMode::Replay);
+
+        let history = (0..1000).map(|n| format!("line-{n:04}\r\n")).collect::<String>();
+        feed(&s, 1, r.offset, history.as_bytes());
+        let recent = s.get_current(1, None);
+        assert_eq!(recent.offset, r.offset + history.len() as u64);
+        assert!(recent.bytes.len() < history.len() / 2, "current screen should stay bounded despite long history");
+    }
+
+    #[test]
+    fn preview_follows_recent_rows_without_losing_short_output() {
+        let s = screens();
+        resize(&s, 1, 5, 20);
+        feed(&s, 1, 0, b"one\r\ntwo");
+        let text = |lines: Vec<PreviewLine>| {
+            lines
+                .into_iter()
+                .map(|line| line.into_iter().map(|span| span.text).collect::<String>().trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(s.preview(1, 2, 20)), ["one", "two"]);
+
+        feed(&s, 1, 8, b"\r\nthree\r\nfour\r\nfive");
+        assert_eq!(text(s.preview(1, 2, 20)), ["four", "five"]);
+    }
+
+    #[test]
+    fn alternate_screen_preview_uses_its_bottom_rows() {
+        let s = screens();
+        resize(&s, 1, 5, 20);
+        feed(&s, 1, 0, b"\x1b[?1049hTOP\x1b[5;1HBOTTOM");
+        let lines = s.preview(1, 2, 20);
+        assert_eq!(lines.len(), 2);
+        let last = lines[1].iter().map(|span| span.text.as_str()).collect::<String>();
+        assert!(last.starts_with("BOTTOM"));
+        assert!(!lines.iter().flatten().any(|span| span.text.contains("TOP")));
     }
 
     #[test]

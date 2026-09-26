@@ -1,7 +1,7 @@
 //! Drivers: how argus treats each kind of agent.
 //!
 //! A driver adjusts the launch command (e.g. to register hooks) and turns the
-//! agent's hook events into a [`Hint`]. Drivers hold no state: there is one
+//! agent's hook events into a [`DriverReport`]. Drivers hold no state: there is one
 //! instance per kind, shared by every agent of that kind. What a hint does to
 //! an agent's activity is decided by the common state machine in
 //! `activity.rs`, which is the same for every kind.
@@ -14,10 +14,12 @@ mod opencode;
 mod pi;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use argus_proto::msg::Activity;
+use argus_proto::msg::{Activity, InteractionPhase, PendingInteraction};
+use argus_proto::text;
 use serde_json::Value;
 
 /// What a hook event means, independent of which agent sent it.
@@ -38,6 +40,37 @@ pub enum Hint {
     /// Not relevant to the main agent's activity.
     Ignore,
 }
+
+/// One translated hook event. Only drivers inspect provider-specific JSON;
+/// the manager consumes this value and updates its shared state machine.
+pub struct DriverReport {
+    pub hint: Hint,
+    pub interaction: Option<InteractionChange>,
+}
+
+/// Lifecycle of a request that may need an answer from a person.
+pub enum InteractionChange {
+    /// `confirm_after` and `on_screen` promote the request to `needs_user`
+    /// once it is still `observed` after the delay, or once the agent's
+    /// screen shows it to a person.
+    Opened {
+        request: PendingInteraction,
+        confirm_after: Option<Duration>,
+        on_screen: Option<ScreenCheck>,
+    },
+    NeedsUser {
+        fallback: PendingInteraction,
+    },
+    Closed {
+        id: Option<String>,
+        session_id: Option<String>,
+    },
+}
+
+/// Whether the agent's screen shows a request to a person. Only consulted
+/// while the request a hook reported is still `observed`, so it confirms that
+/// request rather than discovering one.
+pub type ScreenCheck = Arc<dyn Fn(&vt100::Screen) -> bool + Send + Sync>;
 
 /// The command a holder will execute, as a driver may rewrite it.
 pub struct Launch {
@@ -84,6 +117,15 @@ pub trait Driver: Send + Sync {
     /// Interprets one hook event.
     fn interpret(&self, event: &Value) -> Hint;
 
+    /// Provider-specific interaction information from the same hook event.
+    fn interaction(&self, _event: &Value) -> Option<InteractionChange> {
+        None
+    }
+
+    fn translate(&self, event: &Value) -> DriverReport {
+        DriverReport { hint: self.interpret(event), interaction: self.interaction(event) }
+    }
+
     /// What the hook prints to keep the agent going after `event`, a turn's
     /// end, with `reason` as its next input. `None` when this agent cannot be
     /// held, and the turn ends as usual.
@@ -126,8 +168,9 @@ pub fn install_shared_files(ctx: &Context) -> Result<()> {
 /// the design doc's `argus tui` recap section for why this replaced both the
 /// hook-derived-summary and Claude-session-title approaches to recap.
 /// Coordination is injected whole rather than behind a command the agent must
-/// remember to run: agents do not reliably follow such pointers.
-pub(super) const SELF_LABEL_INSTRUCTIONS: &str = concat!(
+/// remember to run: agents do not reliably follow such pointers. `argus
+/// guide` prints the same text, for sessions it never reached.
+pub(crate) const SELF_LABEL_INSTRUCTIONS: &str = concat!(
     include_str!("../../instructions/core.md"),
     "\n",
     include_str!("../../instructions/labels.md"),
@@ -168,9 +211,66 @@ fn plugin_hint(event: &Value, version: u64) -> Hint {
     }
 }
 
+/// Common interaction translation for argus's in-process plugins. Pi and
+/// OMP report a visible prompt immediately; OpenCode gets a short grace
+/// period for requests that resolve without a person.
+fn plugin_interaction(event: &Value, version: u64, confirm_after: Option<Duration>) -> Option<InteractionChange> {
+    if event.get("v").and_then(Value::as_u64) != Some(version) {
+        return None;
+    }
+    match field(event, "hook_event_name") {
+        Some("PermissionRequest") => {
+            let mut request = interaction_request(event);
+            if confirm_after.is_none() {
+                request.phase = InteractionPhase::NeedsUser;
+            }
+            Some(InteractionChange::Opened { request, confirm_after, on_screen: None })
+        }
+        Some("PermissionReplied") => Some(InteractionChange::Closed {
+            id: field(event, "request_id").map(str::to_string),
+            session_id: field(event, "request_session_id").map(str::to_string),
+        }),
+        _ => None,
+    }
+}
+
 /// Reads a string field of a hook event.
 fn field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(Value::as_str)
+}
+
+/// The common fields forwarded by native hooks or argus's OpenCode plugin.
+fn interaction_request(event: &Value) -> PendingInteraction {
+    let session = field(event, "request_session_id").or_else(|| field(event, "session_id")).unwrap_or_default();
+    let kind = field(event, "interaction_kind").unwrap_or("permission");
+    let tool = field(event, "tool_name").unwrap_or_default();
+    let id = field(event, "request_id")
+        .or_else(|| field(event, "tool_use_id"))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{session}:{kind}:{tool}"));
+    let summary = field(event, "question_text")
+        .or_else(|| field(event, "permission"))
+        .or_else(|| field(event, "tool_name"))
+        .map(|s| text::clip(s.chars().take(120).collect::<String>()));
+    let choices = event
+        .get("choices")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().filter_map(Value::as_str).take(12).map(|s| s.chars().take(80).collect::<String>()).collect()
+        })
+        .unwrap_or_default();
+    let created_at =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    PendingInteraction {
+        id,
+        kind: kind.into(),
+        phase: InteractionPhase::Observed,
+        session_id: session.into(),
+        summary,
+        choices,
+        created_at,
+    }
 }
 
 #[cfg(test)]

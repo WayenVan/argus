@@ -10,7 +10,7 @@ use std::fs;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-use super::{Context, Driver, Hint, Launch, pi, plugin_hint};
+use super::{Context, Driver, Hint, InteractionChange, Launch, pi, plugin_hint, plugin_interaction};
 
 pub struct Omp;
 
@@ -39,6 +39,10 @@ impl Driver for Omp {
 
     fn interpret(&self, event: &Value) -> Hint {
         plugin_hint(event, EVENT_VERSION)
+    }
+
+    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
+        plugin_interaction(event, EVENT_VERSION, None)
     }
 }
 

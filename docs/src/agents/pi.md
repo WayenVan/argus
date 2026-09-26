@@ -18,6 +18,9 @@ argus's extension. No user file is modified.
 **`blocked` is rare.**
 pi does not ask before running tools. An agent shows `blocked` only while a
 dialog from an extension waits for you during a turn.
+`argus inspect` also shows a pending interaction with the dialog kind and
+title when pi provides them. Pi's prompt events do not include option labels;
+use `argus inspect <agent> --screen` to read those.
 
 **Package commands are not tracked.**
 `pi install`, `pi list` and the other package commands run without argus's
