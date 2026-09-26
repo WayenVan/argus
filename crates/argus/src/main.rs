@@ -7,6 +7,7 @@ mod attach;
 mod client;
 mod errors;
 mod manager;
+mod modes;
 mod naming;
 mod output;
 mod query;

@@ -10,6 +10,7 @@ argus-proto = { workspace = true, features = ["tokio"] }
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+memchr.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -92,6 +92,7 @@ dependencies = [
  "clap-markdown",
  "crossterm",
  "libc",
+ "memchr",
  "nix",
  "ratatui",
  "serde",

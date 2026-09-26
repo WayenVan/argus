@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Detaching from Codex no longer leaves the kitty keyboard protocol on in the
+  shell, which showed zsh's `execute:` prompt and raw `CSI … u` sequences.
+  Attach now tracks the terminal modes the agent's output turns on (every
+  DECSET mode, kitty keyboard stacks per screen, XTMODKEYS, OSC colours,
+  keypad mode, scroll region) and undoes exactly those on the way out,
+  instead of resetting a fixed list.
+
 ## [0.2.0] - 2026-09-26
 
 ### Added

@@ -24,6 +24,7 @@ use signal_hook::SigId;
 use signal_hook::consts::SIGWINCH;
 
 use crate::client::Conn;
+use crate::modes::{ModeTracker, Screen};
 use crate::term;
 
 /// Ctrl-\ (FS). In raw mode it arrives as a byte instead of SIGQUIT, unless
@@ -43,15 +44,20 @@ const NORMAL_SCREEN_LEAVE: &str = "\x1b[?1047l\x1b[999B\r\n";
 const FOCUS_REPORTS: &str = "\x1b[?1004h";
 /// Home + clear, for when there is no screen restore to draw instead.
 const CLEAR: &str = "\x1b[H\x1b[2J";
-/// Leaves the agent's terminal modes behind: synchronized-output hold
-/// (released first, so the rest of this actually reaches the screen instead
-/// of sitting in a buffered frame until the terminal's own timeout), kitty
-/// keyboard flags (popped before leaving the alternate screen, which has its
-/// own stack), modifyOtherKeys, focus reporting, alternate screen, mouse
-/// modes, bracketed paste, colour scheme reports, hidden cursor, cursor
-/// colour, colours. The cursor shape is restored separately, to what it was
-/// before argus started: see [`term::Profile::cursor_shape`].
-const RESET: &str = "\x1b[?2026l\x1b[<u\x1b[>4m\x1b[?2031l\x1b[?1004l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b]112\x07\x1b[0m";
+/// What argus itself turns on or leaves behind, reset after the agent's own
+/// modes (see [`ModeTracker`]): the synchronized-output hold goes first, so the
+/// rest actually reaches the screen instead of sitting in a buffered frame
+/// until the terminal's own timeout; then focus reports and colours. The
+/// cursor shape is restored separately, to what it was before argus started:
+/// see [`term::Profile::cursor_shape`].
+const RELEASE_SYNC: &str = "\x1b[?2026l";
+const RESET: &str = "\x1b[?1004l\x1b[0m";
+/// Visits the screen the terminal is not on and comes back, for emptying its
+/// keyboard stack. 1047 neither saves nor restores the cursor; leaving it
+/// clears the alternate screen, which is not in use (or is about to be
+/// redrawn by the TUI) by then.
+const VISIT_ALTERNATE: (&str, &str) = ("\x1b[?1047h", "\x1b[?1047l");
+const VISIT_NORMAL: (&str, &str) = ("\x1b[?1047l", "\x1b[?1047h");
 
 pub struct Options {
     pub readonly: bool,
@@ -131,7 +137,7 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
     let screen = if opts.alt_screen { Screen::Alternate } else { screen_for(restore.as_ref().map(|r| r.mode)) };
     let ending = {
         let _raw = term::RawMode::enter()?;
-        let _display = DisplaySession::enter(screen, opts.shared_screen);
+        let mut display = DisplaySession::enter(screen, opts.shared_screen);
         match &restore {
             // Only worth drawing if it is a real redraw of the size we are
             // about to show it at; otherwise the holder will resize the PTY
@@ -140,11 +146,13 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
                 if matches!(r.mode, ScreenMode::Snapshot | ScreenMode::PrimarySnapshot)
                     && (r.rows, r.cols) == (rows, cols) =>
             {
-                print_raw_bytes(snapshot_body(&r.bytes))
+                let body = snapshot_body(&r.bytes);
+                display.modes.feed(body);
+                print_raw_bytes(body)
             }
             _ => print_raw(CLEAR),
         }
-        pump(stream, opts.readonly)
+        pump(stream, opts.readonly, &mut display.modes)
     };
 
     Ok(match ending? {
@@ -205,7 +213,7 @@ pub fn validate_holder_hello(response: HolderResponse) -> Result<()> {
     }
 }
 
-fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
+fn pump(stream: UnixStream, readonly: bool, modes: &mut ModeTracker) -> Result<Ending> {
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let detached = Arc::new(AtomicBool::new(false));
     // The user just ran `argus attach` here, so this terminal has focus now;
@@ -230,7 +238,7 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
         std::thread::spawn(move || forward_resizes(winch, writer));
     }
 
-    let ending = forward_output(&stream, &detached);
+    let ending = forward_output(&stream, &detached, modes);
     drop(stop_tx);
     // Also unblocks an input thread stuck writing to a holder that stopped reading.
     let _ = stream.shutdown(Shutdown::Both);
@@ -240,7 +248,8 @@ fn pump(stream: UnixStream, readonly: bool) -> Result<Ending> {
 
 /// Holder → screen, on the calling thread. Blocking writes to stdout push
 /// back on the holder, which drops the backlog instead of stalling the agent.
-fn forward_output(stream: &UnixStream, detached: &AtomicBool) -> Result<Ending> {
+/// `modes` sees every byte that reaches the terminal.
+fn forward_output(stream: &UnixStream, detached: &AtomicBool, modes: &mut ModeTracker) -> Result<Ending> {
     // Buffered: a frame's header and payload, and often several frames,
     // then arrive in one read.
     let mut reader = io::BufReader::with_capacity(frame::READ_BUFFER, stream);
@@ -253,6 +262,7 @@ fn forward_output(stream: &UnixStream, detached: &AtomicBool) -> Result<Ending> 
         };
         match frame {
             (ty::DATA, bytes) => {
+                modes.feed(&bytes);
                 out.write_all(&bytes)?;
                 out.flush()?;
             }
@@ -431,22 +441,6 @@ impl Drop for SignalRegistration {
     }
 }
 
-/// Which screen an attachment draws on: the one the agent is on, so the
-/// caller's terminal (and tmux's mouse-wheel binding, which only enters copy
-/// mode off the alternate screen) sees what running the agent directly would
-/// show.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Screen {
-    /// The agent is on its alternate screen. Argus enters one for it, since
-    /// the snapshot and the agent's later redraws do not select it again.
-    Alternate,
-    /// The agent draws on the normal screen, so its output reaches the
-    /// caller's scrollback. Wrapping it in an alternate screen would not
-    /// hold anyway: an agent that toggles 1049 itself (omp does on every
-    /// resize) drops the terminal out of it at an arbitrary point.
-    Normal,
-}
-
 /// `None` or `Unavailable` mostly means an agent too new to have drawn
 /// anything, which selects its alternate screen itself when it wants one.
 fn screen_for(mode: Option<ScreenMode>) -> Screen {
@@ -472,20 +466,40 @@ fn screen_switches(screen: Screen, shared: bool) -> (&'static str, &'static str)
 /// attaching returns with an error or unwinds.
 struct DisplaySession {
     leave: &'static str,
+    modes: ModeTracker,
 }
 
 impl DisplaySession {
     fn enter(screen: Screen, shared: bool) -> Self {
         let (enter, leave) = screen_switches(screen, shared);
         print_raw(&format!("{enter}{FOCUS_REPORTS}"));
-        Self { leave }
+        Self { leave, modes: ModeTracker::new(screen) }
     }
 }
 
 impl Drop for DisplaySession {
     fn drop(&mut self) {
-        print_raw(&RESET.replace(ALT_SCREEN_LEAVE, self.leave));
-        print_raw(&term::restore_cursor_shape());
+        print_raw(&self.teardown());
+    }
+}
+
+impl DisplaySession {
+    /// Everything the agent turned on is turned off on the screen it is on,
+    /// then the session's own screen switch; a keyboard stack left on the
+    /// other screen is emptied last, from wherever that leaves the terminal.
+    fn teardown(&mut self) -> String {
+        let mut out =
+            format!("{RELEASE_SYNC}{}{RESET}{}{}", self.modes.undo(), term::restore_cursor_shape(), self.leave);
+        let now = if self.leave.is_empty() { self.modes.screen() } else { Screen::Normal };
+        out += &self.modes.undo_keys(now);
+        let (other, (visit, back)) = match now {
+            Screen::Normal => (Screen::Alternate, VISIT_ALTERNATE),
+            Screen::Alternate => (Screen::Normal, VISIT_NORMAL),
+        };
+        if self.modes.keys_dirty(other) {
+            out += &format!("{visit}{}{back}", self.modes.undo_keys(other));
+        }
+        out
     }
 }
 
@@ -540,10 +554,45 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE, NORMAL_SCREEN_LEAVE, Screen, find_detach, only_mouse_reports, screen_for,
-        screen_switches, snapshot_body, winch_pipe,
+        ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE, DisplaySession, ModeTracker, NORMAL_SCREEN_LEAVE, Screen, find_detach,
+        only_mouse_reports, screen_for, screen_switches, snapshot_body, winch_pipe,
     };
+    use crate::term;
     use argus_proto::msg::ScreenMode;
+
+    fn teardown(screen: Screen, shared: bool, output: &[u8]) -> String {
+        let mut display = DisplaySession { leave: screen_switches(screen, shared).1, modes: ModeTracker::new(screen) };
+        display.modes.feed(output);
+        let out = display.teardown();
+        std::mem::forget(display);
+        out.replace(&term::restore_cursor_shape(), "")
+    }
+
+    #[test]
+    fn teardown_empties_keyboard_stacks_on_both_screens() {
+        // Codex attached live: a push on the normal screen, then one on its own
+        // alternate screen, which the session did not enter for it.
+        let codex = b"\x1b[>7u\x1b[?1049h\x1b[>7u\x1b[?2004h";
+        assert_eq!(
+            teardown(Screen::Normal, false, codex),
+            format!("\x1b[?2026l\x1b[<1u\x1b[?2004l\x1b[?1004l\x1b[0m{NORMAL_SCREEN_LEAVE}\x1b[<1u")
+        );
+        // From the TUI, which keeps its alternate screen: the normal screen is
+        // visited to empty its stack.
+        assert_eq!(
+            teardown(Screen::Alternate, true, b"\x1b[?1049l\x1b[>1u\x1b[?1049h\x1b[>7u"),
+            "\x1b[?2026l\x1b[<1u\x1b[?1004l\x1b[0m\x1b[?1047l\x1b[<1u\x1b[?1047h"
+        );
+        // Left on the normal screen with something on the alternate one.
+        assert_eq!(
+            teardown(Screen::Alternate, false, b"\x1b[>7u\x1b[?1049l"),
+            format!("\x1b[?2026l\x1b[?1004l\x1b[0m{ALT_SCREEN_LEAVE}\x1b[?1047h\x1b[<1u\x1b[?1047l")
+        );
+        assert_eq!(
+            teardown(Screen::Alternate, false, b"plain"),
+            format!("\x1b[?2026l\x1b[?1004l\x1b[0m{ALT_SCREEN_LEAVE}")
+        );
+    }
 
     #[test]
     fn detach_key_in_every_encoding() {
