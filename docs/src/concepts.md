@@ -40,8 +40,9 @@ again. argus uses this to hold a turn open: see [Labels](#labels).
 `attach` shows the agent on the screen it uses. An agent on the alternate
 screen (Claude Code, Codex, pi) gets one for the session, and detaching leaves
 your terminal as it was. An agent drawing on the normal screen (omp) has
-its recent output replayed there, so you can scroll it back; it stays in your
-scrollback after you detach, and each attach adds it again.
+its recent output replayed there, so you can scroll it back. Attaching clears
+the terminal's scrollback first, so it holds one copy of that output rather
+than one per attach; anything older in that terminal's scrollback is lost.
 
 ## Names and groups
 

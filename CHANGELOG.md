@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Attaching to a normal-screen agent (omp) clears the terminal's scrollback
+  before replaying its output, so reattaching, as from tree mode, no longer
+  adds another copy of the same history each time.
+
 ## [0.2.1] - 2026-09-26
 
 ### Changed

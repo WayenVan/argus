@@ -44,6 +44,11 @@ const NORMAL_SCREEN_LEAVE: &str = "\x1b[?1047l\x1b[999B\r\n";
 const FOCUS_REPORTS: &str = "\x1b[?1004h";
 /// Home + clear, for when there is no screen restore to draw instead.
 const CLEAR: &str = "\x1b[H\x1b[2J";
+/// [`CLEAR`] plus the scrollback, before a normal-screen agent's whole
+/// history is replayed: otherwise the terminal keeps another copy of it
+/// from every earlier attach, which pushes out everything older. After the
+/// 2J, since some terminals move the cleared screen into scrollback.
+const CLEAR_WITH_SCROLLBACK: &str = "\x1b[H\x1b[2J\x1b[3J";
 /// What argus itself turns on or leaves behind, reset after the agent's own
 /// modes (see [`ModeTracker`]): the synchronized-output hold goes first, so the
 /// rest actually reaches the screen instead of sitting in a buffered frame
@@ -131,6 +136,7 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
     )?;
 
     let screen = if opts.alt_screen { Screen::Alternate } else { screen_for(restore.as_ref().map(|r| r.mode)) };
+    let clear = clear_for(screen, restore.as_ref().map(|r| r.mode), opts.replay);
     let ending = {
         let _raw = term::RawMode::enter()?;
         let mut display = DisplaySession::enter(screen, opts.shared_screen);
@@ -143,7 +149,7 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
                 display.modes.feed(body);
                 print_raw_bytes(body)
             }
-            _ => print_raw(CLEAR),
+            _ => print_raw(clear),
         }
         pump(stream, opts.readonly, &mut display.modes)
     };
@@ -435,6 +441,18 @@ fn screen_for(mode: Option<ScreenMode>) -> Screen {
     }
 }
 
+/// How to clear the screen when no snapshot is drawn. The holder replays
+/// its whole ring buffer for a manager `Replay` reply (offset 0), or for
+/// `--replay` when there is no reply to pick up from.
+fn clear_for(screen: Screen, mode: Option<ScreenMode>, replay: bool) -> &'static str {
+    let full_replay = match mode {
+        Some(ScreenMode::Replay) => true,
+        Some(ScreenMode::Snapshot) => false,
+        Some(ScreenMode::Unavailable) | None => replay,
+    };
+    if screen == Screen::Normal && full_replay { CLEAR_WITH_SCROLLBACK } else { CLEAR }
+}
+
 /// The screen switches around a session: one on the way in, one on the way
 /// out. A shared caller (the TUI) is on the alternate screen already and
 /// re-enters it after, so it only has to leave it for a normal-screen agent.
@@ -539,8 +557,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE, DisplaySession, ModeTracker, NORMAL_SCREEN_LEAVE, Screen, find_detach,
-        only_mouse_reports, screen_for, screen_switches, snapshot_body, winch_pipe,
+        ALT_SCREEN_ENTER, ALT_SCREEN_LEAVE, CLEAR, CLEAR_WITH_SCROLLBACK, DisplaySession, ModeTracker,
+        NORMAL_SCREEN_LEAVE, Screen, clear_for, find_detach, only_mouse_reports, screen_for, screen_switches,
+        snapshot_body, winch_pipe,
     };
     use crate::term;
     use argus_proto::msg::ScreenMode;
@@ -598,6 +617,15 @@ mod tests {
         assert_eq!(screen_for(Some(ScreenMode::Replay)), Screen::Normal);
         assert_eq!(screen_for(Some(ScreenMode::Unavailable)), Screen::Normal);
         assert_eq!(screen_for(None), Screen::Normal);
+    }
+
+    #[test]
+    fn only_a_full_normal_screen_replay_clears_scrollback() {
+        assert_eq!(clear_for(Screen::Normal, Some(ScreenMode::Replay), false), CLEAR_WITH_SCROLLBACK);
+        assert_eq!(clear_for(Screen::Normal, None, true), CLEAR_WITH_SCROLLBACK);
+        assert_eq!(clear_for(Screen::Normal, Some(ScreenMode::Unavailable), false), CLEAR);
+        assert_eq!(clear_for(Screen::Normal, None, false), CLEAR);
+        assert_eq!(clear_for(Screen::Alternate, None, true), CLEAR);
     }
 
     #[test]
