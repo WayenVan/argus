@@ -118,16 +118,17 @@ unsafe fn child_exec(
     }
 }
 
-/// The client's environment plus argus variables. TERM is forced so agents
-/// render for a known terminal regardless of where they are attached from.
+/// The client's environment plus argus variables. PWD matches the directory
+/// entered by the child; TERM is forced for consistent terminal rendering.
 fn agent_env(spec: &HolderSpec) -> Vec<String> {
     let mut env: Vec<String> = spec
         .env
         .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "TERM" | "ARGUS_AGENT_ID" | "ARGUS_SOCKET"))
+        .filter(|(k, _)| !matches!(k.as_str(), "PWD" | "TERM" | "ARGUS_AGENT_ID" | "ARGUS_SOCKET"))
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     env.push("TERM=xterm-256color".into());
+    env.push(format!("PWD={}", spec.cwd));
     env.push(format!("ARGUS_AGENT_ID={}", spec.id));
     env.push(format!("ARGUS_SOCKET={}", spec.manager_socket.display()));
     env
