@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use argus_proto::frame::{self, ty};
 use argus_proto::msg::{
-    Activity, AgentInfo, Capability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, MANAGER_CAPABILITIES, Request,
-    Response, RunRequest, now_secs,
+    Activity, AgentInfo, Capability, HOLDER_CAPABILITIES, HolderRequest, HolderResponse, Request, Response, RunRequest,
+    now_secs,
 };
 use argus_proto::{BUILD, HOLDER_PROTOCOL_VERSION, MANAGER_PROTOCOL_VERSION, paths};
 use nix::sys::signal::kill as signal_process;
@@ -562,7 +562,7 @@ pub fn manager_status(json: bool) -> Result<()> {
         }
         return Ok(());
     };
-    let Response::Hello { pid, version, capabilities, build } = conn.request(&hello_request())? else {
+    let Response::Hello { pid, version, capabilities, build, .. } = conn.request(&hello_request())? else {
         bail!("unexpected reply to Hello");
     };
     let agents = conn.list(true)?;
@@ -623,8 +623,10 @@ fn holder_build(id: u64) -> Option<String> {
     }
 }
 
+/// Sends no capabilities: the manager does not read them, and an older one
+/// rejects the whole request over a capability it does not know.
 fn hello_request() -> Request {
-    Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: MANAGER_CAPABILITIES.to_vec() }
+    Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: Vec::new() }
 }
 
 pub fn terminal_size() -> (u16, u16) {

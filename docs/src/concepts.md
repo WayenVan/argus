@@ -70,5 +70,5 @@ itself, and may then message and stop those without asking.
 
 If a turn ends with `title` or `recap` unset, argus holds it open once and asks
 the agent to set them. Only the end that follows counts as the turn, so `wait`
-and `send --then-wait` return after it. Claude Code only; other agents end the
-turn as usual.
+and `send --then-wait` return after it. Claude Code and Codex only; other
+agents end the turn as usual.

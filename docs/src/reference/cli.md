@@ -29,6 +29,7 @@ Lightweight manager for long-running terminal agents
 * `rm` — Remove an exited agent
 * `prune` — Remove every exited agent
 * `manager` — Manage the manager process
+* `setup` — One-time changes to an agent's own configuration that widen what it may do; shows them and asks first
 
 
 
@@ -437,6 +438,32 @@ Show whether the manager is running
 
 ###### **Options:**
 
+* `--json` — Print JSON (one object per line) instead of text
+
+
+
+## `argus setup`
+
+One-time changes to an agent's own configuration that widen what it may do; shows them and asks first
+
+**Usage:** `argus setup <COMMAND>`
+
+###### **Subcommands:**
+
+* `codex` — Let Codex agents run `argus label self` outside the sandbox, via a rule in $CODEX_HOME/rules/argus.rules
+
+
+
+## `argus setup codex`
+
+Let Codex agents run `argus label self` outside the sandbox, via a rule in $CODEX_HOME/rules/argus.rules
+
+**Usage:** `argus setup codex [OPTIONS]`
+
+###### **Options:**
+
+* `-y`, `--yes` — Write the rule without asking
+* `--remove` — Delete argus's rules file instead
 * `--json` — Print JSON (one object per line) instead of text
 
 

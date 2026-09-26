@@ -393,7 +393,7 @@ mod tests {
         let mut rec = record();
         let continuing = json!({"hook_event_name":"Stop","stop_hook_active":true});
         assert_eq!(hold_stop(&mut rec, claude, &continuing), None, "Claude is already continuing");
-        assert_eq!(hold_stop(&mut rec, driver::for_kind("codex"), &stop), None, "not supported yet");
+        assert_eq!(hold_stop(&mut rec, driver::for_kind("pi"), &stop), None, "not supported yet");
     }
 
     #[test]

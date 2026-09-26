@@ -179,6 +179,7 @@ impl Manager {
                     pid: std::process::id(),
                     capabilities: MANAGER_CAPABILITIES.to_vec(),
                     build: Some(argus_proto::BUILD.to_string()),
+                    hook_reply: true,
                 })
             }
             Request::Run(req) => {

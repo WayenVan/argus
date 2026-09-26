@@ -6,6 +6,8 @@
 //! in `config.toml` under `hooks.state."/<session-flags>/config.toml:<event>:0:0"`,
 //! independent of the working directory. The definitions below are therefore
 //! frozen: changing any of them makes every user review the hooks again.
+//! (`Stop` changed once, from `async=true` to `async=false`, so that Codex
+//! reads its answer; see `hold_stop`.)
 //!
 //! Codex only fires `SessionStart` with the first prompt, so a freshly started
 //! agent reports nothing until then. It draws its prompt first and a startup
@@ -68,15 +70,16 @@ impl Driver for Codex {
         let overrides = hook_overrides(&hook_command(hook_exe, "codex"));
         launch.command.splice(1..1, overrides);
 
+        let mut warnings = Vec::new();
         if overridden {
-            return Ok(Some("your own -c hooks.* overrides may replace argus's hooks for those events".into()));
+            warnings.push("your own -c hooks.* overrides may replace argus's hooks for those events");
+        } else if !trusted() {
+            warnings.push("Codex will ask you to review argus's hooks once: attach to this agent and trust them");
         }
-        if !trusted() {
-            return Ok(Some(
-                "Codex will ask you to review argus's hooks once: attach to this agent and trust them".into(),
-            ));
+        if !label_rule_installed() {
+            warnings.push("Codex's sandbox blocks `argus label`, so labels may need your approval: run `argus setup codex` once to allow it");
         }
-        Ok(None)
+        Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
     }
 
     fn interpret(&self, event: &Value) -> Hint {
@@ -94,18 +97,30 @@ impl Driver for Codex {
             _ => Hint::Ignore,
         }
     }
+
+    /// Codex takes Claude's answer: a block with a reason continues the turn
+    /// with the reason as the next input.
+    fn hold_stop(&self, event: &Value, reason: &str) -> Option<String> {
+        if event.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
+    }
 }
 
 /// `-c hooks.<Event>=[…]` pairs. Frozen: see the module docs. The timeout is
 /// 3s because Codex caps `Interrupt` hooks at 3s and warns on every start
-/// otherwise; argus-hook itself gives up after 0.5s.
+/// otherwise; argus-hook itself gives up after 0.5s. Only `Stop` is
+/// synchronous: Codex ignores what an async hook prints.
 fn hook_overrides(command: &str) -> Vec<String> {
     let command = command.replace('\\', r"\\").replace('"', r#"\""#);
     HOOK_EVENTS
         .iter()
-        .flat_map(|(event, _)| {
-            let value =
-                format!(r#"hooks.{event}=[{{hooks=[{{type="command",command="{command}",async=true,timeout=3}}]}}]"#);
+        .flat_map(|&(event, _)| {
+            let is_async = event != "Stop";
+            let value = format!(
+                r#"hooks.{event}=[{{hooks=[{{type="command",command="{command}",async={is_async},timeout=3}}]}}]"#
+            );
             ["-c".to_string(), value]
         })
         .collect()
@@ -116,6 +131,20 @@ fn hook_overrides(command: &str) -> Vec<String> {
 fn developer_instructions_override() -> Vec<String> {
     let text = SELF_LABEL_INSTRUCTIONS.replace('\\', r"\\").replace('"', r#"\""#).replace('\n', r"\n");
     vec!["-c".to_string(), format!(r#"developer_instructions="{text}""#)]
+}
+
+/// The exec-policy rule that lets the agent run `argus label self …` outside
+/// Codex's sandbox, which blocks the manager's socket. Codex reads rules only
+/// from files, so `argus setup codex` writes it, after asking.
+pub(crate) const LABEL_RULE: &str = r#"prefix_rule(pattern=["argus", "label", "self"], decision="allow")"#;
+
+/// argus's own rules file, next to the user's.
+pub(crate) fn rules_file() -> PathBuf {
+    codex_home().join("rules").join("argus.rules")
+}
+
+pub(crate) fn label_rule_installed() -> bool {
+    std::fs::read_to_string(rules_file()).is_ok_and(|text| text.lines().any(|l| l.trim() == LABEL_RULE))
 }
 
 /// `$CODEX_HOME`, defaulting to `~/.codex`.
@@ -158,6 +187,18 @@ mod tests {
             args[1],
             r#"hooks.SessionStart=[{hooks=[{type="command",command="'/opt/argus hook' codex",async=true,timeout=3}]}]"#
         );
+        let stop = args.iter().find(|a| a.starts_with("hooks.Stop=")).unwrap();
+        assert_eq!(
+            stop,
+            r#"hooks.Stop=[{hooks=[{type="command",command="'/opt/argus hook' codex",async=false,timeout=3}]}]"#
+        );
+    }
+
+    #[test]
+    fn holds_stop_once() {
+        let held = Codex.hold_stop(&json!({"hook_event_name":"Stop","stop_hook_active":false}), "argus: x").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&held).unwrap(), json!({"decision":"block","reason":"argus: x"}));
+        assert_eq!(Codex.hold_stop(&json!({"hook_event_name":"Stop","stop_hook_active":true}), "argus: x"), None);
     }
 
     #[test]

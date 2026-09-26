@@ -59,6 +59,19 @@ argus grid           # dashboard of every agent
 Detaching with `Ctrl-\` leaves the agent running; reattach later with
 `argus attach claude-1` or pick it from `argus grid`.
 
+## Agent setup
+
+argus never widens what an agent may do behind your back. When an agent needs
+a lasting permission, `argus setup <agent>` shows exactly what it will write,
+writes it only after you agree, keeps it in a file of argus's own, and
+`--remove` undoes it. argus warns when it starts an agent that is missing one.
+
+| Agent | Command | What it allows |
+|---|---|---|
+| Codex | `argus setup codex` | `argus label self …` outside the sandbox, so agents can set their labels ([details](docs/src/agents/codex.md)) |
+
+Claude Code needs none: argus passes its permission per session.
+
 Works with [Claude Code](docs/src/agents/claude.md),
 [Codex](docs/src/agents/codex.md), [opencode](docs/src/agents/opencode.md),
 [pi](docs/src/agents/pi.md), [omp](docs/src/agents/omp.md), and

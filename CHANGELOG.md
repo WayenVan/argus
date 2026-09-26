@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Builds from either side of an upgrade keep talking to each other. Clients
+  and `argus-hook` send no capabilities in `Hello`, which an older manager
+  would reject, and the manager announces answering reports in a new
+  `hook_reply` field rather than in its capability list, which older clients
+  could not parse. Unknown capabilities are now ignored instead of failing the
+  whole message.
+
 ### Added
 
 - Claude Code agents that end a turn with `title` or `recap` unset are asked to
@@ -14,7 +23,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   turn, so `wait` and `send --then-wait` return after the real one. A turn is
   held at most once.
   - `argus-hook` prints the manager's answer to a report. It asks for one only
-    from a manager with the new `hook_reply` capability.
+    from a manager whose `Hello` says `hook_reply`.
+  - Codex agents are held the same way. Its `Stop` hook is synchronous now, so
+    Codex asks you to review that one hook again once.
+- `argus setup codex` lets Codex agents run `argus label self` outside the
+  sandbox, which blocks the manager's socket. It shows the rule, asks, and
+  writes it to `$CODEX_HOME/rules/argus.rules`; `--remove` deletes that file.
+  Starting a Codex agent warns while the rule is missing.
 - Claude Code agents may run `argus label self …` without a permission prompt:
   argus's settings allow `Bash(argus label self:*)`, added to your own
   `--settings` if you pass one.

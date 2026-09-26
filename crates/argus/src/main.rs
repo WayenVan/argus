@@ -10,6 +10,7 @@ mod manager;
 mod naming;
 mod output;
 mod query;
+mod setup;
 mod stream;
 mod term;
 mod theme;
@@ -287,6 +288,29 @@ enum Command {
         #[command(subcommand)]
         action: ManagerAction,
     },
+    /// One-time changes to an agent's own configuration that widen what it may do; shows them and asks first
+    Setup {
+        #[command(subcommand)]
+        agent: SetupAgent,
+    },
+}
+
+/// One subcommand per agent that needs a lasting change argus will not make
+/// on its own (see `setup.rs`).
+#[derive(Subcommand)]
+enum SetupAgent {
+    /// Let Codex agents run `argus label self` outside the sandbox, via a rule
+    /// in $CODEX_HOME/rules/argus.rules
+    Codex {
+        /// Write the rule without asking
+        #[arg(long, short)]
+        yes: bool,
+        /// Delete argus's rules file instead
+        #[arg(long, conflicts_with = "yes")]
+        remove: bool,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -352,6 +376,7 @@ impl Command {
             | Command::Kill { output, .. }
             | Command::Rm { output, .. }
             | Command::Prune { output, .. }
+            | Command::Setup { agent: SetupAgent::Codex { output, .. } }
             | Command::Manager {
                 action:
                     ManagerAction::Start { output }
@@ -390,6 +415,7 @@ impl Command {
             | Command::Tree { .. }
             | Command::Events { .. }
             | Command::Prune { .. }
+            | Command::Setup { .. }
             | Command::Manager { .. } => vec![],
         }
     }
@@ -454,6 +480,7 @@ fn main() -> ExitCode {
             ManagerAction::Status { output } => client::manager_status(output.json),
             ManagerAction::Run => manager::run(),
         },
+        Command::Setup { agent: SetupAgent::Codex { yes, remove, output } } => setup::codex(yes, remove, output.json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

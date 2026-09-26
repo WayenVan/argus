@@ -7,7 +7,7 @@
 //! `activity.rs`, which is the same for every kind.
 
 mod claude;
-mod codex;
+pub(crate) mod codex;
 mod generic;
 mod omp;
 mod opencode;
