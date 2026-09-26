@@ -17,6 +17,7 @@ use std::time::Duration;
 use argus_proto::MANAGER_PROTOCOL_VERSION;
 use argus_proto::frame;
 use argus_proto::msg::{Capability, Request, Response};
+use argus_proto::text;
 
 fn main() {
     // Only agents started by argus carry these; anything else is not ours.
@@ -28,7 +29,10 @@ fn main() {
     if std::io::stdin().read_to_end(&mut input).is_err() {
         return;
     }
-    let Ok(event) = serde_json::from_slice(&input) else { return };
+    let Ok(mut event) = serde_json::from_slice(&input) else { return };
+    // A huge pasted prompt must not push the event past the frame limit and
+    // lose it; the manager keeps no more than this anyway.
+    text::clip_event(&mut event);
 
     let Ok(mut stream) = UnixStream::connect(socket) else { return };
     let _ = stream.set_write_timeout(Some(TIMEOUT));

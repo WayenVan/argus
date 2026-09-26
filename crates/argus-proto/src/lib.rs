@@ -10,6 +10,7 @@ pub mod ansi;
 pub mod frame;
 pub mod msg;
 pub mod paths;
+pub mod text;
 
 /// Client ↔ manager protocol. Bumped for incompatible request/response changes.
 pub const MANAGER_PROTOCOL_VERSION: u32 = 2;

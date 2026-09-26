@@ -26,6 +26,9 @@ export const ArgusPlugin = async (_input, options) => {
   // finishing (and pending asks being refused) after it went idle; those
   // must not bring it back to work.
   const busy = new Set();
+  // Root session -> its latest assistant message with text: { id, text },
+  // sent with the turn's end like Claude's `last_assistant_message`.
+  const replies = new Map();
   let queue = Promise.resolve();
 
   // One argus-hook at a time, so events reach the manager in order.
@@ -107,8 +110,9 @@ export const ArgusPlugin = async (_input, options) => {
         const r = root(p.sessionID);
         // An interrupted turn goes idle twice; only the first ends it.
         if (!busy.delete(r)) return;
-        send(failure.get(r) ?? "Stop", r);
+        send(failure.get(r) ?? "Stop", r, { last_assistant_message: replies.get(r)?.text });
         failure.delete(r);
+        replies.delete(r);
         lastTool.delete(r);
         return;
       }
@@ -125,11 +129,24 @@ export const ArgusPlugin = async (_input, options) => {
 
   return {
     event: guard(({ event }) => onEvent(event)),
-    "chat.message": guard((input) => {
+    "chat.message": guard((input, output) => {
       if (isChild(input.sessionID)) return;
       const r = root(input.sessionID);
       busy.add(r);
-      send("UserPromptSubmit", r);
+      replies.delete(r);
+      const prompt = (output?.parts ?? [])
+        .filter((p) => p?.type === "text" && !p.synthetic && !p.ignored)
+        .map((p) => p.text ?? "")
+        .join("\n");
+      send("UserPromptSubmit", r, { prompt: prompt || undefined });
+    }),
+    // Each finished text part of an assistant message; read, never changed.
+    "experimental.text.complete": guard((input, output) => {
+      if (isChild(input.sessionID) || !output?.text?.trim()) return;
+      const r = root(input.sessionID);
+      const last = replies.get(r);
+      if (last?.id === input.messageID) last.text += "\n\n" + output.text;
+      else replies.set(r, { id: input.messageID, text: output.text });
     }),
     "tool.execute.before": guard((input) => {
       if (isChild(input.sessionID)) return;

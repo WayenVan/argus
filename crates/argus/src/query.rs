@@ -11,6 +11,7 @@ use crate::client::{self, Conn};
 use crate::manager::driver;
 use crate::naming::self_id;
 use crate::output::{self, AgentView};
+use crate::turns::{self, Turn};
 
 // ---------------------------------------------------------------------------
 // inspect
@@ -22,9 +23,12 @@ struct Inspection<'a> {
     /// The current screen as plain text; `null` when not running.
     #[serde(skip_serializing_if = "Option::is_none")]
     screen: Option<Option<String>>,
+    /// The last finished turns, oldest first (`--last`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turns: Option<Vec<Turn>>,
 }
 
-pub fn inspect(target: String, screen: bool, json: bool) -> Result<()> {
+pub fn inspect(target: String, screen: bool, last: Option<u64>, json: bool) -> Result<()> {
     let mut conn = Conn::connect()?;
     let agent = conn.find(&target)?;
     let screen = if screen && agent.status.is_live() {
@@ -32,16 +36,50 @@ pub fn inspect(target: String, screen: bool, json: bool) -> Result<()> {
     } else {
         screen.then_some(None)
     };
+    let turns = match last {
+        Some(n) => Some(turns::read(agent.id, n as usize).context("reading the turn log")?),
+        None => None,
+    };
     if json {
-        output::print(Inspection { agent: AgentView::new(&agent), screen });
+        output::print(Inspection { agent: AgentView::new(&agent), screen, turns });
         return Ok(());
     }
     print!("{}", describe(&agent));
+    if let Some(turns) = turns {
+        print!("{}", describe_turns(&turns));
+    }
     if let Some(screen) = screen {
         println!("\nscreen:");
         println!("{}", screen.as_deref().unwrap_or("(not running)"));
     }
     Ok(())
+}
+
+fn describe_turns(turns: &[Turn]) -> String {
+    if turns.is_empty() {
+        return "\nturns: (none recorded)\n".into();
+    }
+    let now = now_secs();
+    let mut out = String::new();
+    for t in turns {
+        out += &format!("\nturn {} ({}, {} ago)\n", t.turn, t.ended, client::age(now.saturating_sub(t.at)));
+        if let Some(prompt) = &t.prompt {
+            for line in printable(prompt).lines() {
+                out += &format!("> {line}\n");
+            }
+        }
+        match &t.reply {
+            Some(reply) => out += &format!("{}\n", printable(reply)),
+            None => out += "(no reply recorded)\n",
+        }
+    }
+    out
+}
+
+/// Drops control characters other than newlines and tabs, so text an agent
+/// wrote cannot drive the reader's terminal.
+fn printable(text: &str) -> String {
+    text.chars().filter(|&c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
 }
 
 /// The screen as plain text: styles dropped, trailing blanks trimmed.

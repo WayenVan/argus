@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `argus inspect --last [N]` prints an agent's last N finished turns: each
+  prompt and its full final reply, which `--screen` cuts to what fits on
+  screen. The manager records them from hook events into
+  `agents/<id>/turns.jsonl` (at most the last 50 turns, compacted to 1 MiB
+  once it passes 2 MiB), readable after the agent exits. `argus-hook` cuts a
+  prompt or reply to 64 KiB before forwarding it, so a huge pasted prompt can
+  no longer push an event past the 1 MiB frame limit and lose it. Claude and Codex report `prompt` and
+  `last_assistant_message` themselves; the opencode, pi and omp plugins now
+  send the same fields. A turn held back for labels records the held reply
+  plus what follows it.
+
 - Claude Code agents that end a turn with `title` or `recap` unset are asked to
   set them before the turn ends. argus's `Stop` hook is now synchronous and
   answers with Claude's `decision: block`; the held end does not count as a

@@ -50,6 +50,11 @@ pub struct AgentRuntime {
     /// The `turns` value at which a `Stop` was last held back with
     /// directives, so a turn is held at most once.
     pub held_turn: Option<u64>,
+    /// The prompt of the turn in progress, for the turn log.
+    pub prompt: Option<String>,
+    /// The reply a held-back `Stop` carried: the turn's real answer, which
+    /// the reply after the directives only adds to.
+    pub held_reply: Option<String>,
 }
 
 impl AgentRecord {

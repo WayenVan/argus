@@ -21,6 +21,8 @@ export default function (pi) {
   let busy = false; // Between agent_start and the final agent_end.
   const tools = new Map(); // toolCallId -> name, for tools running in parallel.
   const waiting = new Set(); // toolCallIds waiting on the user: approvals, `ask`.
+  let prompt; // The prompt of the run about to start.
+  let reply; // The run's final reply so far, sent with its end.
   let queue = Promise.resolve();
 
   // One argus-hook at a time, so events reach the manager in order.
@@ -53,6 +55,20 @@ export default function (pi) {
       } catch {}
     });
 
+  // The text of the last assistant message that has any, like Claude's
+  // `last_assistant_message`.
+  const replyOf = (messages) => {
+    for (const m of [...(messages ?? [])].reverse()) {
+      if (m?.role !== "assistant") continue;
+      const text =
+        typeof m.content === "string"
+          ? m.content
+          : (m.content ?? []).filter((p) => p?.type === "text").map((p) => p.text ?? "").join("");
+      if (text.trim()) return text;
+    }
+    return undefined;
+  };
+
   // Parallel tool calls can each wait for approval, one dialog at a time,
   // while others run, so what to show is worked out from all of them.
   const report = (ctx) => {
@@ -77,9 +93,14 @@ export default function (pi) {
   on("session_switch", fresh("clear"));
   on("session_branch", fresh("clear"));
 
+  on("before_agent_start", (event) => {
+    prompt = event.prompt;
+  });
   on("agent_start", (_event, ctx) => {
     busy = true;
-    send("UserPromptSubmit", ctx);
+    reply = undefined;
+    send("UserPromptSubmit", ctx, { prompt });
+    prompt = undefined;
   });
   on("tool_execution_start", (event, ctx) => {
     tools.set(event.toolCallId, event.toolName);
@@ -103,11 +124,12 @@ export default function (pi) {
   // omp announces its own retries, compaction and other continuations with
   // `willContinue`; only the last agent_end ends the run.
   on("agent_end", (event, ctx) => {
+    reply = replyOf(event.messages) ?? reply;
     if (event.willContinue || !busy) return;
     reset();
     const last = event.messages?.findLast((m) => m.role === "assistant");
     if (last?.stopReason === "aborted") send("Interrupt", ctx);
     else if (last?.stopReason === "error") send("StopFailure", ctx);
-    else send("Stop", ctx);
+    else send("Stop", ctx, { last_assistant_message: reply });
   });
 }

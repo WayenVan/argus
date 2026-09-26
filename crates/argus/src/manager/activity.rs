@@ -23,11 +23,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use argus_proto::msg::{Activity, TmuxLocation, now_secs};
+use argus_proto::text;
 use serde_json::Value;
 
 use super::driver::{self, Driver, Hint};
 use super::registry::AgentRecord;
 use super::{Manager, directive, holder, log};
+use crate::turns::{self, Turn};
 
 /// How long `working` may go without hooks or output before it is `unknown`.
 const SILENCE: Duration = Duration::from_secs(15);
@@ -59,6 +61,7 @@ impl Manager {
         // Saved, so a caller's `--after` still means the same turn after a
         // manager restart.
         let finished = count_turn(rec, &hint);
+        let turn = track_turn(rec, event, &hint, stdout.is_some());
         let changed = apply(rec, hint) || finished;
         let arm = rec.info.activity == Activity::Working;
         if arm && changed {
@@ -78,6 +81,11 @@ impl Manager {
             log(&format!("saving registry: {e:#}"));
         }
         drop(reg);
+        if let Some(turn) = turn
+            && let Err(e) = turns::append(agent_id, &turn)
+        {
+            log(&format!("recording turn {} of agent {agent_id}: {e}", turn.turn));
+        }
         if start_watchdog {
             let manager = self.clone();
             tokio::spawn(async move { manager.watchdog(agent_id).await });
@@ -282,6 +290,43 @@ fn count_turn(rec: &mut AgentRecord, hint: &Hint) -> bool {
     finished
 }
 
+/// Collects a turn's prompt and reply from the hook events that carry them
+/// (`UserPromptSubmit.prompt`, `Stop.last_assistant_message`; argus's own
+/// plugins send the same fields) and returns the finished turn to log. Call
+/// after `count_turn`.
+fn track_turn(rec: &mut AgentRecord, event: &Value, hint: &Hint, held: bool) -> Option<Turn> {
+    let text = |key| event.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string);
+    if held {
+        rec.runtime.held_reply = text("last_assistant_message");
+        return None;
+    }
+    let ended = match hint {
+        Hint::Done => "done",
+        Hint::Error => "error",
+        Hint::Interrupted => "interrupted",
+        _ => {
+            // Directives fed back into a held turn are not a new prompt.
+            let is_prompt = event.get("hook_event_name").and_then(Value::as_str) == Some("UserPromptSubmit");
+            if is_prompt && rec.runtime.held_turn != Some(rec.info.turns) {
+                rec.runtime.prompt = text("prompt");
+                rec.runtime.held_reply = None;
+            }
+            return None;
+        }
+    };
+    let reply = match (rec.runtime.held_reply.take(), text("last_assistant_message")) {
+        (Some(held), Some(last)) if held != last => Some(format!("{held}\n\n{last}")),
+        (held, last) => held.or(last),
+    };
+    Some(Turn {
+        turn: rec.info.turns,
+        ended: ended.into(),
+        at: now_secs(),
+        prompt: rec.runtime.prompt.take().map(text::clip),
+        reply: reply.map(text::clip),
+    })
+}
+
 fn apply(rec: &mut AgentRecord, hint: Hint) -> bool {
     match hint {
         // Unseen results stay marked until someone looks.
@@ -394,6 +439,56 @@ mod tests {
         let continuing = json!({"hook_event_name":"Stop","stop_hook_active":true});
         assert_eq!(hold_stop(&mut rec, claude, &continuing), None, "Claude is already continuing");
         assert_eq!(hold_stop(&mut rec, driver::for_kind("pi"), &stop), None, "not supported yet");
+    }
+
+    /// Feeds `event` through what `report` does for turns.
+    fn turn_after(rec: &mut AgentRecord, event: Value) -> Option<Turn> {
+        let claude = driver::for_kind("claude");
+        let mut hint = claude.interpret(&event);
+        let held = hint == Hint::Done && hold_stop(rec, claude, &event).is_some();
+        if held {
+            hint = Hint::Working;
+        }
+        count_turn(rec, &hint);
+        let turn = track_turn(rec, &event, &hint, held);
+        apply(rec, hint);
+        turn
+    }
+
+    #[test]
+    fn turns_record_prompt_and_reply() {
+        let prompt = |p: &str| json!({"hook_event_name":"UserPromptSubmit","prompt":p});
+        let stop = |r: &str, active: bool| json!({"hook_event_name":"Stop","stop_hook_active":active,"last_assistant_message":r});
+        let mut rec = record();
+        rec.info.labels = [("title", "t"), ("recap", "r")].map(|(k, v)| (k.into(), v.into())).into();
+        assert_eq!(turn_after(&mut rec, prompt("hi")), None);
+        let t = turn_after(&mut rec, stop("hello", false)).expect("a finished turn");
+        assert_eq!(
+            (t.turn, t.ended.as_str(), t.prompt.as_deref(), t.reply.as_deref()),
+            (1, "done", Some("hi"), Some("hello"))
+        );
+
+        // Held for its labels: the held reply is the answer, the one after
+        // the directives adds to it unless it repeats it.
+        rec.info.labels.clear();
+        turn_after(&mut rec, prompt("fix it"));
+        assert_eq!(turn_after(&mut rec, stop("fixed", false)), None, "held");
+        assert_eq!(turn_after(&mut rec, prompt("argus: set your labels")), None);
+        let t = turn_after(&mut rec, stop("labels set", true)).unwrap();
+        assert_eq!((t.prompt.as_deref(), t.reply.as_deref()), (Some("fix it"), Some("fixed\n\nlabels set")));
+
+        turn_after(&mut rec, prompt("again"));
+        turn_after(&mut rec, stop("same", false));
+        let t = turn_after(&mut rec, stop("same", true)).unwrap();
+        assert_eq!(t.reply.as_deref(), Some("same"));
+
+        // An interrupt ends a turn with whatever it has; the next starts clean.
+        rec.info.labels = [("title", "t"), ("recap", "r")].map(|(k, v)| (k.into(), v.into())).into();
+        turn_after(&mut rec, prompt("long job"));
+        let t = turn_after(&mut rec, json!({"hook_event_name":"StopFailure"})).unwrap();
+        assert_eq!((t.ended.as_str(), t.prompt.as_deref(), t.reply), ("error", Some("long job"), None));
+        let t = turn_after(&mut rec, stop("", false)).unwrap();
+        assert_eq!((t.prompt, t.reply), (None, None), "nothing carried over");
     }
 
     #[test]

@@ -23,3 +23,7 @@ argus run --kind claude my-claude-wrapper
 
 **Briefly `busy` after starting.**
 Startup output shows as `busy` for a second or two before it settles.
+
+**`inspect --last` shows nothing.**
+Turns come from hooks, which other programs do not have. Use
+`argus inspect --screen` or `argus logs` instead.

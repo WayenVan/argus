@@ -22,3 +22,7 @@ finishes.
 **Interrupting a turn with Esc shows `unknown`.**
 Claude sends no hook when you press Esc. After 15 s without hooks or output,
 argus changes `working` to `unknown`. The next prompt fixes it.
+
+**An interrupted turn is missing from `inspect --last`.**
+Claude sends no hook when you press Esc, so argus never sees that turn end and
+records nothing for it. Its prompt is dropped when the next one arrives.

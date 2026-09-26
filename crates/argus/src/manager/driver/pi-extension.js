@@ -23,6 +23,8 @@ export default function (pi) {
   let busy = false; // Between agent_start and agent_settled.
   let ending; // What the coming agent_settled means, decided at agent_end.
   const tools = new Map(); // toolCallId -> name, for tools running in parallel.
+  let prompt; // The prompt of the run about to start.
+  let reply; // The run's final reply, sent with its end.
   let queue = Promise.resolve();
 
   // One argus-hook at a time, so events reach the manager in order.
@@ -55,15 +57,34 @@ export default function (pi) {
       } catch {}
     });
 
+  // The text of the last assistant message that has any, like Claude's
+  // `last_assistant_message`.
+  const replyOf = (messages) => {
+    for (const m of [...(messages ?? [])].reverse()) {
+      if (m?.role !== "assistant") continue;
+      const text =
+        typeof m.content === "string"
+          ? m.content
+          : (m.content ?? []).filter((p) => p?.type === "text").map((p) => p.text ?? "").join("");
+      if (text.trim()) return text;
+    }
+    return undefined;
+  };
+
   on("session_start", (event, ctx) => {
     // Anything but a fresh start is a new session inside the same agent.
     const source = event.reason === "startup" || event.reason === "reload" ? event.reason : "clear";
     send("SessionStart", ctx, { source });
   });
+  on("before_agent_start", (event) => {
+    prompt = event.prompt;
+  });
   on("agent_start", (_event, ctx) => {
     busy = true;
     ending = undefined;
-    send("UserPromptSubmit", ctx);
+    reply = undefined;
+    send("UserPromptSubmit", ctx, { prompt });
+    prompt = undefined;
   });
   on("tool_execution_start", (event, ctx) => {
     tools.set(event.toolCallId, event.toolName);
@@ -91,12 +112,13 @@ export default function (pi) {
     if (ctx.signal?.aborted || last?.stopReason === "aborted") ending = "Interrupt";
     else if (last?.stopReason === "error") ending = "StopFailure";
     else ending = "Stop";
+    reply = replyOf(event.messages) ?? reply;
   });
   // Final: retries, compaction and queued follow-ups all happen before it.
   on("agent_settled", (_event, ctx) => {
     if (!busy) return;
     busy = false;
     tools.clear();
-    send(ending ?? "Stop", ctx);
+    send(ending ?? "Stop", ctx, { last_assistant_message: reply });
   });
 }

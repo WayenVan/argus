@@ -88,6 +88,7 @@ Show one agent in full
 ###### **Options:**
 
 * `--screen` — Also print its current screen as plain text
+* `--last <N>` — Also print its last N finished turns (default 1): each prompt and final reply, as its hooks reported them
 * `--json` — Print JSON (one object per line) instead of text
 
 

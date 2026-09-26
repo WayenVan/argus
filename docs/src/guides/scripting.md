@@ -86,8 +86,10 @@ exit 0 if it holds, 124 if not.
 argus wait --dir . --timeout 600 && make release
 ```
 
-`argus inspect <agent>` shows one agent in full; `--screen` adds its current
-screen as plain text.
+`argus inspect <agent>` shows one agent in full. `--last [N]` adds its last N
+finished turns (default 1): each prompt and the agent's full final reply, as its
+hooks reported them. `--screen` adds its current screen as plain text, which
+shows only what fits on screen.
 
 Agents learn these commands from the instruction argus adds at launch.
 
@@ -111,7 +113,9 @@ line:
 - `wait` prints `agent` when waiting on one named agent, `agents` otherwise.
   `wait` and `send --then-wait` keep their exit codes.
 - `inspect` prints `agent`, plus `screen` with `--screen` (`null` once
-  exited).
+  exited) and `turns` with `--last`: oldest first, each with `turn`, `ended`
+  (`done`, `error` or `interrupted`), `at` (Unix seconds), and `prompt` and
+  `reply` when reported.
 - `status` prints `path`, `scope`, `self` (the ID left out, or `null`),
   `summary` (`all_free` and a count per availability) and `agents`.
 - `kill` prints `{"schema":1,"ids":[...]}`: the agents signalled, which may

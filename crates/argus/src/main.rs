@@ -16,6 +16,7 @@ mod term;
 mod theme;
 mod tmux;
 mod tui;
+mod turns;
 mod wait;
 
 use std::process::ExitCode;
@@ -83,6 +84,11 @@ enum Command {
         /// Also print its current screen as plain text
         #[arg(long)]
         screen: bool,
+        /// Also print its last N finished turns (default 1): each prompt and
+        /// final reply, as its hooks reported them
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "1",
+              value_parser = clap::value_parser!(u64).range(1..))]
+        last: Option<u64>,
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -441,7 +447,7 @@ fn main() -> ExitCode {
         Command::Ps { prefix, all, label, watch, output } => {
             client::ps(client::PsOptions { prefix, all, labels: label, json: output.json, watch })
         }
-        Command::Inspect { target, screen, output } => query::inspect(target, screen, output.json),
+        Command::Inspect { target, screen, last, output } => query::inspect(target, screen, last, output.json),
         Command::Status { path, scope, all, include_self, label, output } => {
             query::status(query::StatusOptions { path, scope, all, include_self, labels: label, json: output.json })
         }

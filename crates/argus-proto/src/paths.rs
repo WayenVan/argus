@@ -81,6 +81,11 @@ pub fn output_log(agent_dir: &Path) -> PathBuf {
     agent_dir.join("output.log")
 }
 
+/// One JSON line per finished turn: its prompt and final reply.
+pub fn turn_log(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("turns.jsonl")
+}
+
 /// Creates `dir` (and parents) and makes sure only the owner can enter it.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
