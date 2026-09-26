@@ -71,10 +71,30 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # The tag's section of CHANGELOG.md, e.g. `## [0.2.0] - …` for v0.2.0,
+      # up to the next version heading or the link definitions.
+      - name: Release notes
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          echo >> notes.md
+          echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/CHANGELOG.md" >> notes.md
 
       - name: Create release
         env:
@@ -84,5 +104,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --latest \
-            --generate-notes \
+            --notes-file notes.md \
             dist/*
