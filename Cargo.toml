@@ -4,7 +4,7 @@ members = ["crates/argus-proto", "crates/argus-holder", "crates/argus-hook", "cr
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 

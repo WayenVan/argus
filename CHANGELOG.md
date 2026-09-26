@@ -6,8 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
 ### Added
 
+- Agents report prompts that wait on a person as pending interactions, listed
+  by `argus pending [TARGET]` or, without a target, the agents in this
+  directory and below. `inspect`, `status` and `wait` show them too. A request
+  with evidence it is still waiting marks the agent `blocked` (`needs_user`);
+  one that may resolve by itself stays `observed`. Claude, Codex, opencode, pi
+  and omp report them, and parallel requests are cleared by ID. `--json` prints
+  the agents as usual.
+  - Codex's permission hook fires before its automatic reviewer decides, so a
+    Codex request becomes `needs_user` only once Codex's approval prompt
+    appears on screen. The prompt is recognized by its structure (choices, key
+    hints, enter/esc footer) and the requested command, not by its wording.
+- The dashboard shows the selected agent's details with `K`: the same
+  information as `argus inspect`, scrollable in a popup.
+- `argus attach --alt-screen` forces an alternate-screen redraw when a
+  restarted manager has lost the agent's screen mode.
 - `argus guide [core|labels|coordination]` prints the instructions argus gives
   each agent it starts, or one part of them. For sessions they never reached,
   such as a Codex session started outside argus and resumed in it.
@@ -57,12 +74,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   should and should not change each label, so agents stop relabeling every
   turn. The core section
   now notes that a prompt may come from another agent through `argus send`.
-- A Codex permission request becomes `needs_user`, and the agent `blocked`,
-  once Codex's approval prompt appears on screen. Before, it stayed `observed`
-  even while a person had to answer, since the hook fires before Codex's
-  automatic reviewer decides. The prompt is recognized by its structure
-  (choices, key hints, enter/esc footer) and the requested command from the
-  hook, not by its wording.
+### Fixed
+
+- An agent started with `--cwd` got `PWD` pointing at the manager's directory
+  rather than its own; it now matches the directory it runs in.
+- `attach` after the holder's output ring was truncated forgot whether the
+  agent was on the alternate screen and its input modes; the ring now keeps
+  the modes at the start of the retained output. The TUI's screen preview and
+  a same-size attach also restore from a snapshot instead of replaying history.
 
 ## [0.1.0] - 2026-09-25
 
@@ -194,6 +213,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `argus run`, `argus attach`, and `argus grid`/`tree` dashboards with
   rename/move/kill/copy/new-agent shortcuts and tmux pane jumps.
 
-[Unreleased]: https://github.com/WayenVan/argus/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/WayenVan/argus/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/WayenVan/argus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/WayenVan/argus/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/WayenVan/argus/releases/tag/v0.0.1
