@@ -253,15 +253,16 @@ pub enum Capability {
     ScreenRestore,
     StyledPreview,
     OffsetReplay,
-    /// One this build does not know, from a newer peer. Builds before this
-    /// variant reject a whole message whose list names a capability they do
-    /// not know, so new capabilities go in their own optional field (like
-    /// `Response::Hello::hook_reply`) until those builds are gone.
+    /// The manager answers a `Report` sent with `reply`.
+    HookReply,
+    /// One this build does not know, from a newer peer; ignored rather than
+    /// failing the whole message.
     #[serde(other)]
     Unknown,
 }
 
-pub const MANAGER_CAPABILITIES: &[Capability] = &[Capability::ScreenRestore, Capability::StyledPreview];
+pub const MANAGER_CAPABILITIES: &[Capability] =
+    &[Capability::ScreenRestore, Capability::StyledPreview, Capability::HookReply];
 pub const HOLDER_CAPABILITIES: &[Capability] = &[Capability::OffsetReplay];
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -332,8 +333,8 @@ pub enum Request {
         include_exited: bool,
     },
     /// Sent by `argus-hook` on behalf of an agent. Answered with `HookReply`
-    /// only when `reply` is set, which a hook does only for a manager whose
-    /// `Hello` says `hook_reply`.
+    /// only when `reply` is set, which a hook does only for a manager with
+    /// [`Capability::HookReply`].
     Report {
         agent_id: u64,
         /// The hook's origin (`claude`, `codex`); must match the agent's kind.
@@ -432,10 +433,6 @@ pub enum Response {
         /// that predate it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build: Option<String>,
-        /// The manager answers a `Report` sent with `reply`. A field rather
-        /// than a capability, which older clients could not parse.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        hook_reply: bool,
     },
     Agent {
         agent: AgentInfo,
@@ -809,9 +806,8 @@ mod compatibility_tests {
             r#"{"type":"Hello","version":2,"pid":42,"capabilities":["screen_restore","from_the_future"]}"#,
         )
         .unwrap();
-        let Response::Hello { capabilities, hook_reply, .. } = manager else { panic!() };
+        let Response::Hello { capabilities, .. } = manager else { panic!() };
         assert_eq!(capabilities, [Capability::ScreenRestore, Capability::Unknown]);
-        assert!(!hook_reply, "older managers do not answer reports");
 
         let report: Request =
             serde_json::from_str(r#"{"type":"Report","agent_id":1,"source":"claude","event":{}}"#).unwrap();

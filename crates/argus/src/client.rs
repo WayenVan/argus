@@ -623,8 +623,7 @@ fn holder_build(id: u64) -> Option<String> {
     }
 }
 
-/// Sends no capabilities: the manager does not read them, and an older one
-/// rejects the whole request over a capability it does not know.
+/// Sends no capabilities: the manager does not read them.
 fn hello_request() -> Request {
     Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: Vec::new() }
 }
