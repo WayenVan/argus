@@ -29,7 +29,7 @@ Lightweight manager for long-running terminal agents
 * `rm` — Remove an exited agent
 * `prune` — Remove every exited agent
 * `manager` — Manage the manager process
-* `setup` — One-time changes to an agent's own configuration that widen what it may do; shows them and asks first
+* `setup` — One-time changes to an agent's own configuration that widen what it may do; shows them and asks first. Without an agent, sets up every agent found on PATH
 
 
 
@@ -445,25 +445,32 @@ Show whether the manager is running
 
 ## `argus setup`
 
-One-time changes to an agent's own configuration that widen what it may do; shows them and asks first
+One-time changes to an agent's own configuration that widen what it may do; shows them and asks first. Without an agent, sets up every agent found on PATH
 
-**Usage:** `argus setup <COMMAND>`
+**Usage:** `argus setup [OPTIONS]
+       setup <COMMAND>`
 
 ###### **Subcommands:**
 
-* `codex` — Let Codex agents run `argus label self` outside the sandbox, via a rule in $CODEX_HOME/rules/argus.rules
+* `codex` — Let Codex agents run `argus label self` and `argus ps`/`status`/`inspect`/`wait` outside the sandbox, via rules in $CODEX_HOME/rules/argus.rules
+
+###### **Options:**
+
+* `-y`, `--yes` — Make every change without asking
+* `--remove` — Undo every change instead
+* `--json` — Print JSON (one object per line) instead of text
 
 
 
 ## `argus setup codex`
 
-Let Codex agents run `argus label self` outside the sandbox, via a rule in $CODEX_HOME/rules/argus.rules
+Let Codex agents run `argus label self` and `argus ps`/`status`/`inspect`/`wait` outside the sandbox, via rules in $CODEX_HOME/rules/argus.rules
 
 **Usage:** `argus setup codex [OPTIONS]`
 
 ###### **Options:**
 
-* `-y`, `--yes` — Write the rule without asking
+* `-y`, `--yes` — Write the rules without asking
 * `--remove` — Delete argus's rules file instead
 * `--json` — Print JSON (one object per line) instead of text
 

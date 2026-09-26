@@ -16,35 +16,43 @@ No user file is modified.
 Codex runs a hook only after you trust it. On the first run, attach to the
 agent and accept argus's hooks. You only need to do this once, and again for
 the `Stop` hook after upgrading from 0.1.0, which ran it in the background.
+`argus setup` and `argus setup codex` tell you while they are not trusted yet.
+Only Codex can record the trust, so setup does not write it.
 
 ## Known limitations
 
-**The sandbox stops the agent from setting its labels until you allow it.**
-`argus label` connects to the manager's socket, which Codex's sandbox blocks
-(`Operation not permitted`). Without a rule, each label update needs your
-approval, or fails, depending on your approval settings. argus warns when it
-starts a Codex agent while the rule is missing. Allow it once:
+**The sandbox blocks `argus` commands until you allow them.**
+`argus label` and the read-only `argus ps`, `status`, `inspect` and `wait`
+connect to the manager's socket, which Codex's sandbox blocks
+(`Operation not permitted`). Without rules, each call needs your approval, or
+fails, depending on your approval settings. argus warns when it starts a Codex
+agent while the rules are missing. Allow them once:
 
 ```sh
-argus setup codex            # shows the rule, asks, then writes it
+argus setup codex            # shows the rules, asks, then writes them
 argus setup codex --remove   # undo
 ```
 
-It writes one line to `$CODEX_HOME/rules/argus.rules` (default
+It writes these lines to `$CODEX_HOME/rules/argus.rules` (default
 `~/.codex/rules/`), argus's own file next to yours:
 
 ```text
 prefix_rule(pattern=["argus", "label", "self"], decision="allow")
+prefix_rule(pattern=["argus", "ps"], decision="allow")
+prefix_rule(pattern=["argus", "status"], decision="allow")
+prefix_rule(pattern=["argus", "inspect"], decision="allow")
+prefix_rule(pattern=["argus", "wait"], decision="allow")
 ```
 
-- *Scope:* exactly `argus label self …` runs outside the sandbox without a
-  prompt. A chained command such as `argus label self x && other` still runs
-  sandboxed. The rule matches the word `argus`, so a call by absolute path
-  (`/usr/local/bin/argus label self …`) is not covered.
-- *Reach:* every Codex session reads it, not only agents argus started. Outside
-  argus the command has no agent to label and fails.
+- *Scope:* exactly these commands run outside the sandbox without a prompt.
+  `send`, `kill`, `rm` and the rest still ask. A chained command such as
+  `argus ps && other` still runs sandboxed. The rules match the word `argus`,
+  so a call by absolute path (`/usr/local/bin/argus ps`) is not covered.
+- *Reach:* every Codex session reads them, not only agents argus started.
 - *Why a file:* Codex reads rules only from its rules directory. Claude takes
   its permission per session through `--settings`, so it needs no setup.
+- *Upgrading:* a rules file from an older `argus setup codex` holds only the
+  label rule; run it again to add the rest.
 
 **No hook until the first prompt.**
 Codex fires its first hook with the first prompt. A new agent is `unknown`

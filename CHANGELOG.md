@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `argus setup` without an agent finds each supported agent on `PATH` and runs
+  its setup, asking before each change as `argus setup <agent>` does. `--yes`
+  and `--remove` apply to all of them. For Codex it also says whether argus's
+  hooks are trusted yet; only Codex can record that, so setup does not.
 - `argus inspect --last [N]` prints an agent's last N finished turns: each
   prompt and its full final reply, which `--screen` cuts to what fits on
   screen. The manager records them from hook events into
@@ -30,10 +34,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     failing the message.
   - Codex agents are held the same way. Its `Stop` hook is synchronous now, so
     Codex asks you to review that one hook again once.
-- `argus setup codex` lets Codex agents run `argus label self` outside the
-  sandbox, which blocks the manager's socket. It shows the rule, asks, and
-  writes it to `$CODEX_HOME/rules/argus.rules`; `--remove` deletes that file.
-  Starting a Codex agent warns while the rule is missing.
+- `argus setup codex` lets Codex agents run `argus label self` and the
+  read-only `argus ps`, `status`, `inspect` and `wait` outside the sandbox,
+  which blocks the manager's socket. It shows the rules, asks, and writes them
+  to `$CODEX_HOME/rules/argus.rules`; `--remove` deletes that file. Starting a
+  Codex agent warns while any rule is missing.
 - Claude Code agents may run `argus label self …` without a permission prompt:
   argus's settings allow `Bash(argus label self:*)`, added to your own
   `--settings` if you pass one.

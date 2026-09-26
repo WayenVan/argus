@@ -76,8 +76,8 @@ impl Driver for Codex {
         } else if !trusted() {
             warnings.push("Codex will ask you to review argus's hooks once: attach to this agent and trust them");
         }
-        if !label_rule_installed() {
-            warnings.push("Codex's sandbox blocks `argus label`, so labels may need your approval: run `argus setup codex` once to allow it");
+        if !rules_installed() {
+            warnings.push("Codex's sandbox blocks `argus label` and `argus ps`/`status`/`inspect`/`wait`, so they may need your approval: run `argus setup codex` once to allow them");
         }
         Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
     }
@@ -133,18 +133,26 @@ fn developer_instructions_override() -> Vec<String> {
     vec!["-c".to_string(), format!(r#"developer_instructions="{text}""#)]
 }
 
-/// The exec-policy rule that lets the agent run `argus label self …` outside
-/// Codex's sandbox, which blocks the manager's socket. Codex reads rules only
-/// from files, so `argus setup codex` writes it, after asking.
-pub(crate) const LABEL_RULE: &str = r#"prefix_rule(pattern=["argus", "label", "self"], decision="allow")"#;
+/// The exec-policy rules that let the agent run `argus label self …` and
+/// argus's read-only commands outside Codex's sandbox, which blocks the
+/// manager's socket. Codex reads rules only from files, so `argus setup codex`
+/// writes them, after asking.
+pub(crate) const RULES: &[&str] = &[
+    r#"prefix_rule(pattern=["argus", "label", "self"], decision="allow")"#,
+    r#"prefix_rule(pattern=["argus", "ps"], decision="allow")"#,
+    r#"prefix_rule(pattern=["argus", "status"], decision="allow")"#,
+    r#"prefix_rule(pattern=["argus", "inspect"], decision="allow")"#,
+    r#"prefix_rule(pattern=["argus", "wait"], decision="allow")"#,
+];
 
 /// argus's own rules file, next to the user's.
 pub(crate) fn rules_file() -> PathBuf {
     codex_home().join("rules").join("argus.rules")
 }
 
-pub(crate) fn label_rule_installed() -> bool {
-    std::fs::read_to_string(rules_file()).is_ok_and(|text| text.lines().any(|l| l.trim() == LABEL_RULE))
+/// Whether argus's rules file holds every rule in `RULES`.
+pub(crate) fn rules_installed() -> bool {
+    std::fs::read_to_string(rules_file()).is_ok_and(|text| RULES.iter().all(|r| text.lines().any(|l| l.trim() == *r)))
 }
 
 /// `$CODEX_HOME`, defaulting to `~/.codex`.
@@ -157,7 +165,7 @@ fn codex_home() -> PathBuf {
 /// Whether the user has trusted argus's hooks before. Only presence can be
 /// checked: Codex's hash is its own business, so a stale trust (e.g. after
 /// argus-hook moved) is caught by Codex itself, which asks again.
-fn trusted() -> bool {
+pub(crate) fn trusted() -> bool {
     let Ok(config) = std::fs::read_to_string(codex_home().join("config.toml")) else { return false };
     HOOK_EVENTS.iter().all(|(_, key)| config.contains(&format!("/<session-flags>/config.toml:{key}:0:0")))
 }

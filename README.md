@@ -65,10 +65,11 @@ argus never widens what an agent may do behind your back. When an agent needs
 a lasting permission, `argus setup <agent>` shows exactly what it will write,
 writes it only after you agree, keeps it in a file of argus's own, and
 `--remove` undoes it. argus warns when it starts an agent that is missing one.
+Plain `argus setup` does this for every agent it finds on `PATH`.
 
 | Agent | Command | What it allows |
 |---|---|---|
-| Codex | `argus setup codex` | `argus label self …` outside the sandbox, so agents can set their labels ([details](docs/src/agents/codex.md)) |
+| Codex | `argus setup codex` | `argus label self …` and `argus ps`/`status`/`inspect`/`wait` outside the sandbox, so agents can set their labels and look at other agents ([details](docs/src/agents/codex.md)) |
 
 Claude Code needs none: argus passes its permission per session.
 

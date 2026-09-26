@@ -294,10 +294,20 @@ enum Command {
         #[command(subcommand)]
         action: ManagerAction,
     },
-    /// One-time changes to an agent's own configuration that widen what it may do; shows them and asks first
+    /// One-time changes to an agent's own configuration that widen what it may do; shows them and asks first.
+    /// Without an agent, sets up every agent found on PATH
+    #[command(args_conflicts_with_subcommands = true)]
     Setup {
         #[command(subcommand)]
-        agent: SetupAgent,
+        agent: Option<SetupAgent>,
+        /// Make every change without asking
+        #[arg(long, short)]
+        yes: bool,
+        /// Undo every change instead
+        #[arg(long, conflicts_with = "yes")]
+        remove: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -305,10 +315,10 @@ enum Command {
 /// on its own (see `setup.rs`).
 #[derive(Subcommand)]
 enum SetupAgent {
-    /// Let Codex agents run `argus label self` outside the sandbox, via a rule
-    /// in $CODEX_HOME/rules/argus.rules
+    /// Let Codex agents run `argus label self` and `argus ps`/`status`/`inspect`/`wait`
+    /// outside the sandbox, via rules in $CODEX_HOME/rules/argus.rules
     Codex {
-        /// Write the rule without asking
+        /// Write the rules without asking
         #[arg(long, short)]
         yes: bool,
         /// Delete argus's rules file instead
@@ -382,7 +392,8 @@ impl Command {
             | Command::Kill { output, .. }
             | Command::Rm { output, .. }
             | Command::Prune { output, .. }
-            | Command::Setup { agent: SetupAgent::Codex { output, .. } }
+            | Command::Setup { agent: Some(SetupAgent::Codex { output, .. }), .. }
+            | Command::Setup { agent: None, output, .. }
             | Command::Manager {
                 action:
                     ManagerAction::Start { output }
@@ -486,7 +497,10 @@ fn main() -> ExitCode {
             ManagerAction::Status { output } => client::manager_status(output.json),
             ManagerAction::Run => manager::run(),
         },
-        Command::Setup { agent: SetupAgent::Codex { yes, remove, output } } => setup::codex(yes, remove, output.json),
+        Command::Setup { agent: Some(SetupAgent::Codex { yes, remove, output }), .. } => {
+            setup::codex(yes, remove, output.json)
+        }
+        Command::Setup { agent: None, yes, remove, output } => setup::all(yes, remove, output.json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
