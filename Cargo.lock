@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "argus"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argus-proto",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "argus-holder"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argus-proto",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "argus-hook"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argus-proto",
  "serde_json",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "argus-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "serde",
