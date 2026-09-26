@@ -22,8 +22,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{
-    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, ScreenCheck, field, hook_command,
-    interaction_request,
+    Context, Driver, DriverReport, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, ScreenCheck, block_stop,
+    field, hook_command, interaction_request,
 };
 
 pub struct Codex;
@@ -86,43 +86,43 @@ impl Driver for Codex {
         Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
     }
 
-    fn interpret(&self, event: &Value) -> Hint {
-        match field(event, "hook_event_name").unwrap_or_default() {
-            "SessionStart" => match field(event, "source") {
-                Some("compact") => Hint::Ignore,
-                _ => Hint::SessionStart,
-            },
-            "UserPromptSubmit" | "PostToolUse" => Hint::Working,
-            "PreToolUse" => Hint::Tool(field(event, "tool_name").unwrap_or("tool").to_string()),
-            // Codex may route this to its automatic reviewer. This hook
-            // cannot establish that a human approval prompt is visible.
-            "PermissionRequest" => Hint::Ignore,
-            "Stop" => Hint::Done,
-            // The user interrupted the turn and is presumably about to type.
-            "Interrupt" => Hint::Interrupted,
-            _ => Hint::Ignore,
-        }
-    }
-
-    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
-        (field(event, "hook_event_name") == Some("PermissionRequest")).then(|| InteractionChange::Opened {
-            request: interaction_request(event),
-            // This fires before Codex's reviewer decides whether a person
-            // must answer, and no later hook says it reached one: only the
-            // approval prompt on screen does.
-            confirm_after: None,
-            on_screen: Some(approval_check(event)),
-        })
+    fn translate(&self, event: &Value) -> DriverReport {
+        DriverReport { hint: hint(event), interaction: interaction(event) }
     }
 
     /// Codex takes Claude's answer: a block with a reason continues the turn
     /// with the reason as the next input.
     fn hold_stop(&self, event: &Value, reason: &str) -> Option<String> {
-        if event.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
-            return None;
-        }
-        Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
+        block_stop(event, reason)
     }
+}
+
+fn hint(event: &Value) -> Hint {
+    match field(event, "hook_event_name").unwrap_or_default() {
+        "SessionStart" => match field(event, "source") {
+            Some("compact") => Hint::Ignore,
+            _ => Hint::SessionStart,
+        },
+        "UserPromptSubmit" | "PostToolUse" => Hint::Working,
+        "PreToolUse" => Hint::Tool(field(event, "tool_name").unwrap_or("tool").to_string()),
+        "Stop" => Hint::Done,
+        // The user interrupted the turn and is presumably about to type.
+        "Interrupt" => Hint::Interrupted,
+        // `PermissionRequest` is only an interaction; see `interaction`.
+        _ => Hint::Ignore,
+    }
+}
+
+fn interaction(event: &Value) -> Option<InteractionChange> {
+    (field(event, "hook_event_name") == Some("PermissionRequest")).then(|| InteractionChange::Opened {
+        request: interaction_request(event),
+        // Codex may route the request to its automatic reviewer. This fires
+        // before the reviewer decides whether a person must answer, and no
+        // later hook says it reached one: only the approval prompt on screen
+        // does.
+        confirm_after: None,
+        on_screen: Some(approval_check(event)),
+    })
 }
 
 /// How many of the screen's last non-blank rows the approval prompt is
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn interprets_events() {
-        let hint = |v: Value| Codex.interpret(&v);
+        let hint = |v: Value| Codex.translate(&v).hint;
         assert_eq!(hint(json!({"hook_event_name":"UserPromptSubmit"})), Hint::Working);
         assert_eq!(hint(json!({"hook_event_name":"PreToolUse","tool_name":"shell"})), Hint::Tool("shell".into()));
         assert_eq!(hint(json!({"hook_event_name":"PermissionRequest"})), Hint::Ignore);

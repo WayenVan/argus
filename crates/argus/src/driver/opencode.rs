@@ -23,9 +23,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
-use super::{
-    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint, plugin_interaction,
-};
+use super::{Context, Driver, DriverReport, Launch, SELF_LABEL_INSTRUCTIONS, plugin_report};
 
 pub struct Opencode;
 
@@ -33,6 +31,9 @@ const PLUGIN_JS: &str = include_str!("opencode-plugin.js");
 const PLUGIN_FILE: &str = "argus-opencode.js";
 const INSTRUCTIONS_FILE: &str = "argus-instructions.md";
 const CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+/// How long a permission request may take to resolve without a person
+/// before it counts as waiting on one.
+const CONFIRM_AFTER: Duration = Duration::from_secs(3);
 /// The plugin's event format; see the `v` field in `opencode-plugin.js`.
 const EVENT_VERSION: u64 = 1;
 
@@ -77,25 +78,18 @@ impl Driver for Opencode {
         Ok(warning)
     }
 
-    fn interpret(&self, event: &Value) -> Hint {
-        match plugin_hint(event, EVENT_VERSION) {
-            Hint::WaitingApproval => Hint::Ignore,
-            other => other,
+    fn translate(&self, event: &Value) -> DriverReport {
+        plugin_report(event, EVENT_VERSION, Some(CONFIRM_AFTER))
+    }
+
+    /// Writes the plugin and the instructions it points opencode at.
+    fn write_shared_files(&self, ctx: &Context) -> Result<()> {
+        for (name, text) in [(PLUGIN_FILE, PLUGIN_JS), (INSTRUCTIONS_FILE, SELF_LABEL_INSTRUCTIONS)] {
+            let path = ctx.dir.join(name);
+            fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         }
+        Ok(())
     }
-
-    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
-        plugin_interaction(event, EVENT_VERSION, Some(Duration::from_secs(3)))
-    }
-}
-
-/// Writes the plugin and the instructions it points opencode at.
-pub fn write_shared_files(ctx: &Context) -> Result<()> {
-    for (name, text) in [(PLUGIN_FILE, PLUGIN_JS), (INSTRUCTIONS_FILE, SELF_LABEL_INSTRUCTIONS)] {
-        let path = ctx.dir.join(name);
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(())
 }
 
 /// Appends `item` to the list at `config[key]`, making it a list if needed.
@@ -124,10 +118,11 @@ fn file_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::Hint;
     use std::path::PathBuf;
 
     fn ev(v: Value) -> Hint {
-        Opencode.interpret(&v)
+        Opencode.translate(&v).hint
     }
 
     #[test]

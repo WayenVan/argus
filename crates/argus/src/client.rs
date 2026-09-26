@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -18,12 +18,13 @@ use argus_proto::msg::{
     now_secs,
 };
 use argus_proto::{BUILD, HOLDER_PROTOCOL_VERSION, MANAGER_PROTOCOL_VERSION, paths};
-use nix::sys::signal::kill as signal_process;
-use nix::unistd::{Pid, isatty, setsid};
+use nix::fcntl::{Flock, FlockArg};
+use nix::unistd::{isatty, setsid};
 
 use crate::errors::{self, CodedError};
 use crate::output::{self, AgentList, AgentView, AgentWithWarnings, OneAgent};
-use crate::{attach, naming, stream, term};
+use crate::watcher::Watcher;
+use crate::{attach, naming, term};
 use serde::Serialize;
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
@@ -147,8 +148,11 @@ fn spawn_manager() -> Result<()> {
             Ok(())
         });
     }
-    // The manager outlives us; init reaps it once we exit.
-    cmd.spawn().context("starting the manager")?;
+    // The manager is our child until we exit, and then init's. A client that
+    // outlives it (an attached `argus run`, `argus tree`) reaps it, so a
+    // stopped manager does not linger as a zombie.
+    let mut child = cmd.spawn().context("starting the manager")?;
+    std::thread::spawn(move || child.wait());
     Ok(())
 }
 
@@ -257,13 +261,34 @@ impl PsOptions {
 
 pub fn ps(opts: PsOptions) -> Result<()> {
     if opts.watch {
-        return stream::ps_watch(&opts);
+        return ps_watch(&opts);
     }
     let agents: Vec<AgentInfo> = Conn::connect()?.list(true)?.into_iter().filter(|a| opts.keeps(a)).collect();
     if opts.json {
         output::print(AgentList::new(&agents));
     } else {
         print!("{}", format_table(&agents));
+    }
+    Ok(())
+}
+
+/// `ps -w`: the table, redrawn on every change until interrupted.
+fn ps_watch(opts: &PsOptions) -> Result<()> {
+    let mut watcher = Watcher::start(None, opts.all)?;
+    loop {
+        render_ps(watcher.agents(), opts)?;
+        // Redraw at least once a second so AGE keeps moving.
+        watcher.next(Duration::from_secs(1))?;
+    }
+}
+
+fn render_ps(table: &BTreeMap<u64, AgentInfo>, opts: &PsOptions) -> Result<()> {
+    let agents: Vec<AgentInfo> = table.values().filter(|a| opts.keeps(a)).cloned().collect();
+    let mut out = io::stdout().lock();
+    let written = write!(out, "\x1b[H\x1b[2Jargus ps -w  (Ctrl-C to quit)\n\n{}", format_table(&agents))
+        .and_then(|_| out.flush());
+    if written.is_err() {
+        std::process::exit(0); // stdout closed
     }
     Ok(())
 }
@@ -468,6 +493,20 @@ pub fn manager_start(json: bool) -> Result<()> {
     manager_status(json)
 }
 
+/// The pid the running manager wrote, if any.
+fn manager_pid() -> Option<u32> {
+    std::fs::read_to_string(paths::manager_pid()).ok()?.trim().parse().ok()
+}
+
+/// Whether a manager holds the single-instance lock, i.e. is still running.
+fn manager_holds_lock() -> bool {
+    let Ok(file) = OpenOptions::new().create(true).truncate(false).write(true).open(paths::manager_lock()) else {
+        return false;
+    };
+    // Taken only to test it; released again at once.
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err()
+}
+
 pub fn manager_stop(kill_agents: bool, json: bool) -> Result<()> {
     let was_running = match Conn::open(false)? {
         Some(mut conn) => {
@@ -492,9 +531,12 @@ pub fn manager_restart(json: bool) -> Result<()> {
             bail!("unexpected reply to Hello");
         };
         conn.request(&Request::Shutdown { kill_agents: false })?;
-        // The old manager holds the single-instance lock until it exits.
+        // The old manager holds the single-instance lock until it is done,
+        // unless a client watching agents already started the next one,
+        // which then holds the lock and has written its own pid. Not the old
+        // pid alone: a zombie or a reused pid would look alive.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while signal_process(Pid::from_raw(pid as i32), None).is_ok() {
+        while manager_holds_lock() && manager_pid() == Some(pid) {
             if Instant::now() > deadline {
                 bail!("the old manager (pid {pid}) did not exit");
             }

@@ -4,9 +4,9 @@
 //!
 //! Only the current visible screen is tracked (no vt100 scrollback): once an
 //! agent has entered the alternate screen, replaying its history is neither
-//! possible (alt screen has none) nor useful. On the primary screen a normal
-//! attach replays the holder's ring buffer for scrollback, while a dashboard
-//! attach can restore just the current screen and its output offset.
+//! possible (alt screen has none) nor useful. On the primary screen every
+//! attach, from a shell or the dashboard, replays the holder's ring buffer
+//! instead, so the agent's history lands in the terminal's scrollback.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -150,17 +150,7 @@ impl Screens {
     /// How `id`'s screen should be restored. `since_offset` lets a caller
     /// that already has the screen at that offset skip the bytes.
     pub fn get(&self, id: u64, since_offset: Option<u64>) -> ScreenReply {
-        self.get_with_mode(id, since_offset, false)
-    }
-
-    /// A TUI attach needs the current primary screen, not a replay of up to
-    /// 1 MiB of history. The snapshot and output offset come from one lock.
-    pub fn get_current(&self, id: u64, since_offset: Option<u64>) -> ScreenReply {
-        self.get_with_mode(id, since_offset, true)
-    }
-
-    fn get_with_mode(&self, id: u64, since_offset: Option<u64>, current: bool) -> ScreenReply {
-        self.read(id, |state| snapshot(state, since_offset, current)).unwrap_or(ScreenReply {
+        self.read(id, |state| snapshot(state, since_offset)).unwrap_or(ScreenReply {
             mode: ScreenMode::Unavailable,
             rows: 0,
             cols: 0,
@@ -212,22 +202,12 @@ fn lock(state: &Mutex<State>) -> ControlFlow<(), MutexGuard<'_, State>> {
     }
 }
 
-fn snapshot(state: &State, since_offset: Option<u64>, current: bool) -> ScreenReply {
+fn snapshot(state: &State, since_offset: Option<u64>) -> ScreenReply {
     let screen = state.parser.screen();
     let (rows, cols) = screen.size();
     if !screen.alternate_screen() {
-        if current {
-            let bytes = if since_offset == Some(state.offset) {
-                vec![]
-            } else {
-                let mut bytes = screen.state_formatted();
-                append_styled_blanks(screen, &mut bytes);
-                bytes.extend(screen.cursor_state_formatted());
-                bytes.extend(screen.attributes_formatted());
-                bytes
-            };
-            return ScreenReply { mode: ScreenMode::PrimarySnapshot, rows, cols, offset: state.offset, bytes };
-        }
+        // An agent on the primary screen keeps its history there, for the
+        // terminal's scrollback: replay it rather than redraw one screen.
         // 0 tells the holder to replay from its oldest retained byte:
         // there is no screen-owned history to fall back on instead.
         return ScreenReply { mode: ScreenMode::Replay, rows, cols, offset: 0, bytes: vec![] };
@@ -508,30 +488,6 @@ mod tests {
         );
         feed(&s, 1, 1_000_000, b"redrawn");
         assert_eq!(s.get(1, None).mode, ScreenMode::Snapshot);
-    }
-
-    #[test]
-    fn current_primary_snapshot_skips_history_and_keeps_its_offset() {
-        let s = screens();
-        resize(&s, 1, 5, 20);
-        let output = b"first\r\nsecond\r\nthird";
-        feed(&s, 1, 0, output);
-
-        let r = s.get_current(1, None);
-        assert_eq!(r.mode, ScreenMode::PrimarySnapshot);
-        assert_eq!(r.offset, output.len() as u64);
-        assert!(!r.bytes.starts_with(b"\x1b[?1049h"));
-        let mut restored = vt100::Parser::new(5, 20, 0);
-        restored.process(&r.bytes);
-        assert!(restored.screen().contents().contains("third"));
-        assert!(s.get_current(1, Some(r.offset)).bytes.is_empty());
-        assert_eq!(s.get(1, None).mode, ScreenMode::Replay);
-
-        let history = (0..1000).map(|n| format!("line-{n:04}\r\n")).collect::<String>();
-        feed(&s, 1, r.offset, history.as_bytes());
-        let recent = s.get_current(1, None);
-        assert_eq!(recent.offset, r.offset + history.len() as u64);
-        assert!(recent.bytes.len() < history.len() / 2, "current screen should stay bounded despite long history");
     }
 
     #[test]

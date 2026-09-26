@@ -3,20 +3,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use argus_proto::msg::{Activity, AgentInfo, Availability, InteractionPhase};
 
 use crate::client::Conn;
+use crate::driver;
 use crate::errors::{EXITED, STUCK, TIMEOUT, code_of, coded};
-use crate::manager::driver;
+use crate::naming;
 use crate::naming::self_id;
 use crate::output::{self, AgentList, OneAgent};
 use crate::query::{Place, Scope};
-use crate::stream::Messages;
-use crate::{naming, stream};
+use crate::watcher::{Update, Watcher};
 
 /// How long `send --then-wait` gives a sent prompt to show up as activity.
 const PICKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,9 +95,8 @@ pub fn wait(waited: Waited, goal: Goal, after: Option<u64>, timeout: Option<u64>
         if me == Some(agent.id) {
             bail!("an agent cannot wait for itself");
         }
-        let (agents, rx) = stream::start_watch(Some(vec![agent.id]), true)?;
-        let agent = agents.into_iter().next().unwrap_or(agent);
-        let agent = after_turn(agent, &rx, after, &goal, deadline, None, !json)?;
+        let mut watcher = Watcher::start(Some(vec![agent.id]), true)?;
+        let agent = after_turn(&mut watcher, &agent, after, &goal, deadline, None, !json)?;
         return finish(&[&agent], true, &goal, json);
     }
     let (ids, place, labels) = match waited {
@@ -118,14 +116,14 @@ pub fn wait(waited: Waited, goal: Goal, after: Option<u64>, timeout: Option<u64>
         Waited::Dir { path, scope, labels } => (None, Some(Place::new(path, scope)?), labels),
     };
     let single = ids.as_ref().is_some_and(|ids| ids.len() == 1);
-    let (agents, rx) = stream::start_watch(ids.clone(), true)?;
-    let mut table: BTreeMap<u64, AgentInfo> = agents.into_iter().map(|a| (a.id, a)).collect();
+    let mut watcher = Watcher::start(ids.clone(), true)?;
     // Whether an agent is in the directory; its cwd never changes.
     let mut inside: HashMap<u64, bool> = HashMap::new();
     let mut notices = InteractionNotices::new(&goal, !json);
     loop {
+        let table = watcher.agents();
         let check = match &ids {
-            Some(ids) => check_targets(ids, &table, &goal)?,
+            Some(ids) => check_targets(ids, table, &goal)?,
             None => {
                 let place = place.as_ref().expect("set with no targets");
                 let members: Vec<&AgentInfo> = table
@@ -140,22 +138,16 @@ pub fn wait(waited: Waited, goal: Goal, after: Option<u64>, timeout: Option<u64>
         let watched = match &check {
             Check::Reached(agents) | Check::Pending(agents) => agents,
         };
-        notices.observe_all(watched, &table, Instant::now());
+        notices.observe_all(watched, table, Instant::now());
         let pending = match check {
             Check::Reached(agents) => return finish(&agents, single, &goal, json),
             Check::Pending(pending) => pending,
         };
+        let names: Vec<String> = pending.iter().map(|a| format!("{} ({})", a.name, a.activity)).collect();
         let idle_for = if notices.pending() { Duration::from_secs(1) } else { Duration::from_secs(3600) };
         let wait_for = deadline.map_or(idle_for, |d| d.saturating_duration_since(Instant::now()).min(idle_for));
-        match rx.recv_timeout(wait_for) {
-            Ok(Ok(Some(msg))) => stream::apply(&mut table, &msg),
-            Err(RecvTimeoutError::Timeout) if deadline.is_some_and(|d| Instant::now() >= d) => {
-                let names: Vec<String> = pending.iter().map(|a| format!("{} ({})", a.name, a.activity)).collect();
-                return Err(coded(TIMEOUT, format!("timed out waiting for {}", names.join(", "))));
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(Err(e)) => return Err(e),
-            Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => bail!("lost connection to the manager"),
+        if matches!(watcher.next(wait_for)?, Update::Nothing) && deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(coded(TIMEOUT, format!("timed out waiting for {}", names.join(", "))));
         }
     }
 }
@@ -166,15 +158,16 @@ pub struct Pickup {
     pub at: Instant,
 }
 
-/// Blocks until `current` reaches `goal` with `turns > after`: in a turn that
-/// finished after turn `after`. Fails with `stuck` if the turn ends in an error
-/// or the agent goes unknown on the way (e.g. interrupted with Esc, which ends
-/// a turn without `Stop`). Being unknown already at the start, as every agent
-/// is right after a manager restart, does not count. `blocked` keeps waiting,
-/// with a notice on stderr when `notify` (see [`InteractionNotices`]).
+/// Blocks until `agent`, as `watcher` follows it, reaches `goal` with
+/// `turns > after`: in a turn that finished after turn `after`. Fails with
+/// `stuck` if the turn ends in an error or the agent goes unknown on the way
+/// (e.g. interrupted with Esc, which ends a turn without `Stop`). Being unknown
+/// at the start, or right after the manager restarted, does not count: every
+/// agent is unknown then. `blocked` keeps waiting, with a notice on stderr when
+/// `notify` (see [`InteractionNotices`]).
 pub fn after_turn(
-    mut current: AgentInfo,
-    rx: &Messages,
+    watcher: &mut Watcher,
+    agent: &AgentInfo,
     after: u64,
     goal: &Goal,
     deadline: Option<Instant>,
@@ -184,9 +177,10 @@ pub fn after_turn(
     if goal.is_exit() {
         bail!("--after waits for a turn; to wait for the process to end, drop --after");
     }
-    if !driver::for_kind(&current.kind).has_hooks() {
-        bail!("{} has no hooks, so it reports no turns; wait with --until exited", current.name);
+    if !driver::for_kind(&agent.kind).has_hooks() {
+        bail!("{} has no hooks, so it reports no turns; wait with --until exited", agent.name);
     }
+    let mut current = watcher.get(agent.id).cloned().unwrap_or_else(|| agent.clone());
     let mut known = false;
     let mut picked_up = pickup.is_none();
     let mut notices = InteractionNotices::new(goal, notify);
@@ -214,13 +208,39 @@ pub fn after_turn(
                 bail!("{} has not picked up the prompt", current.name);
             }
         }
-        if let Err(e) = stream::next_update(rx, &mut current, deadline, Duration::from_secs(1)) {
-            if code_of(&e) == TIMEOUT {
+        match next_state(watcher, &mut current, deadline, Duration::from_secs(1)) {
+            Ok(reset) => known &= !reset,
+            Err(e) if code_of(&e) == TIMEOUT => {
                 return Err(coded(TIMEOUT, format!("timed out waiting for {} ({})", current.name, current.activity)));
             }
-            return Err(e);
+            Err(e) => return Err(e),
         }
     }
+}
+
+/// Waits at most `poll` for news, then brings `current` up to date. Returns
+/// whether the watcher's table was reset (see [`Update::Reset`]). Fails with
+/// `timeout` once `deadline` passes, and when the agent was removed or is no
+/// longer running.
+pub fn next_state(
+    watcher: &mut Watcher,
+    current: &mut AgentInfo,
+    deadline: Option<Instant>,
+    poll: Duration,
+) -> Result<bool> {
+    let wait_for = deadline.map_or(poll, |d| d.saturating_duration_since(Instant::now()).min(poll));
+    let reset = matches!(watcher.next(wait_for)?, Update::Reset);
+    match watcher.get(current.id) {
+        Some(agent) => *current = agent.clone(),
+        None => bail!("{} was removed", current.name),
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(coded(TIMEOUT, format!("timed out waiting for {}", current.name)));
+    }
+    if !current.status.is_live() {
+        return Err(coded(EXITED, format!("{} {}", current.name, current.status.as_str())));
+    }
+    Ok(reset)
 }
 
 /// Reports confirmed blocks and long-lived unconfirmed requests on stderr.
@@ -376,6 +396,7 @@ fn finish(agents: &[&AgentInfo], single: bool, goal: &Goal, json: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argus_proto::msg::Response;
 
     fn agent(activity: &str, live: bool) -> AgentInfo {
         serde_json::from_value(serde_json::json!({
@@ -420,13 +441,23 @@ mod tests {
     /// Runs `after_turn(after)` on `start` followed by `updates`, with a
     /// deadline so a wait that never ends times out.
     fn after(start: AgentInfo, updates: &[AgentInfo], after: u64) -> Result<AgentInfo> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        for (seq, agent) in updates.iter().enumerate() {
+        let messages = updates.iter().enumerate().map(|(seq, agent)| {
             let event = argus_proto::msg::AgentEvent::Updated { agent: agent.clone() };
-            tx.send(Ok(Some(argus_proto::msg::Response::Event { epoch: 1, seq: seq as u64, event }))).unwrap();
+            Response::Event { epoch: 1, seq: seq as u64, event }
+        });
+        after_messages(start, messages.collect(), after)
+    }
+
+    /// Runs `after_turn(after)` on `start` followed by `messages`, with a
+    /// deadline so a wait that never ends times out.
+    fn after_messages(start: AgentInfo, messages: Vec<Response>, after: u64) -> Result<AgentInfo> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for msg in messages {
+            tx.send(Ok(Some(msg))).unwrap();
         }
+        let mut watcher = Watcher::fake(vec![start.clone()], rx);
         let deadline = Some(Instant::now() + Duration::from_millis(50));
-        after_turn(start, &rx, after, &Goal::Availability(Availability::Free), deadline, None, false)
+        after_turn(&mut watcher, &start, after, &Goal::Availability(Availability::Free), deadline, None, false)
     }
 
     #[test]
@@ -447,6 +478,11 @@ mod tests {
         // Every agent starts unknown after a manager restart.
         let restarted = [turned("working", 2), turned("done", 3)];
         assert_eq!(after(turned("unknown", 2), &restarted, 2).unwrap().turns, 3);
+        // Also when the manager restarts during the wait.
+        let snapshot = Response::Snapshot { epoch: 2, seq: 0, agents: vec![turned("unknown", 2)] };
+        let done = argus_proto::msg::AgentEvent::Updated { agent: turned("done", 3) };
+        let messages = vec![snapshot, Response::Event { epoch: 2, seq: 1, event: done }];
+        assert_eq!(after_messages(turned("working", 2), messages, 2).unwrap().turns, 3);
     }
 
     #[test]
@@ -513,7 +549,8 @@ mod tests {
         assert!(after(generic, &[], 0).is_err());
         let exited = Goal::Availability(Availability::Exited);
         let (_tx, rx) = std::sync::mpsc::channel();
-        assert!(after_turn(turned("idle", 0), &rx, 0, &exited, None, None, false).is_err());
+        let mut watcher = Watcher::fake(vec![turned("idle", 0)], rx);
+        assert!(after_turn(&mut watcher, &turned("idle", 0), 0, &exited, None, None, false).is_err());
     }
 
     #[test]

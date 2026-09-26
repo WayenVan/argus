@@ -191,7 +191,7 @@ impl std::str::FromStr for Availability {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentInfo {
     pub id: u64,
     /// Path-shaped name, e.g. `research/claude-1`. The group is its prefix.
@@ -392,16 +392,11 @@ pub enum Request {
     /// The manager's own idea of the agent's current screen, for `attach` to
     /// restore without depending on the agent redrawing itself. `since_offset`
     /// lets a caller that already has the screen at that offset skip the
-    /// bytes. `current` requests a primary-screen snapshot instead of a
-    /// history replay, for dashboard attaches.
+    /// bytes.
     Screen {
         target: String,
         #[serde(default)]
         since_offset: Option<u64>,
-        /// For TUI attach, restore the current primary screen instead of
-        /// replaying its retained output history.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        current: bool,
     },
     /// A styled crop of the agent's current screen to `rows`x`cols`, for
     /// dashboard thumbnails. Unlike `Screen`, it contains structured spans,
@@ -587,9 +582,6 @@ pub enum ScreenMode {
     /// redraw of the current screen and terminal modes. Apply it only if the
     /// caller's terminal size matches `rows`/`cols`.
     Snapshot,
-    /// A redraw of the current primary screen with a matching output offset.
-    /// It has no alternate-screen switch or scrollback history.
-    PrimarySnapshot,
     /// The agent is on the primary screen: recovering earlier output means
     /// replaying the holder's ring buffer from `offset`
     /// (usually its oldest retained byte) instead of a synthetic redraw.
@@ -803,12 +795,11 @@ mod compatibility_tests {
     use super::*;
 
     #[test]
-    fn screen_current_flag_defaults_to_history_replay() {
-        let old = serde_json::json!({"type": "Screen", "target": "1", "since_offset": null});
+    fn screen_requests_from_older_clients_still_parse() {
+        // `current` asked for a primary-screen snapshot; it is ignored now.
+        let old = serde_json::json!({"type": "Screen", "target": "1", "since_offset": null, "current": true});
         let request: Request = serde_json::from_value(old).unwrap();
-        assert!(matches!(request, Request::Screen { current: false, .. }));
-        let request = Request::Screen { target: "1".into(), since_offset: None, current: true };
-        assert_eq!(serde_json::to_value(request).unwrap()["current"], true);
+        assert!(matches!(request, Request::Screen { since_offset: None, .. }));
     }
 
     #[test]

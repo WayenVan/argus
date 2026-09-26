@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   through the agent's whole current screen with `↑`/`↓` (`k`/`j`) and
   `PgUp`/`PgDn`. `c` copies what the focused pane shows: the name, the
   screen as text, the title or the recap.
+- Tree mode shows the selected agent's ID and working directory in their own
+  panes, next to each other under the preview; both take focus and `c`
+  copies them (the whole path, though the pane shortens it). Unset labels
+  read "not set".
 - The dashboard's details popup opens and closes with `i` (was `K`).
 
 ### Fixed
@@ -24,6 +28,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   DECSET mode, kitty keyboard stacks per screen, XTMODKEYS, OSC colours,
   keypad mode, scroll region) and undoes exactly those on the way out,
   instead of resetting a fixed list.
+- `argus manager restart` no longer waits 5 s and fails with "the old manager
+  did not exit" when the manager was started by an `argus` command that is
+  still running (an attached `argus run`, `argus tree`, `argus wait`).
+- Attaching from the dashboard to an agent on the normal screen (omp)
+  replays its recent output again, as `argus attach` does, instead of
+  showing only its current screen with nothing to scroll back to.
+- `argus wait` and `argus send --wait` / `--then-wait` keep waiting across
+  `argus manager restart` instead of failing with "lost connection to the
+  manager", as `ps -w`, `events` and the dashboards already did.
 
 ## [0.2.0] - 2026-09-26
 

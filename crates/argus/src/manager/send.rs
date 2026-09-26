@@ -3,7 +3,7 @@
 //!
 //! The check and the typing both happen here, not in the client, so nothing
 //! can change between them: the registry lock is held while deciding, and
-//! `submitting` keeps a second send out until the agent has picked up the
+//! [`SendGate`] keeps a second send out until the agent has picked up the
 //! first (its activity leaves `idle`/`done`) or `SUBMIT_TIMEOUT` passes.
 
 use std::time::{Duration, Instant};
@@ -23,6 +23,32 @@ const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 const ENTER_DELAY: Duration = Duration::from_millis(30);
 const PASTE_ENTER_DELAY: Duration = Duration::from_millis(150);
 
+/// What an agent's `send`s are checked against besides its activity.
+#[derive(Default)]
+pub struct SendGate {
+    /// When an attached terminal last typed into the agent.
+    last_input: Option<Instant>,
+    /// Set by `argus send` until the agent leaves `idle`/`done` (the prompt
+    /// was submitted) or this deadline passes, so a second send cannot land
+    /// on top of the first.
+    submitting: Option<Instant>,
+}
+
+impl SendGate {
+    /// An attached terminal typed into the agent.
+    pub fn typed(&mut self, at: Instant) {
+        self.last_input = Some(at);
+    }
+
+    /// The agent's activity became `activity`. Once it no longer waits for a
+    /// prompt, a prompt sent earlier went through.
+    pub fn activity_changed(&mut self, activity: &Activity) {
+        if !activity.awaits_prompt() {
+            self.submitting = None;
+        }
+    }
+}
+
 const PASTE_START: &str = "\x1b[200~";
 const PASTE_END: &str = "\x1b[201~";
 
@@ -31,7 +57,7 @@ impl Manager {
         let (id, name, turn) = {
             let mut reg = self.registry.lock().unwrap();
             let id = resolve_one(&reg, target, "send")?;
-            let rec = reg.agents.get_mut(&id).expect("resolved");
+            let rec = reg.get(id).expect("resolved");
             if !rec.info.status.is_live() {
                 bail!("{} is not running", rec.info.name);
             }
@@ -39,15 +65,14 @@ impl Manager {
             if let Some(reason) = refusal(rec, force, now) {
                 return Ok(Response::error(crate::errors::NOT_READY, format!("{} {reason}", rec.info.name)));
             }
-            rec.runtime.submitting = Some(now + SUBMIT_TIMEOUT);
-            (id, rec.info.name.clone(), rec.info.turns)
+            let (name, turn) = (rec.info.name.clone(), rec.info.turns);
+            reg.edit(id, |rec| rec.runtime.send.submitting = Some(now + SUBMIT_TIMEOUT));
+            (id, name, turn)
         };
         let typed = self.type_text(id, &text, enter).await;
         if typed.is_err() || !enter {
             // Nothing was submitted, so there is nothing to wait for.
-            if let Some(rec) = self.registry.lock().unwrap().agents.get_mut(&id) {
-                rec.runtime.submitting = None;
-            }
+            self.registry.lock().unwrap().edit(id, |rec| rec.runtime.send.submitting = None);
         }
         typed?;
         if enter {
@@ -103,10 +128,10 @@ fn refusal(rec: &AgentRecord, force: bool, now: Instant) -> Option<String> {
     if force {
         return None;
     }
-    if rec.info.attached > 0 && rec.runtime.last_input.is_some_and(|t| now < t + TYPING_GRACE) {
+    if rec.info.attached > 0 && rec.runtime.send.last_input.is_some_and(|t| now < t + TYPING_GRACE) {
         return Some("has someone typing in an attached terminal".into());
     }
-    if rec.runtime.submitting.is_some_and(|deadline| now < deadline) {
+    if rec.runtime.send.submitting.is_some_and(|deadline| now < deadline) {
         return Some("is still taking an earlier prompt".into());
     }
     None
@@ -115,29 +140,12 @@ fn refusal(rec: &AgentRecord, force: bool, now: Instant) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_proto::msg::{AgentInfo, AgentStatus};
+    use crate::manager::registry::test_record;
 
     fn record(activity: &str) -> AgentRecord {
-        AgentRecord::new(AgentInfo {
-            id: 1,
-            name: "a".into(),
-            kind: "claude".into(),
-            command: vec![],
-            cwd: "/".into(),
-            created_at: 0,
-            exited_at: None,
-            holder_pid: None,
-            agent_pid: None,
-            status: AgentStatus::Running,
-            exit_code: None,
-            activity: activity.into(),
-            activity_since: None,
-            turns: 0,
-            attached: 0,
-            tmux_locations: Vec::new(),
-            pending_interactions: Vec::new(),
-            labels: Default::default(),
-        })
+        let mut rec = test_record();
+        rec.info.activity = activity.into();
+        rec
     }
 
     #[test]
@@ -163,14 +171,14 @@ mod tests {
     fn typing_and_submitting() {
         let now = Instant::now();
         let mut rec = record("idle");
-        rec.runtime.last_input = Some(now);
+        rec.runtime.send.last_input = Some(now);
         assert_eq!(refusal(&rec, false, now), None, "detached input does not count");
         rec.info.attached = 1;
         assert!(refusal(&rec, false, now).is_some());
         assert_eq!(refusal(&rec, false, now + TYPING_GRACE), None);
 
         let mut rec = record("idle");
-        rec.runtime.submitting = Some(now + SUBMIT_TIMEOUT);
+        rec.runtime.send.submitting = Some(now + SUBMIT_TIMEOUT);
         assert!(refusal(&rec, false, now).is_some());
         assert_eq!(refusal(&rec, false, now + SUBMIT_TIMEOUT), None);
     }

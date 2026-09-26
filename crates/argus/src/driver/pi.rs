@@ -17,9 +17,7 @@ use std::fs;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-use super::{
-    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, plugin_hint, plugin_interaction,
-};
+use super::{Context, Driver, DriverReport, Launch, SELF_LABEL_INSTRUCTIONS, plugin_report};
 
 pub struct Pi;
 
@@ -46,12 +44,14 @@ impl Driver for Pi {
         Ok(inject(launch, ctx, SUBCOMMANDS, EXTENSION_FILE, HOOK_ENV))
     }
 
-    fn interpret(&self, event: &Value) -> Hint {
-        plugin_hint(event, EVENT_VERSION)
+    fn translate(&self, event: &Value) -> DriverReport {
+        plugin_report(event, EVENT_VERSION, None)
     }
 
-    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
-        plugin_interaction(event, EVENT_VERSION, None)
+    /// Writes the extension the agents load.
+    fn write_shared_files(&self, ctx: &Context) -> Result<()> {
+        let path = ctx.dir.join(EXTENSION_FILE);
+        fs::write(&path, EXTENSION_JS).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -83,15 +83,10 @@ pub(super) fn inject(
     warning
 }
 
-/// Writes the extension the agents load.
-pub fn write_shared_files(ctx: &Context) -> Result<()> {
-    let path = ctx.dir.join(EXTENSION_FILE);
-    fs::write(&path, EXTENSION_JS).with_context(|| format!("writing {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::Hint;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -103,20 +98,24 @@ mod tests {
         Launch { command: command.iter().map(|s| s.to_string()).collect(), env: vec![], agent_dir: PathBuf::new() }
     }
 
+    fn hint(event: &Value) -> Hint {
+        Pi.translate(event).hint
+    }
+
     #[test]
     fn interprets_events() {
         let e = |name: &str| json!({"v": 1, "hook_event_name": name, "session_id": "s"});
-        assert_eq!(Pi.interpret(&e("SessionStart")), Hint::SessionStart);
-        assert_eq!(Pi.interpret(&e("UserPromptSubmit")), Hint::Working);
+        assert_eq!(hint(&e("SessionStart")), Hint::SessionStart);
+        assert_eq!(hint(&e("UserPromptSubmit")), Hint::Working);
         assert_eq!(
-            Pi.interpret(&json!({"v": 1, "hook_event_name": "PreToolUse", "tool_name": "bash"})),
+            hint(&json!({"v": 1, "hook_event_name": "PreToolUse", "tool_name": "bash"})),
             Hint::Tool("bash".into())
         );
-        assert_eq!(Pi.interpret(&e("PermissionRequest")), Hint::WaitingApproval);
-        assert_eq!(Pi.interpret(&e("Stop")), Hint::Done);
-        assert_eq!(Pi.interpret(&e("StopFailure")), Hint::Error);
-        assert_eq!(Pi.interpret(&e("Interrupt")), Hint::Interrupted);
-        assert_eq!(Pi.interpret(&json!({"v": 2, "hook_event_name": "Stop"})), Hint::Ignore);
+        assert_eq!(hint(&e("PermissionRequest")), Hint::Ignore);
+        assert_eq!(hint(&e("Stop")), Hint::Done);
+        assert_eq!(hint(&e("StopFailure")), Hint::Error);
+        assert_eq!(hint(&e("Interrupt")), Hint::Interrupted);
+        assert_eq!(hint(&json!({"v": 2, "hook_event_name": "Stop"})), Hint::Ignore);
     }
 
     #[test]

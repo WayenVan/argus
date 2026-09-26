@@ -5,20 +5,24 @@
 
 mod attach;
 mod client;
+mod driver;
 mod errors;
+mod events;
+mod logs;
 mod manager;
 mod modes;
 mod naming;
 mod output;
 mod query;
+mod send;
 mod setup;
-mod stream;
 mod term;
 mod theme;
 mod tmux;
 mod tui;
 mod turns;
 mod wait;
+mod watcher;
 
 use std::process::ExitCode;
 
@@ -496,15 +500,15 @@ fn main() -> ExitCode {
         }
         Command::Grid { prefix, label } => tui::run(tui::Mode::Grid, prefix, label),
         Command::Tree { prefix, label } => tui::run(tui::Mode::Tree, prefix, label),
-        Command::Logs { target, bytes, follow, raw, screen } => stream::logs(target, bytes, follow, raw, screen),
-        Command::Send { target, text, no_enter, force, wait, then_wait, timeout, output } => stream::send(
+        Command::Logs { target, bytes, follow, raw, screen } => logs::logs(target, bytes, follow, raw, screen),
+        Command::Send { target, text, no_enter, force, wait, then_wait, timeout, output } => send::send(
             target,
-            stream::SendOptions { text, enter: !no_enter, force, wait, then_wait, timeout, json: output.json },
+            send::SendOptions { text, enter: !no_enter, force, wait, then_wait, timeout, json: output.json },
         ),
         Command::Rename { target, name, output } => client::rename(target, name, output.json),
         Command::Mv { target, group, output } => client::mv(target, group, output.json),
         Command::Label { target, changes, output } => client::label(target, changes, output.json),
-        Command::Events { output } => stream::events(output.json),
+        Command::Events { output } => events::events(output.json),
         Command::Ack { target, output } => client::ack(target, output.json),
         Command::Wait { targets, dir, scope, label, until, until_activity, after, timeout, output } => {
             let waited = match dir {
@@ -526,7 +530,7 @@ fn main() -> ExitCode {
             print!(
                 "{}",
                 match section {
-                    None => manager::driver::SELF_LABEL_INSTRUCTIONS,
+                    None => driver::SELF_LABEL_INSTRUCTIONS,
                     Some(GuideSection::Core) => include_str!("instructions/core.md"),
                     Some(GuideSection::Labels) => include_str!("instructions/labels.md"),
                     Some(GuideSection::Coordination) => include_str!("instructions/coordination.md"),

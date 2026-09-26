@@ -13,7 +13,7 @@
 //! since `Watch` deliberately never carries output.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::mpsc::TryRecvError;
+
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,13 +26,14 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use crate::attach;
 use crate::client::{self, Conn, PsOptions};
 use crate::errors::CodedError;
 use crate::theme::theme;
-use crate::{Cli, Command, query, stream, term, tmux};
+use crate::watcher::Watcher;
+use crate::{Cli, Command, query, term, tmux};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
 /// list (pushed by Watch, applied as it arrives), preview bytes are always a
@@ -111,12 +112,14 @@ enum Pane {
     #[default]
     Agents,
     Preview,
+    Id,
+    Cwd,
     Title,
     Recap,
 }
 
 impl Pane {
-    const ALL: [Pane; 4] = [Pane::Agents, Pane::Preview, Pane::Title, Pane::Recap];
+    const ALL: [Pane; 6] = [Pane::Agents, Pane::Preview, Pane::Id, Pane::Cwd, Pane::Title, Pane::Recap];
 
     fn next(self) -> Pane {
         Self::ALL[(self as usize + 1) % Self::ALL.len()]
@@ -126,17 +129,33 @@ impl Pane {
         Self::ALL[(self as usize + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
-    /// The pane `H`/`J`/`K`/`L` move to from this one: the agent list on the
-    /// left, the other three stacked on the right. Moving right returns to
-    /// `right`, the right-hand pane last focused.
+    /// The pane `H`/`J`/`K`/`L` move to from this one, by position: the
+    /// agent list on the left; on the right the preview, then ID and working
+    /// directory side by side, then title and recap. Moving right from the
+    /// list returns to `right`, the right-hand pane last focused.
     fn toward(self, key: char, right: Pane) -> Pane {
         match (key, self) {
+            ('H', Pane::Cwd) => Pane::Id,
             ('H', _) => Pane::Agents,
             ('L', Pane::Agents) => right,
-            ('K', Pane::Title) => Pane::Preview,
-            ('K', Pane::Recap) | ('J', Pane::Preview) => Pane::Title,
+            ('L', Pane::Id) => Pane::Cwd,
+            ('K', Pane::Id | Pane::Cwd) => Pane::Preview,
+            ('K', Pane::Title) | ('J', Pane::Preview) => Pane::Id,
+            ('K', Pane::Recap) | ('J', Pane::Id | Pane::Cwd) => Pane::Title,
             ('J', Pane::Title) => Pane::Recap,
             _ => self,
+        }
+    }
+
+    /// What a field pane shows and `c` copies from it, in the footer's words.
+    fn field(self) -> &'static str {
+        match self {
+            Pane::Agents => "name",
+            Pane::Preview => "screen",
+            Pane::Id => "id",
+            Pane::Cwd => "cwd",
+            Pane::Title => "title",
+            Pane::Recap => "recap",
         }
     }
 
@@ -429,31 +448,18 @@ fn event_loop(
     // Due immediately, so the first frame is not empty.
     let mut last_tick = Instant::now() - PREVIEW_TICK;
 
-    let (agents, mut rx) = stream::start_watch(None, opts.all)?;
-    let mut table: BTreeMap<u64, AgentInfo> = agents.into_iter().map(|a| (a.id, a)).collect();
+    let mut watcher = Watcher::start(None, opts.all)?;
 
     loop {
-        // Non-blocking: apply whatever the watch thread has queued up since
-        // the last frame. A disconnected or ended watch means the manager
-        // went away (restart or upgrade); reconnect and keep going.
-        loop {
-            match rx.try_recv() {
-                Ok(Ok(Some(msg))) => stream::apply(&mut table, &msg),
-                Ok(Ok(None)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    std::thread::sleep(Duration::from_millis(200));
-                    let (agents, new_rx) = stream::start_watch(None, opts.all)?;
-                    table = agents.into_iter().map(|a| (a.id, a)).collect();
-                    rx = new_rx;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-            }
-        }
+        // Apply whatever arrived since the last frame, without waiting. The
+        // watcher reconnects on its own when the manager restarts.
+        watcher.catch_up()?;
+        let table = watcher.agents();
 
         // Only Tree needs the flattened rows; building them walks the whole
         // table, so skip it while Grid is on screen.
         let rows = match mode {
-            Mode::Tree => tree_rows(&table, opts, &tree.collapsed),
+            Mode::Tree => tree_rows(table, opts, &tree.collapsed),
             Mode::Grid => Vec::new(),
         };
         if mode == Mode::Tree {
@@ -474,7 +480,7 @@ fn event_loop(
         let content_area = dashboard_content_rect(area);
         if last_tick.elapsed() >= PREVIEW_TICK {
             let refreshed = match mode {
-                Mode::Grid => refresh_grid(conn, &table, opts, content_area).map(|tiles| grid.tiles = tiles),
+                Mode::Grid => refresh_grid(conn, table, opts, content_area).map(|tiles| grid.tiles = tiles),
                 Mode::Tree if tree.zoomed && tree.focus == Pane::Agents => Ok(()),
                 Mode::Tree => refresh_tree_preview(conn, &rows, tree.selected, tree_preview_rect(content_area, &tree))
                     .map(|preview| tree.preview = preview),
@@ -498,7 +504,7 @@ fn event_loop(
         let status_line = status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TTL).map(|(msg, _)| msg.as_str());
         let stale = conn.stale_manager().is_some();
         terminal.draw(|frame| {
-            draw(frame, mode, &grid, &tree, &rows, &table, &overlay, status_line, jump_socket.as_deref(), stale)
+            draw(frame, mode, &grid, &tree, &rows, table, &overlay, status_line, jump_socket.as_deref(), stale)
         })?;
 
         let timeout = INPUT_POLL.min(PREVIEW_TICK.saturating_sub(last_tick.elapsed()));
@@ -522,7 +528,7 @@ fn event_loop(
         }
 
         if !matches!(overlay, Overlay::None) {
-            handle_overlay_key(conn, &mut overlay, &mut status, key.code, area, &table);
+            handle_overlay_key(conn, &mut overlay, &mut status, key.code, area, table);
             continue;
         }
 
@@ -1022,8 +1028,7 @@ fn tree_preview_rect(area: Rect, tree: &TreeState) -> Rect {
         return area;
     }
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
-    let detail = tree_detail_rects(cols[1]);
-    detail[0]
+    tree_detail_rects(cols[1]).preview
 }
 
 /// Lines of screen the preview box shows at once.
@@ -1039,27 +1044,54 @@ fn preview_scroll_limit(tree: &TreeState, area: Rect) -> usize {
 /// What `c` copies from the focused pane: the agent's name from the list,
 /// its whole current screen (uncropped) from the preview, or a label.
 fn copy_pane(conn: &mut Conn, info: &AgentInfo, focus: Pane) -> String {
-    let (what, text) = match focus {
-        Pane::Agents => ("name", Some(info.name.clone())),
+    let text = match focus {
+        Pane::Agents => Some(info.name.clone()),
         Pane::Preview => match query::screen_text(conn, info.id) {
-            Ok(text) if !text.is_empty() => ("screen", Some(text)),
-            Ok(_) => ("screen", None),
+            Ok(text) => Some(text),
             Err(e) => return format!("copy failed: {e}"),
         },
-        Pane::Title => ("title", info.labels.get("title").cloned()),
-        Pane::Recap => ("recap", info.labels.get("recap").cloned()),
+        Pane::Id => Some(info.id.to_string()),
+        // The whole path, not the shortened one on screen.
+        Pane::Cwd => Some(info.cwd.clone()),
+        Pane::Title | Pane::Recap => info.labels.get(focus.field()).cloned(),
     };
+    let what = focus.field();
     let Some(text) = text.filter(|t| !t.is_empty()) else { return format!("{} has no {what} to copy", info.name) };
     match term::copy_to_clipboard(&text) {
-        Ok(()) if focus == Pane::Agents => format!("copied {text}"),
+        // Short enough to show what went to the clipboard.
+        Ok(()) if matches!(focus, Pane::Agents | Pane::Id | Pane::Cwd) => format!("copied {text}"),
         Ok(()) => format!("copied the {what} of {}", info.name),
         Err(e) => format!("copy failed: {e}"),
     }
 }
 
-fn tree_detail_rects(area: Rect) -> [Rect; 3] {
-    let parts = Layout::vertical([Constraint::Percentage(50), Constraint::Length(3), Constraint::Min(3)]).split(area);
-    [parts[0], parts[1], parts[2]]
+/// Where each pane of the detail column goes.
+struct DetailRects {
+    preview: Rect,
+    id: Rect,
+    cwd: Rect,
+    title: Rect,
+    recap: Rect,
+}
+
+/// Three lines of recap between borders; more would take room from the
+/// preview, and the recap is meant to be short.
+const RECAP_HEIGHT: u16 = 5;
+/// Wide enough for an ID of five digits between padded borders.
+const ID_WIDTH: u16 = 11;
+
+fn tree_detail_rects(area: Rect) -> DetailRects {
+    // The preview takes all the room there is; the recap shows up to three
+    // lines, and gives way first on a short terminal.
+    let [preview, ids, title, recap] = Layout::vertical([
+        Constraint::Min(6),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Max(RECAP_HEIGHT),
+    ])
+    .areas(area);
+    let [id, cwd] = Layout::horizontal([Constraint::Length(ID_WIDTH), Constraint::Min(1)]).areas(ids);
+    DetailRects { preview, id, cwd, title, recap }
 }
 
 fn refresh_tree_preview(conn: &mut Conn, rows: &[Row], selected: usize, area: Rect) -> Result<Vec<PreviewLine>> {
@@ -1082,9 +1114,16 @@ fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, blin
     draw_tree_list(frame, cols[0], rows, tree, blink, jump_socket);
 
     let detail = tree_detail_rects(cols[1]);
-    draw_detail_preview(frame, detail[0], rows, tree);
-    draw_detail_label(frame, detail[1], rows, tree, Pane::Title);
-    draw_detail_label(frame, detail[2], rows, tree, Pane::Recap);
+    draw_detail_preview(frame, detail.preview, rows, tree);
+    let agent = match rows.get(tree.selected) {
+        Some(Row::Agent { info, .. }) => Some(info),
+        _ => None,
+    };
+    for (pane, area) in
+        [(Pane::Id, detail.id), (Pane::Cwd, detail.cwd), (Pane::Title, detail.title), (Pane::Recap, detail.recap)]
+    {
+        draw_detail_field(frame, area, agent, pane, tree.focus == pane);
+    }
 }
 
 fn draw_tree_list(
@@ -1225,19 +1264,52 @@ fn preview_text(preview: &[PreviewLine], height: u16, scroll: usize) -> Text<'st
     )
 }
 
-/// One of the self-reported labels (`title`, `recap`) an agent is taught to
-/// maintain via `SELF_LABEL_INSTRUCTIONS` — a plain readback of
-/// `AgentInfo.labels`, not a separate data source.
-fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, pane: Pane) {
-    let key = if pane == Pane::Title { "title" } else { "recap" };
-    let block = focusable_panel(format!(" {key} "), tree.focus == pane);
-    let value = match rows.get(tree.selected) {
-        Some(Row::Agent { info, .. }) => info.labels.get(key).map(String::as_str).unwrap_or("none"),
-        _ => "none",
+/// One small framed field of the selected agent. `title` and `recap` are the
+/// labels agents set on themselves (see `SELF_LABEL_INSTRUCTIONS`), read
+/// straight from `AgentInfo.labels`.
+fn draw_detail_field(frame: &mut Frame, area: Rect, agent: Option<&AgentInfo>, pane: Pane, focused: bool) {
+    let block = focusable_panel(format!(" {} ", pane.field()), focused).padding(Padding::horizontal(1));
+    let width = usize::from(block.inner(area).width);
+    let value = agent.and_then(|info| match pane {
+        Pane::Id => Some(info.id.to_string()),
+        Pane::Cwd => Some(display_path(&info.cwd, width)),
+        _ => info.labels.get(pane.field()).cloned(),
+    });
+    let line = match value {
+        Some(value) => {
+            let style = match pane {
+                Pane::Id => Style::default().fg(theme().lavender).add_modifier(Modifier::BOLD),
+                Pane::Title => Style::default().fg(theme().text).add_modifier(Modifier::BOLD),
+                Pane::Recap => Style::default().fg(theme().subtext0),
+                _ => Style::default().fg(theme().text),
+            };
+            Line::styled(value, style)
+        }
+        None => {
+            let placeholder = if agent.is_some() { "not set" } else { "\u{2014}" };
+            Line::styled(placeholder, Style::default().fg(theme().overlay0).add_modifier(Modifier::ITALIC))
+        }
     };
-    let paragraph = Paragraph::new(value).style(Style::default().fg(theme().subtext0)).block(block);
-    let paragraph = if key == "recap" { paragraph.wrap(Wrap { trim: false }) } else { paragraph };
+    let paragraph = Paragraph::new(line).block(block);
+    let paragraph = if pane == Pane::Recap { paragraph.wrap(Wrap { trim: false }) } else { paragraph };
     frame.render_widget(paragraph, area);
+}
+
+/// `path` as it fits in `width` columns: the home directory as `~`, and a
+/// path still too long cut from the left, keeping the directories nearest
+/// the agent.
+fn display_path(path: &str, width: usize) -> String {
+    let home = std::env::var("HOME").ok().filter(|h| h.len() > 1);
+    let path = match home.as_deref().and_then(|h| path.strip_prefix(h)) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    };
+    let len = path.chars().count();
+    if len <= width || width == 0 {
+        return path;
+    }
+    let tail: String = path.chars().skip(len - (width - 1)).collect();
+    format!("\u{2026}{tail}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,8 +1391,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree: &TreeState, stat
             " \u{2191}/\u{2193} scroll   PgUp/PgDn page   {zoom}   enter attach   tab/HJKL pane   c copy screen   {COMMON}   {SWITCH}"
         ),
         (Mode::Tree, pane) => {
-            let key = if pane == Pane::Title { "title" } else { "recap" };
-            format!(" c copy {key}   enter attach   tab/HJKL pane   {COMMON}   {SWITCH}")
+            format!(" c copy {}   enter attach   tab/HJKL pane   {COMMON}   {SWITCH}", pane.field())
         }
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(theme().subtext0).bg(theme().mantle)), area);
@@ -1779,6 +1850,8 @@ mod tests {
     #[test]
     fn tab_cycles_the_tree_panes_both_ways() {
         assert_eq!(Pane::Agents.next(), Pane::Preview);
+        assert_eq!(Pane::Preview.next(), Pane::Id);
+        assert_eq!(Pane::Cwd.next(), Pane::Title);
         assert_eq!(Pane::Recap.next(), Pane::Agents);
         assert_eq!(Pane::Agents.prev(), Pane::Recap);
         assert!(Pane::Preview.zoomable() && !Pane::Title.zoomable());
@@ -1790,11 +1863,18 @@ mod tests {
         assert_eq!(Pane::Agents.toward('L', right), Pane::Preview);
         assert_eq!(Pane::Agents.toward('L', Pane::Recap), Pane::Recap, "back to the last right-hand pane");
         assert_eq!(Pane::Recap.toward('H', right), Pane::Agents);
-        assert_eq!(Pane::Preview.toward('J', right), Pane::Title);
+        assert_eq!(Pane::Preview.toward('J', right), Pane::Id);
+        assert_eq!(Pane::Id.toward('L', right), Pane::Cwd);
+        assert_eq!(Pane::Cwd.toward('H', right), Pane::Id);
+        assert_eq!(Pane::Id.toward('H', right), Pane::Agents);
+        assert_eq!(Pane::Cwd.toward('K', right), Pane::Preview);
+        assert_eq!(Pane::Cwd.toward('J', right), Pane::Title);
         assert_eq!(Pane::Title.toward('J', right), Pane::Recap);
         assert_eq!(Pane::Recap.toward('K', right), Pane::Title);
-        assert_eq!(Pane::Title.toward('K', right), Pane::Preview);
-        for (pane, key) in [(Pane::Preview, 'K'), (Pane::Recap, 'J'), (Pane::Agents, 'J'), (Pane::Title, 'L')] {
+        assert_eq!(Pane::Title.toward('K', right), Pane::Id);
+        for (pane, key) in
+            [(Pane::Preview, 'K'), (Pane::Recap, 'J'), (Pane::Agents, 'J'), (Pane::Title, 'L'), (Pane::Cwd, 'L')]
+        {
             assert_eq!(pane.toward(key, right), pane, "{pane:?} {key}");
         }
     }
@@ -1827,9 +1907,41 @@ mod tests {
         let title = tree_detail_rects(
             Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
                 .split(Rect::new(0, 0, 100, 24))[1],
-        )[1];
+        )
+        .title;
         assert_eq!(buf[(title.x, title.y)].fg, theme().mauve);
         assert_eq!(buf[(0, 0)].fg, theme().surface2, "the agent list is not focused");
+    }
+
+    #[test]
+    fn id_and_cwd_have_their_own_boxes() {
+        let mut info = agent(42, "a");
+        info.cwd = "/srv/projects/argus".into();
+        let rows = [Row::Agent { info, depth: 0 }];
+        let tree = TreeState { focus: Pane::Cwd, ..TreeState::default() };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw_tree(frame, frame.area(), &rows, &tree, true, None)).unwrap();
+        let buf = terminal.backend().buffer();
+        let detail = tree_detail_rects(
+            Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(Rect::new(0, 0, 100, 24))[1],
+        );
+        let row = |r: Rect| (r.x..r.x + r.width).map(|x| buf[(x, r.y + 1)].symbol().to_string()).collect::<String>();
+        assert!(row(detail.id).contains("42"), "{}", row(detail.id));
+        assert!(row(detail.cwd).contains("/srv/projects/argus"), "{}", row(detail.cwd));
+        assert_eq!(buf[(detail.cwd.x, detail.cwd.y)].fg, theme().mauve, "focused");
+        assert_eq!(buf[(detail.id.x, detail.id.y)].fg, theme().surface2);
+    }
+
+    #[test]
+    fn long_paths_keep_their_end() {
+        assert_eq!(display_path("/srv/a", 20), "/srv/a");
+        assert_eq!(display_path("/srv/projects/argus", 10), "\u{2026}cts/argus");
+        assert_eq!(display_path("/srv/projects/argus", 10).chars().count(), 10);
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(display_path(&format!("{home}/code/x"), 40), "~/code/x");
+            assert_eq!(display_path(&format!("{home}x/code"), 80), format!("{home}x/code"), "only whole segments");
+        }
     }
 
     #[test]

@@ -3,16 +3,26 @@
 //! Each agent is an [`AgentRecord`]: the public [`AgentInfo`] (persisted and
 //! sent to clients) plus [`AgentRuntime`], state that only means something to
 //! this manager process and is rebuilt from scratch after a restart.
+//!
+//! Records change only through [`Registry::create`], [`Registry::edit`] and
+//! [`Registry::remove`]. Each compares the record before and after: watchers
+//! hear of any change to its `AgentInfo`, and the file is rewritten when a
+//! durable field changed (see [`durable`]).
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use argus_proto::msg::{Activity, AgentInfo};
 use argus_proto::paths;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+
+use super::activity::Watchdog;
+use super::hooks::Session;
+use super::log;
+use super::send::SendGate;
+use super::turn::TurnState;
 
 /// How many unread change notifications a watcher may fall behind by before
 /// it is told to resync.
@@ -23,38 +33,18 @@ pub struct AgentRecord {
     pub runtime: AgentRuntime,
 }
 
+/// Each part belongs to the module that keeps it up to date.
 #[derive(Default)]
 pub struct AgentRuntime {
     /// Attached terminals that currently have focus (from the holder).
     pub focused: u32,
-    /// The agent session hook reports are bound to; others are dropped.
-    pub session_id: Option<String>,
-    /// Last tool seen, restored when a permission prompt is answered.
-    pub last_tool: Option<String>,
-    /// Silence watchdog: when to look at the output offset next.
-    pub deadline: Option<Instant>,
-    /// Whether a watchdog task is running for this agent.
-    pub watchdog: bool,
-    /// Bumped each time the agent enters `working`, so the watchdog takes a
-    /// fresh output baseline for every working period.
-    pub working_gen: u64,
     /// Bumped each time the agent shows or hides its cursor, so a pending
     /// `ready_on_cursor` check can tell whether it stayed up.
     pub cursor_gen: u64,
-    /// When an attached terminal last typed into the agent.
-    pub last_input: Option<Instant>,
-    /// Set by `argus send` until the agent leaves `idle`/`done` (the prompt
-    /// was submitted) or this deadline passes, so a second send cannot land
-    /// on top of the first.
-    pub submitting: Option<Instant>,
-    /// The `turns` value at which a `Stop` was last held back with
-    /// directives, so a turn is held at most once.
-    pub held_turn: Option<u64>,
-    /// The prompt of the turn in progress, for the turn log.
-    pub prompt: Option<String>,
-    /// The reply a held-back `Stop` carried: the turn's real answer, which
-    /// the reply after the directives only adds to.
-    pub held_reply: Option<String>,
+    pub session: Session,
+    pub turn: TurnState,
+    pub watchdog: Watchdog,
+    pub send: SendGate,
 }
 
 impl AgentRecord {
@@ -64,13 +54,13 @@ impl AgentRecord {
 }
 
 pub struct Registry {
-    pub next_id: u64,
-    pub agents: BTreeMap<u64, AgentRecord>,
+    next_id: u64,
+    agents: BTreeMap<u64, AgentRecord>,
     /// Activities the previous manager left agents in, for `recover` to
     /// restore if the agent printed nothing since (see [`Settled`]).
-    pub restore: BTreeMap<u64, Restore>,
+    restore: BTreeMap<u64, Restore>,
     /// Bumped on every change; watch events carry it.
-    pub seq: u64,
+    seq: u64,
     changes: broadcast::Sender<u64>,
 }
 
@@ -97,14 +87,32 @@ pub struct Restore {
     pub offset: u64,
 }
 
+/// Clears what only a running agent watched by this manager has: attached
+/// terminals and pending requests. Neither survives the agent's exit, and a
+/// restarted manager learns them afresh (holders report attachments on
+/// subscribe; hooks report new requests).
+pub fn clear_volatile(info: &mut AgentInfo) {
+    info.attached = 0;
+    info.tmux_locations.clear();
+    info.pending_interactions.clear();
+}
+
+/// `info` without the fields a restarted manager does not trust (see
+/// [`reset`]): a change to anything else is worth writing to disk. Activity
+/// is only worth keeping at a clean stop, which saves it with
+/// [`Registry::save_settled`].
+fn durable(info: &AgentInfo) -> AgentInfo {
+    let mut durable = AgentInfo { activity: Activity::Unknown, activity_since: None, ..info.clone() };
+    clear_volatile(&mut durable);
+    durable
+}
+
 /// Clears what a new manager cannot trust in a loaded agent: holders report
 /// the real attach count on subscribe, and hook state from before the restart
 /// may be stale. Returns the activity to restore if the agent was left at its
 /// prompt by a manager that stopped cleanly.
 fn reset(info: &mut AgentInfo, settled: &Settled) -> Option<Restore> {
-    info.attached = 0;
-    info.tmux_locations.clear();
-    info.pending_interactions.clear();
+    clear_volatile(info);
     if !info.status.is_live() {
         return None;
     }
@@ -141,8 +149,57 @@ impl Registry {
         Ok(Registry { next_id, agents, restore, seq: 0, changes })
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_with(Settled::new())
+    /// Adds an agent under a fresh ID; `build` makes its record from the ID.
+    pub fn create(&mut self, build: impl FnOnce(u64) -> AgentInfo) -> AgentInfo {
+        let id = self.next_id;
+        self.next_id += 1;
+        let info = build(id);
+        self.agents.insert(id, AgentRecord::new(info.clone()));
+        self.changed(id);
+        self.persist();
+        info
+    }
+
+    /// Runs `f` on agent `id`'s record, then tells watchers if its info
+    /// changed and saves if a durable part of it did. `None` if there is no
+    /// such agent.
+    pub fn edit<R>(&mut self, id: u64, f: impl FnOnce(&mut AgentRecord) -> R) -> Option<R> {
+        let rec = self.agents.get_mut(&id)?;
+        let before = rec.info.clone();
+        let out = f(rec);
+        if rec.info != before {
+            let durable_changed = durable(&rec.info) != durable(&before);
+            self.changed(id);
+            if durable_changed {
+                self.persist();
+            }
+        }
+        Some(out)
+    }
+
+    pub fn remove(&mut self, id: u64) -> Option<AgentInfo> {
+        let rec = self.agents.remove(&id)?;
+        self.changed(id);
+        self.persist();
+        Some(rec.info)
+    }
+
+    /// Activities to restore after a restart; see [`Restore`]. Empty after
+    /// the first call.
+    pub fn take_restore(&mut self) -> BTreeMap<u64, Restore> {
+        std::mem::take(&mut self.restore)
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// A failed save is logged, not returned: the change already took effect
+    /// in memory, and the next save writes it again.
+    fn persist(&self) {
+        if let Err(e) = self.save_with(Settled::new()) {
+            log(&format!("saving the registry: {e:#}"));
+        }
     }
 
     /// The last save of a manager stopping cleanly; see [`RegistryFile::settled`].
@@ -175,8 +232,12 @@ impl Registry {
         &self.agents[&id].info
     }
 
+    pub fn get(&self, id: u64) -> Option<&AgentRecord> {
+        self.agents.get(&id)
+    }
+
     /// Records that agent `id` changed (or was removed) and wakes watchers.
-    pub fn changed(&mut self, id: u64) {
+    fn changed(&mut self, id: u64) {
         self.seq += 1;
         // No receivers just means nobody is watching.
         let _ = self.changes.send(id);
@@ -196,12 +257,18 @@ impl Registry {
     }
 }
 
+/// A running Claude agent that has reported nothing yet, for tests.
+#[cfg(test)]
+pub fn test_record() -> AgentRecord {
+    AgentRecord::new(tests::agent(1, "claude-1", argus_proto::msg::AgentStatus::Running))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use argus_proto::msg::AgentStatus;
 
-    fn agent(id: u64, name: &str, status: AgentStatus) -> AgentInfo {
+    pub fn agent(id: u64, name: &str, status: AgentStatus) -> AgentInfo {
         AgentInfo {
             id,
             name: name.into(),
@@ -272,6 +339,39 @@ mod tests {
         reset(&mut info, &Settled::new());
         assert!(info.pending_interactions.is_empty());
         assert_eq!(info.activity, Activity::Unknown);
+    }
+
+    #[test]
+    fn edits_notify_only_when_the_info_changes() {
+        let mut reg = registry(vec![agent(1, "a", AgentStatus::Running)]);
+        let mut changes = reg.subscribe();
+        reg.edit(1, |rec| rec.runtime.focused = 1);
+        assert!(changes.try_recv().is_err(), "runtime-only state is not news");
+        reg.edit(1, |rec| rec.info.activity = Activity::Working);
+        assert_eq!(changes.try_recv().unwrap(), 1);
+        assert_eq!(reg.seq(), 1);
+        assert_eq!(reg.edit(2, |_| ()), None, "no such agent");
+    }
+
+    #[test]
+    fn only_what_a_restart_keeps_is_durable() {
+        let before = agent(1, "a", AgentStatus::Running);
+        let volatile = AgentInfo {
+            activity: Activity::Working,
+            activity_since: Some(5),
+            attached: 2,
+            tmux_locations: vec![argus_proto::msg::TmuxLocation { socket: "s".into(), pane: "%1".into() }],
+            ..before.clone()
+        };
+        assert_eq!(durable(&volatile), durable(&before));
+        for changed in [
+            AgentInfo { turns: 1, ..before.clone() },
+            AgentInfo { name: "b".into(), ..before.clone() },
+            AgentInfo { status: AgentStatus::Exited, ..before.clone() },
+            AgentInfo { labels: [("title".into(), "t".into())].into(), ..before.clone() },
+        ] {
+            assert_ne!(durable(&changed), durable(&before), "{changed:?}");
+        }
     }
 
     #[test]

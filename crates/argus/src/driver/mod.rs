@@ -2,9 +2,12 @@
 //!
 //! A driver adjusts the launch command (e.g. to register hooks) and turns the
 //! agent's hook events into a [`DriverReport`]. Drivers hold no state: there is one
-//! instance per kind, shared by every agent of that kind. What a hint does to
-//! an agent's activity is decided by the common state machine in
-//! `activity.rs`, which is the same for every kind.
+//! instance per kind, shared by every agent of that kind. What a report does
+//! to an agent is decided by the manager's common code (`manager/hooks.rs`),
+//! which is the same for every kind.
+//!
+//! Shared by the manager and the client (`argus setup`, `argus guide`,
+//! whether an agent reports turns); it knows agent kinds, not agent state.
 
 mod claude;
 pub(crate) mod codex;
@@ -29,7 +32,6 @@ pub enum Hint {
     SessionStart,
     Working,
     Tool(String),
-    WaitingApproval,
     /// The turn finished.
     Done,
     /// Idle, waiting for input.
@@ -43,9 +45,18 @@ pub enum Hint {
 
 /// One translated hook event. Only drivers inspect provider-specific JSON;
 /// the manager consumes this value and updates its shared state machine.
+///
+/// A request waiting on a person is reported only as an `interaction`: the
+/// agent is `blocked` exactly while one needs its user.
 pub struct DriverReport {
     pub hint: Hint,
     pub interaction: Option<InteractionChange>,
+}
+
+impl DriverReport {
+    pub fn hint(hint: Hint) -> DriverReport {
+        DriverReport { hint, interaction: None }
+    }
 }
 
 /// Lifecycle of a request that may need an answer from a person.
@@ -114,17 +125,8 @@ pub trait Driver: Send + Sync {
     /// state tracking will be degraded; the agent is started regardless.
     fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>>;
 
-    /// Interprets one hook event.
-    fn interpret(&self, event: &Value) -> Hint;
-
-    /// Provider-specific interaction information from the same hook event.
-    fn interaction(&self, _event: &Value) -> Option<InteractionChange> {
-        None
-    }
-
-    fn translate(&self, event: &Value) -> DriverReport {
-        DriverReport { hint: self.interpret(event), interaction: self.interaction(event) }
-    }
+    /// Translates one hook event.
+    fn translate(&self, event: &Value) -> DriverReport;
 
     /// What the hook prints to keep the agent going after `event`, a turn's
     /// end, with `reason` as its next input. `None` when this agent cannot be
@@ -132,35 +134,36 @@ pub trait Driver: Send + Sync {
     fn hold_stop(&self, _event: &Value, _reason: &str) -> Option<String> {
         None
     }
-}
 
-static CLAUDE: claude::Claude = claude::Claude;
-static CODEX: codex::Codex = codex::Codex;
-static GENERIC: generic::Generic = generic::Generic;
-static OMP: omp::Omp = omp::Omp;
-static OPENCODE: opencode::Opencode = opencode::Opencode;
-static PI: pi::Pi = pi::Pi;
-
-/// The driver for a kind; unknown kinds get the generic driver.
-pub fn for_kind(kind: &str) -> &'static dyn Driver {
-    match kind {
-        "claude" => &CLAUDE,
-        "codex" => &CODEX,
-        "omp" => &OMP,
-        "opencode" => &OPENCODE,
-        "pi" => &PI,
-        _ => &GENERIC,
+    /// Writes the files every agent of this kind shares (e.g. Claude's hook
+    /// settings, opencode's plugin) into `ctx.dir`.
+    fn write_shared_files(&self, _ctx: &Context) -> Result<()> {
+        Ok(())
     }
 }
 
-/// Writes the files drivers share across agents (e.g. Claude's hook
-/// settings, opencode's plugin). Rewritten at every manager start and never
-/// removed, since running agents may still read them.
+/// Every kind argus knows; any other gets [`generic::Generic`].
+static DRIVERS: &[&dyn Driver] = &[&claude::Claude, &codex::Codex, &omp::Omp, &opencode::Opencode, &pi::Pi];
+
+/// The driver for a kind; unknown kinds get the generic driver.
+pub fn for_kind(kind: &str) -> &'static dyn Driver {
+    DRIVERS.iter().copied().find(|d| d.kind() == kind).unwrap_or(&generic::Generic)
+}
+
+/// Writes the files drivers share across agents. Rewritten at every manager
+/// start and never removed, since running agents may still read them.
 pub fn install_shared_files(ctx: &Context) -> Result<()> {
-    claude::write_shared_settings(ctx)?;
-    opencode::write_shared_files(ctx)?;
-    pi::write_shared_files(ctx)?;
-    omp::write_shared_files(ctx)
+    DRIVERS.iter().try_for_each(|d| d.write_shared_files(ctx))
+}
+
+/// The Stop hook answer Claude Code and Codex both take: block the stop, and
+/// continue the turn with `reason` as the next input. `None` when the agent
+/// is already continuing because of such an answer, which could loop.
+fn block_stop(event: &Value, reason: &str) -> Option<String> {
+    if event.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
 }
 
 /// Injected as a system-prompt/developer-instruction addition at launch, so
@@ -171,11 +174,11 @@ pub fn install_shared_files(ctx: &Context) -> Result<()> {
 /// remember to run: agents do not reliably follow such pointers. `argus
 /// guide` prints the same text, for sessions it never reached.
 pub(crate) const SELF_LABEL_INSTRUCTIONS: &str = concat!(
-    include_str!("../../instructions/core.md"),
+    include_str!("../instructions/core.md"),
     "\n",
-    include_str!("../../instructions/labels.md"),
+    include_str!("../instructions/labels.md"),
     "\n",
-    include_str!("../../instructions/coordination.md"),
+    include_str!("../instructions/coordination.md"),
     "\nBefore your final message: if this turn changed where things stand, make sure your recap\n",
     "says so; if your labels are unset, set them.\n",
 );
@@ -186,20 +189,26 @@ pub fn hook_command(hook_exe: &Path, source: &str) -> String {
     format!("'{path}' {source}")
 }
 
-/// Interprets an event from one of argus's own in-process plugins (opencode,
+/// Translates an event from one of argus's own in-process plugins (opencode,
 /// pi, omp), which flatten their agent's events into Claude-style hook events.
 /// Events in any other format `version` are ignored: an agent keeps the
 /// plugin it started with while the manager may be upgraded underneath it.
-fn plugin_hint(event: &Value, version: u64) -> Hint {
+/// `confirm_after`: see [`plugin_interaction`].
+fn plugin_report(event: &Value, version: u64, confirm_after: Option<Duration>) -> DriverReport {
     if event.get("v").and_then(Value::as_u64) != Some(version) {
-        return Hint::Ignore;
+        return DriverReport::hint(Hint::Ignore);
     }
+    DriverReport { hint: plugin_hint(event), interaction: plugin_interaction(event, confirm_after) }
+}
+
+fn plugin_hint(event: &Value) -> Hint {
     let tool = || field(event, "tool_name").map(str::to_string);
     match field(event, "hook_event_name").unwrap_or_default() {
         "SessionStart" => Hint::SessionStart,
         "UserPromptSubmit" | "PostToolUse" => Hint::Working,
         "PreToolUse" => Hint::Tool(tool().unwrap_or_else(|| "tool".into())),
-        "PermissionRequest" => Hint::WaitingApproval,
+        // Only an interaction (see `plugin_interaction`).
+        "PermissionRequest" => Hint::Ignore,
         // The tool that asked now runs (or was refused, and the next event
         // says what happens instead).
         "PermissionReplied" => tool().map_or(Hint::Working, Hint::Tool),
@@ -211,13 +220,10 @@ fn plugin_hint(event: &Value, version: u64) -> Hint {
     }
 }
 
-/// Common interaction translation for argus's in-process plugins. Pi and
-/// OMP report a visible prompt immediately; OpenCode gets a short grace
-/// period for requests that resolve without a person.
-fn plugin_interaction(event: &Value, version: u64, confirm_after: Option<Duration>) -> Option<InteractionChange> {
-    if event.get("v").and_then(Value::as_u64) != Some(version) {
-        return None;
-    }
+/// Pi and OMP report a visible prompt immediately (`confirm_after` is
+/// `None`); OpenCode gets a short grace period for requests that resolve
+/// without a person.
+fn plugin_interaction(event: &Value, confirm_after: Option<Duration>) -> Option<InteractionChange> {
     match field(event, "hook_event_name") {
         Some("PermissionRequest") => {
             let mut request = interaction_request(event);

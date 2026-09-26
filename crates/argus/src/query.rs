@@ -8,7 +8,7 @@ use argus_proto::msg::{Activity, AgentInfo, Availability, InteractionPhase, Requ
 use serde::Serialize;
 
 use crate::client::{self, Conn};
-use crate::manager::driver;
+use crate::driver;
 use crate::naming::self_id;
 use crate::output::{self, AgentView};
 use crate::turns::{self, Turn};

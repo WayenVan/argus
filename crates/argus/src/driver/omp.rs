@@ -10,7 +10,7 @@ use std::fs;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-use super::{Context, Driver, Hint, InteractionChange, Launch, pi, plugin_hint, plugin_interaction};
+use super::{Context, Driver, DriverReport, Launch, pi, plugin_report};
 
 pub struct Omp;
 
@@ -37,25 +37,21 @@ impl Driver for Omp {
         Ok(pi::inject(launch, ctx, &[], EXTENSION_FILE, HOOK_ENV))
     }
 
-    fn interpret(&self, event: &Value) -> Hint {
-        plugin_hint(event, EVENT_VERSION)
+    fn translate(&self, event: &Value) -> DriverReport {
+        plugin_report(event, EVENT_VERSION, None)
     }
 
-    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
-        plugin_interaction(event, EVENT_VERSION, None)
+    /// Writes the extension the agents load.
+    fn write_shared_files(&self, ctx: &Context) -> Result<()> {
+        let path = ctx.dir.join(EXTENSION_FILE);
+        fs::write(&path, EXTENSION_JS).with_context(|| format!("writing {}", path.display()))
     }
-}
-
-/// Writes the extension the agents load.
-pub fn write_shared_files(ctx: &Context) -> Result<()> {
-    let path = ctx.dir.join(EXTENSION_FILE);
-    fs::write(&path, EXTENSION_JS).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::driver::SELF_LABEL_INSTRUCTIONS;
+    use crate::driver::SELF_LABEL_INSTRUCTIONS;
     use std::path::PathBuf;
 
     fn ctx() -> Context {

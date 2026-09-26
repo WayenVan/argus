@@ -53,7 +53,7 @@ pub async fn serve(
         let (seq, agents, mut changes) = {
             let reg = manager.registry.lock().unwrap();
             let agents: Vec<AgentInfo> = reg.infos().filter(|a| filter.wants(a)).cloned().collect();
-            (reg.seq, agents, reg.subscribe())
+            (reg.seq(), agents, reg.subscribe())
         };
         // id → whether the client last saw it live.
         let mut known: HashMap<u64, bool> = agents.iter().map(|a| (a.id, a.status.is_live())).collect();
@@ -90,7 +90,7 @@ pub async fn serve(
             }
         };
         if lagged {
-            let seq = manager.registry.lock().unwrap().seq;
+            let seq = manager.registry.lock().unwrap().seq();
             aio::write_json(&mut writer, &Response::Event { epoch, seq, event: AgentEvent::Resync }).await?;
         }
     }
@@ -112,7 +112,7 @@ fn collect(
     let mut events = Vec::new();
     for id in dirty {
         let was = known.get(&id).copied();
-        let Some(agent) = reg.agents.get(&id).map(|r| &r.info) else {
+        let Some(agent) = reg.get(id).map(|r| &r.info) else {
             if known.remove(&id).is_some() {
                 events.push(AgentEvent::Removed { id });
             }
@@ -133,5 +133,5 @@ fn collect(
         }
         events.push(event);
     }
-    (reg.seq, events)
+    (reg.seq(), events)
 }

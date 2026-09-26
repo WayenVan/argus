@@ -12,7 +12,8 @@ use argus_proto::msg::InteractionPhase;
 use serde_json::{Value, json};
 
 use super::{
-    Context, Driver, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, field, hook_command, interaction_request,
+    Context, Driver, DriverReport, Hint, InteractionChange, Launch, SELF_LABEL_INSTRUCTIONS, block_stop, field,
+    hook_command, interaction_request,
 };
 
 pub struct Claude;
@@ -71,67 +72,64 @@ impl Driver for Claude {
         Ok(None)
     }
 
-    fn interpret(&self, event: &Value) -> Hint {
+    fn translate(&self, event: &Value) -> DriverReport {
         // Events from subagents do not describe the main agent.
         if event.get("agent_id").is_some() {
-            return Hint::Ignore;
+            return DriverReport::hint(Hint::Ignore);
         }
-        match field(event, "hook_event_name").unwrap_or_default() {
-            "SessionStart" => match field(event, "source") {
-                Some("compact") => Hint::Ignore, // Happens mid-turn.
-                _ => Hint::SessionStart,
-            },
-            "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" => Hint::Working,
-            "PreToolUse" => Hint::Tool(field(event, "tool_name").unwrap_or("tool").to_string()),
-            // Other permission hooks (or auto mode) may answer this without a
-            // person. The later permission_prompt notification confirms wait.
-            "PermissionRequest" => Hint::Ignore,
-            "Notification" => match field(event, "notification_type") {
-                Some("permission_prompt") => Hint::WaitingApproval,
-                Some("idle_prompt" | "agent_needs_input") => Hint::WaitingInput,
-                _ => Hint::Ignore,
-            },
-            "Stop" => Hint::Done,
-            "StopFailure" => Hint::Error,
-            _ => Hint::Ignore,
-        }
-    }
-
-    fn interaction(&self, event: &Value) -> Option<InteractionChange> {
-        if event.get("agent_id").is_some() {
-            return None;
-        }
-        match field(event, "hook_event_name") {
-            Some("PermissionRequest") => Some(InteractionChange::Opened {
-                request: interaction_request(event),
-                confirm_after: None,
-                on_screen: None,
-            }),
-            Some("Notification") if field(event, "notification_type") == Some("permission_prompt") => {
-                let mut fallback = interaction_request(event);
-                fallback.id = format!("{}:permission_prompt", fallback.session_id);
-                fallback.phase = InteractionPhase::NeedsUser;
-                Some(InteractionChange::NeedsUser { fallback })
-            }
-            _ => None,
-        }
+        DriverReport { hint: hint(event), interaction: interaction(event) }
     }
 
     fn hold_stop(&self, event: &Value, reason: &str) -> Option<String> {
-        // Already continuing because of a Stop hook; holding again could loop.
-        if event.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
-            return None;
-        }
-        Some(json!({ "decision": "block", "reason": reason }).to_string())
+        block_stop(event, reason)
+    }
+
+    fn write_shared_files(&self, ctx: &Context) -> Result<()> {
+        let Some(hook_exe) = &ctx.hook_exe else { return Ok(()) };
+        let path = ctx.dir.join(SHARED_FILE);
+        fs::write(&path, serde_json::to_vec_pretty(&settings_json(hook_exe))?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 }
 
-/// Writes the settings file shared by every Claude agent started by argus.
-pub fn write_shared_settings(ctx: &Context) -> Result<()> {
-    let Some(hook_exe) = &ctx.hook_exe else { return Ok(()) };
-    let path = ctx.dir.join(SHARED_FILE);
-    fs::write(&path, serde_json::to_vec_pretty(&settings_json(hook_exe))?)
-        .with_context(|| format!("writing {}", path.display()))
+fn hint(event: &Value) -> Hint {
+    match field(event, "hook_event_name").unwrap_or_default() {
+        "SessionStart" => match field(event, "source") {
+            Some("compact") => Hint::Ignore, // Happens mid-turn.
+            _ => Hint::SessionStart,
+        },
+        "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" => Hint::Working,
+        "PreToolUse" => Hint::Tool(field(event, "tool_name").unwrap_or("tool").to_string()),
+        "Notification" => match field(event, "notification_type") {
+            Some("idle_prompt" | "agent_needs_input") => Hint::WaitingInput,
+            // `permission_prompt` is only an interaction; see `interaction`.
+            _ => Hint::Ignore,
+        },
+        "Stop" => Hint::Done,
+        "StopFailure" => Hint::Error,
+        // `PermissionRequest` is only an interaction too.
+        _ => Hint::Ignore,
+    }
+}
+
+/// Other permission hooks (or auto mode) may answer a `PermissionRequest`
+/// without a person, so it is only observed; the `permission_prompt`
+/// notification that follows confirms that a person must answer.
+fn interaction(event: &Value) -> Option<InteractionChange> {
+    match field(event, "hook_event_name") {
+        Some("PermissionRequest") => Some(InteractionChange::Opened {
+            request: interaction_request(event),
+            confirm_after: None,
+            on_screen: None,
+        }),
+        Some("Notification") if field(event, "notification_type") == Some("permission_prompt") => {
+            let mut fallback = interaction_request(event);
+            fallback.id = format!("{}:permission_prompt", fallback.session_id);
+            fallback.phase = InteractionPhase::NeedsUser;
+            Some(InteractionChange::NeedsUser { fallback })
+        }
+        _ => None,
+    }
 }
 
 /// Lets the agent set its own labels without a permission prompt; the label
@@ -222,7 +220,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ev(v: Value) -> Hint {
-        Claude.interpret(&v)
+        Claude.translate(&v).hint
     }
 
     #[test]
@@ -230,10 +228,7 @@ mod tests {
         assert_eq!(ev(json!({"hook_event_name":"UserPromptSubmit"})), Hint::Working);
         assert_eq!(ev(json!({"hook_event_name":"PreToolUse","tool_name":"Bash"})), Hint::Tool("Bash".into()));
         assert_eq!(ev(json!({"hook_event_name":"Stop"})), Hint::Done);
-        assert_eq!(
-            ev(json!({"hook_event_name":"Notification","notification_type":"permission_prompt"})),
-            Hint::WaitingApproval
-        );
+        assert_eq!(ev(json!({"hook_event_name":"Notification","notification_type":"permission_prompt"})), Hint::Ignore);
         assert_eq!(ev(json!({"hook_event_name":"SessionStart","source":"compact"})), Hint::Ignore);
         assert_eq!(ev(json!({"hook_event_name":"Stop","agent_id":"sub"})), Hint::Ignore);
     }

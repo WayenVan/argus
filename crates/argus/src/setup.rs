@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::manager::driver::codex;
+use crate::driver::codex;
 use crate::output;
 
 /// The agents argus has a driver for, in the order `argus setup` goes
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn every_agent_has_a_driver() {
         for &(agent, _) in AGENTS {
-            assert_eq!(crate::manager::driver::for_kind(agent).kind(), agent);
+            assert_eq!(crate::driver::for_kind(agent).kind(), agent);
         }
     }
 

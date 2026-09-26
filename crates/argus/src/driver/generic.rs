@@ -4,7 +4,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Context, Driver, Hint, Launch};
+use super::{Context, Driver, DriverReport, Hint, Launch};
 
 pub struct Generic;
 
@@ -21,7 +21,7 @@ impl Driver for Generic {
         Ok(None)
     }
 
-    fn interpret(&self, _event: &Value) -> Hint {
-        Hint::Ignore
+    fn translate(&self, _event: &Value) -> DriverReport {
+        DriverReport::hint(Hint::Ignore)
     }
 }

@@ -50,6 +50,9 @@ argus wait fix-bug --after "$t" --timeout 600
   with Esc, which ends a turn without a hook). An agent already `unknown` when
   the wait starts, as all are right after `argus manager restart`, does not
   count.
+- Waits, `ps -w`, `events` and the dashboards keep going across
+  `argus manager restart`: they reconnect to the new manager. Right after it,
+  agents are `unknown` until their next hook, which does not fail a wait.
 - A `blocked` agent does not fail the wait: agents also report approvals they
   then grant by themselves (Codex does), and argus cannot tell those from a
   prompt waiting on a person. An agent blocked for 2 s or more gets a line on
