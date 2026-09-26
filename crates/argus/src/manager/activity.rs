@@ -12,6 +12,10 @@
 //!   long tool run can legitimately be silent.
 //! - Agents without hooks are `busy` or `quiet` from their output offset.
 //!
+//! - A turn's end can be held back once with directives (see
+//!   [`super::directive`]): the agent keeps working on them, and only the
+//!   end that follows counts as the turn.
+//!
 //! Everything is event-driven; the only timers are the per-agent watchdog
 //! (armed only while `working`) and the poller for hook-less agents.
 
@@ -21,9 +25,9 @@ use std::time::{Duration, Instant};
 use argus_proto::msg::{Activity, TmuxLocation, now_secs};
 use serde_json::Value;
 
-use super::driver::{self, Hint};
+use super::driver::{self, Driver, Hint};
 use super::registry::AgentRecord;
-use super::{Manager, holder, log};
+use super::{Manager, directive, holder, log};
 
 /// How long `working` may go without hooks or output before it is `unknown`.
 const SILENCE: Duration = Duration::from_secs(15);
@@ -31,21 +35,26 @@ const SILENCE: Duration = Duration::from_secs(15);
 const GENERIC_POLL: Duration = Duration::from_secs(2);
 
 impl Manager {
-    /// Handles a hook event forwarded by `argus-hook`.
-    pub(super) fn report(self: &Arc<Self>, agent_id: u64, source: &str, event: &Value) {
+    /// Handles a hook event forwarded by `argus-hook`. Returns what the hook
+    /// prints for the agent, if anything.
+    pub(super) fn report(self: &Arc<Self>, agent_id: u64, source: &str, event: &Value) -> Option<String> {
         let mut reg = self.registry.lock().unwrap();
-        let Some(rec) = reg.agents.get_mut(&agent_id) else { return };
+        let rec = reg.agents.get_mut(&agent_id)?;
         if !rec.info.status.is_live() {
-            return;
+            return None;
         }
         let driver = driver::for_kind(&rec.info.kind);
         if !driver.has_hooks() || driver.kind() != source {
             log(&format!("dropping {source} hook event for {} ({})", rec.info.name, rec.info.kind));
-            return;
+            return None;
         }
-        let hint = driver.interpret(event);
+        let mut hint = driver.interpret(event);
         if !bind_session(rec, event, &hint) {
-            return;
+            return None;
+        }
+        let stdout = if hint == Hint::Done { hold_stop(rec, driver, event) } else { None };
+        if stdout.is_some() {
+            hint = Hint::Working; // Not the end of the turn yet.
         }
         // Saved, so a caller's `--after` still means the same turn after a
         // manager restart.
@@ -73,6 +82,7 @@ impl Manager {
             let manager = self.clone();
             tokio::spawn(async move { manager.watchdog(agent_id).await });
         }
+        stdout
     }
 
     /// Applies a holder fact or a user action to one agent.
@@ -249,6 +259,18 @@ fn bind_session(rec: &mut AgentRecord, event: &Value, hint: &Hint) -> bool {
     }
 }
 
+/// Keeps a finishing turn going once, with whatever the directives ask for.
+fn hold_stop(rec: &mut AgentRecord, driver: &dyn Driver, event: &Value) -> Option<String> {
+    if rec.runtime.held_turn == Some(rec.info.turns) {
+        return None;
+    }
+    let reason = directive::at_stop(&rec.info)?;
+    let stdout = driver.hold_stop(event, &reason)?;
+    rec.runtime.held_turn = Some(rec.info.turns);
+    log(&format!("holding the turn of {} open: {reason}", rec.info.name));
+    Some(stdout)
+}
+
 /// Counts a finished turn, interrupted ones included, even one that leaves
 /// the activity unchanged (a turn ending `done` while the last result is
 /// still unseen).
@@ -348,6 +370,30 @@ mod tests {
         assert!(count_turn(&mut rec, &Hint::Error));
         assert!(count_turn(&mut rec, &Hint::Interrupted));
         assert_eq!(rec.info.turns, 4);
+    }
+
+    #[test]
+    fn a_turn_is_held_once_and_counted_once() {
+        let claude = driver::for_kind("claude");
+        let stop = json!({"hook_event_name":"Stop","stop_hook_active":false});
+        let mut rec = record();
+        let held = hold_stop(&mut rec, claude, &stop).expect("labels are unset");
+        assert!(held.contains(r#""decision":"block""#), "{held}");
+        // The agent keeps going and ends again: that end is the turn.
+        assert_eq!(hold_stop(&mut rec, claude, &stop), None, "held at most once per turn");
+        assert!(count_turn(&mut rec, &Hint::Done));
+        assert_eq!(rec.info.turns, 1);
+
+        // A later turn with labels still unset is held again; one with them set is not.
+        assert!(hold_stop(&mut rec, claude, &stop).is_some());
+        rec.info.turns += 1;
+        rec.info.labels = [("title", "Fix auth"), ("recap", "Testing")].map(|(k, v)| (k.into(), v.into())).into();
+        assert_eq!(hold_stop(&mut rec, claude, &stop), None);
+
+        let mut rec = record();
+        let continuing = json!({"hook_event_name":"Stop","stop_hook_active":true});
+        assert_eq!(hold_stop(&mut rec, claude, &continuing), None, "Claude is already continuing");
+        assert_eq!(hold_stop(&mut rec, driver::for_kind("codex"), &stop), None, "not supported yet");
     }
 
     #[test]

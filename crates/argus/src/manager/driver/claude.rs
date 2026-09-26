@@ -55,7 +55,7 @@ impl Driver for Claude {
                 // The user brought their own settings: add our hooks to a copy.
                 let (value_idx, user) = settings_value(&launch.command, idx);
                 let mut settings = load_user_settings(&user)?;
-                merge_hooks(&mut settings, &hooks_json(hook_exe));
+                merge_settings(&mut settings, &settings_json(hook_exe));
                 let merged = launch.agent_dir.join("claude-settings.json");
                 fs::write(&merged, serde_json::to_vec_pretty(&settings)?)?;
                 let merged = merged.to_string_lossy().into_owned();
@@ -91,21 +91,41 @@ impl Driver for Claude {
             _ => Hint::Ignore,
         }
     }
+
+    fn hold_stop(&self, event: &Value, reason: &str) -> Option<String> {
+        // Already continuing because of a Stop hook; holding again could loop.
+        if event.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        Some(json!({ "decision": "block", "reason": reason }).to_string())
+    }
 }
 
 /// Writes the settings file shared by every Claude agent started by argus.
 pub fn write_shared_settings(ctx: &Context) -> Result<()> {
     let Some(hook_exe) = &ctx.hook_exe else { return Ok(()) };
     let path = ctx.dir.join(SHARED_FILE);
-    fs::write(&path, serde_json::to_vec_pretty(&hooks_json(hook_exe))?)
+    fs::write(&path, serde_json::to_vec_pretty(&settings_json(hook_exe))?)
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn hooks_json(hook_exe: &Path) -> Value {
-    let handler = json!({ "type": "command", "command": hook_command(hook_exe, "claude"), "async": true });
-    let hooks: serde_json::Map<String, Value> =
-        HOOK_EVENTS.iter().map(|e| (e.to_string(), json!([{ "hooks": [handler.clone()] }]))).collect();
-    json!({ "hooks": hooks })
+/// Lets the agent set its own labels without a permission prompt; the label
+/// instructions and `hold_stop` both ask it to.
+const LABEL_RULE: &str = "Bash(argus label self:*)";
+
+/// Our hooks and the label permission. Every hook runs in the background
+/// except `Stop`, whose answer Claude waits for so the manager can hold the
+/// turn open (see `hold_stop`).
+fn settings_json(hook_exe: &Path) -> Value {
+    let command = hook_command(hook_exe, "claude");
+    let hooks: serde_json::Map<String, Value> = HOOK_EVENTS
+        .iter()
+        .map(|&e| {
+            let handler = json!({ "type": "command", "command": command, "async": e != "Stop" });
+            (e.to_string(), json!([{ "hooks": [handler] }]))
+        })
+        .collect();
+    json!({ "hooks": hooks, "permissions": { "allow": [LABEL_RULE] } })
 }
 
 /// Index of a `--settings` or `--settings=…` argument, if any.
@@ -131,22 +151,44 @@ fn load_user_settings(value: &str) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("parsing --settings {value}"))
 }
 
-/// Appends each of our matcher groups to the user's list for that event.
-fn merge_hooks(settings: &mut Value, ours: &Value) {
-    if !settings.is_object() {
-        *settings = json!({});
-    }
-    let hooks = settings.as_object_mut().unwrap().entry("hooks").or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let hooks = hooks.as_object_mut().unwrap();
+/// Appends each of our matcher groups to the user's list for that event, and
+/// our permission rules to the user's `permissions.allow`.
+fn merge_settings(settings: &mut Value, ours: &Value) {
+    let hooks = object_at(settings, &["hooks"]);
     for (event, groups) in ours["hooks"].as_object().unwrap() {
         let list = hooks.entry(event.clone()).or_insert_with(|| json!([]));
         if let (Some(list), Some(groups)) = (list.as_array_mut(), groups.as_array()) {
             list.extend(groups.iter().cloned());
         }
     }
+    let permissions = object_at(settings, &["permissions"]);
+    let allow = permissions.entry("allow").or_insert_with(|| json!([]));
+    if !allow.is_array() {
+        *allow = json!([]);
+    }
+    let allow = allow.as_array_mut().unwrap();
+    for rule in ours["permissions"]["allow"].as_array().unwrap() {
+        if !allow.contains(rule) {
+            allow.push(rule.clone());
+        }
+    }
+}
+
+/// The object at `path` inside `value`, replacing anything in the way that
+/// is not an object.
+fn object_at<'a>(value: &'a mut Value, path: &[&str]) -> &'a mut serde_json::Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let mut map = value.as_object_mut().unwrap();
+    for key in path {
+        let next = map.entry(key.to_string()).or_insert_with(|| json!({}));
+        if !next.is_object() {
+            *next = json!({});
+        }
+        map = next.as_object_mut().unwrap();
+    }
+    map
 }
 
 #[cfg(test)]
@@ -186,7 +228,7 @@ mod tests {
         assert_eq!(launch.command[4], SELF_LABEL_INSTRUCTIONS);
         assert_eq!(launch.command[5], "-c", "the user's own trailing arg is kept, just pushed further out");
 
-        let user = r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"mine"}]}]}}"#;
+        let user = r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"mine"}]}]},"permissions":{"allow":["Bash(ls:*)"]}}"#;
         let mut launch = Launch {
             command: vec!["claude".into(), "--settings".into(), user.into()],
             env: vec![],
@@ -198,6 +240,9 @@ mod tests {
         let stop = merged["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "user hook kept, ours appended");
         assert_eq!(stop[1]["hooks"][0]["command"], "'/opt/argus hook' claude");
+        assert_eq!(stop[1]["hooks"][0]["async"], false, "Claude waits for our Stop answer");
+        assert_eq!(merged["hooks"]["PreToolUse"][0]["hooks"][0]["async"], true);
+        assert_eq!(merged["permissions"]["allow"], json!(["Bash(ls:*)", LABEL_RULE]), "user rules kept, ours added");
         fs::remove_dir_all(dir).unwrap();
     }
 }

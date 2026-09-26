@@ -11,6 +11,30 @@
 The holders own the agents, so the manager can stop or restart at any time
 without killing them.
 
+## Channels
+
+An agent reaches argus through three separate channels:
+
+```text
+holder ──PTY── agent ──pipes── argus-hook ──socket── manager
+                 │
+                 └──HTTPS── model
+```
+
+| Channel | Between | Carries |
+|---|---|---|
+| PTY | holder and agent | Keystrokes in (typing, `argus send`), screen out (`attach`, `--screen`). The agent's own stdin and stdout. |
+| Hook pipes | agent and `argus-hook` | One event as JSON on the hook's stdin. The hook's stdout goes back to the agent. |
+| Socket | `argus-hook` and manager | The event, forwarded unchanged. |
+
+The agent program starts a new `argus-hook` for each hook event and connects
+it with its own pipes, so hook traffic never appears on the screen. The model
+behind the agent sees neither the PTY nor the pipes: it sees the conversation
+the agent program sends it. The agent program decides what a hook's stdout
+does. For example, Claude Code turns a Stop hook's
+`{"decision":"block","reason":"…"}` into a new message and runs the model
+again. argus uses this to hold a turn open: see [Labels](#labels).
+
 ## Attaching
 
 `attach` shows the agent on the screen it uses. An agent on the alternate
@@ -37,7 +61,14 @@ Key/value pairs on an agent. Agents set two of them on their own:
 - `title`: what the session is about.
 - `recap`: what the agent is doing right now.
 
-argus asks agents to do this through a short instruction it adds at launch.
-The same instruction says what "running", "finished" and "exited" mean for
-other agents, how to check on and wait for them, and not to change or message
-other agents unless you ask.
+argus asks agents to do this through an instruction it adds at launch. The
+same instruction says what "running", "finished" and "exited" mean for other
+agents, and how to check on them, read their results, wait for them and send
+them prompts. An agent changes or messages other agents only when you ask. It
+starts agents of its own only with your consent, in a group named after
+itself, and may then message and stop those without asking.
+
+If a turn ends with `title` or `recap` unset, argus holds it open once and asks
+the agent to set them. Only the end that follows counts as the turn, so `wait`
+and `send --then-wait` return after it. Claude Code only; other agents end the
+turn as usual.

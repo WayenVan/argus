@@ -5,6 +5,7 @@
 //! rebuild itself by reconnecting to every holder socket.
 
 mod activity;
+mod directive;
 pub(crate) mod driver;
 mod holder;
 mod registry;
@@ -141,8 +142,11 @@ async fn handle_conn(manager: Arc<Manager>, stream: UnixStream) -> Result<()> {
             break;
         }
         greeted = true;
-        if let Request::Report { agent_id, source, event } = &req {
-            manager.report(*agent_id, source, event); // Never answered.
+        if let Request::Report { agent_id, source, event, reply } = &req {
+            let stdout = manager.report(*agent_id, source, event);
+            if *reply {
+                aio::write_json(&mut writer, &Response::HookReply { stdout }).await?;
+            }
             continue;
         }
         if let Request::Watch { ids, include_exited } = req {

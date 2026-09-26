@@ -47,6 +47,9 @@ pub struct AgentRuntime {
     /// was submitted) or this deadline passes, so a second send cannot land
     /// on top of the first.
     pub submitting: Option<Instant>,
+    /// The `turns` value at which a `Stop` was last held back with
+    /// directives, so a turn is held at most once.
+    pub held_turn: Option<u64>,
 }
 
 impl AgentRecord {

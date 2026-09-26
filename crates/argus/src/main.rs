@@ -524,7 +524,12 @@ mod tests {
     #[test]
     fn instruction_commands_parse() {
         use clap::Parser;
-        let text = [include_str!("instructions/core.md"), include_str!("instructions/coordination.md")].concat();
+        let text = [
+            include_str!("instructions/core.md"),
+            include_str!("instructions/labels.md"),
+            include_str!("instructions/coordination.md"),
+        ]
+        .concat();
         let mut checked = 0;
         for line in text.lines() {
             let line = line.trim_start().trim_start_matches('`');
@@ -538,6 +543,7 @@ mod tests {
                 .replace("<secs>", "5")
                 .replace("<activity>", "done")
                 .replace("<n>", "3")
+                .replace("<group>", "claude-1")
                 .replace(['[', ']'], "");
             let args: Vec<&str> = command.split_whitespace().collect();
             if let Err(e) = super::Cli::try_parse_from(&args) {

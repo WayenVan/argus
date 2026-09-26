@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Claude Code agents that end a turn with `title` or `recap` unset are asked to
+  set them before the turn ends. argus's `Stop` hook is now synchronous and
+  answers with Claude's `decision: block`; the held end does not count as a
+  turn, so `wait` and `send --then-wait` return after the real one. A turn is
+  held at most once.
+  - `argus-hook` prints the manager's answer to a report. It asks for one only
+    from a manager with the new `hook_reply` capability.
+- Claude Code agents may run `argus label self …` without a permission prompt:
+  argus's settings allow `Bash(argus label self:*)`, added to your own
+  `--settings` if you pass one.
+
+### Changed
+
+- The coordination instructions injected at launch are organized by task:
+  reading another agent's result (`inspect`, `--screen`), waiting, sending, and
+  starting agents of your own, with the user's consent, in a group named after
+  you, which the agent may then send to, kill and remove without asking.
+- The label instructions are their own section and say why the labels matter:
+  the dashboard shows them, and other agents read the recap. They name what
+  should and should not change each label, so agents stop relabeling every
+  turn. The core section
+  now notes that a prompt may come from another agent through `argus send`.
+
 ## [0.1.0] - 2026-09-25
 
 ### Added

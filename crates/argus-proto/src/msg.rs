@@ -253,9 +253,12 @@ pub enum Capability {
     ScreenRestore,
     StyledPreview,
     OffsetReplay,
+    /// The manager answers a `Report` sent with `reply`.
+    HookReply,
 }
 
-pub const MANAGER_CAPABILITIES: &[Capability] = &[Capability::ScreenRestore, Capability::StyledPreview];
+pub const MANAGER_CAPABILITIES: &[Capability] =
+    &[Capability::ScreenRestore, Capability::StyledPreview, Capability::HookReply];
 pub const HOLDER_CAPABILITIES: &[Capability] = &[Capability::OffsetReplay];
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -325,13 +328,17 @@ pub enum Request {
         #[serde(default)]
         include_exited: bool,
     },
-    /// Sent by `argus-hook` on behalf of an agent. Never answered.
+    /// Sent by `argus-hook` on behalf of an agent. Answered with `HookReply`
+    /// only when `reply` is set, which a hook does only for a manager that
+    /// has [`Capability::HookReply`].
     Report {
         agent_id: u64,
         /// The hook's origin (`claude`, `codex`); must match the agent's kind.
         source: String,
         /// The hook payload exactly as the agent wrote it.
         event: serde_json::Value,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reply: bool,
     },
     /// Marks a finished agent as seen: `done` → `idle`.
     Ack {
@@ -444,6 +451,12 @@ pub enum Response {
     /// caller can wait for the turn it started (`turns > turn`).
     Sent {
         turn: u64,
+    },
+    /// Reply to a `Report` sent with `reply`: what the hook prints to its
+    /// stdout for the agent to act on; nothing when absent.
+    HookReply {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout: Option<String>,
     },
     Error {
         code: String,

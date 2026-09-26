@@ -83,6 +83,13 @@ pub trait Driver: Send + Sync {
 
     /// Interprets one hook event.
     fn interpret(&self, event: &Value) -> Hint;
+
+    /// What the hook prints to keep the agent going after `event`, a turn's
+    /// end, with `reason` as its next input. `None` when this agent cannot be
+    /// held, and the turn ends as usual.
+    fn hold_stop(&self, _event: &Value, _reason: &str) -> Option<String> {
+        None
+    }
 }
 
 static CLAUDE: claude::Claude = claude::Claude;
@@ -123,9 +130,11 @@ pub fn install_shared_files(ctx: &Context) -> Result<()> {
 pub(super) const SELF_LABEL_INSTRUCTIONS: &str = concat!(
     include_str!("../../instructions/core.md"),
     "\n",
+    include_str!("../../instructions/labels.md"),
+    "\n",
     include_str!("../../instructions/coordination.md"),
-    "\nBefore you send your final message for this turn, double check: have you actually evaluated\n",
-    "title and recap this turn? If not, do it now, before responding.\n",
+    "\nBefore your final message: if this turn changed where things stand, make sure your recap\n",
+    "says so; if your labels are unset, set them.\n",
 );
 
 /// `'path' arg`, quoted for the `sh -c` that agents run hook commands through.

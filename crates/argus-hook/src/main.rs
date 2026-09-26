@@ -4,8 +4,11 @@
 //!     argus-hook <source>          e.g. `argus-hook claude`
 //!
 //! It reads the event JSON from stdin and forwards it unchanged to the
-//! manager as a `Report`. It must never slow down or break the agent, so every
-//! failure is silent: not started by argus, manager down, bad input — just exit.
+//! manager as a `Report`. A manager that answers reports may reply with text
+//! for the agent, which goes to stdout, where the agent reads it as the hook's
+//! answer (e.g. Claude's `{"decision":"block",…}` on `Stop`). It must never
+//! slow down or break the agent, so every failure is silent: not started by
+//! argus, manager down, bad input — just exit.
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
@@ -13,8 +16,7 @@ use std::time::Duration;
 
 use argus_proto::MANAGER_PROTOCOL_VERSION;
 use argus_proto::frame;
-use argus_proto::msg::MANAGER_CAPABILITIES;
-use argus_proto::msg::Request;
+use argus_proto::msg::{Capability, MANAGER_CAPABILITIES, Request, Response};
 
 fn main() {
     // Only agents started by argus carry these; anything else is not ours.
@@ -32,17 +34,24 @@ fn main() {
     let _ = stream.set_write_timeout(Some(TIMEOUT));
     let _ = stream.set_read_timeout(Some(TIMEOUT));
     // Wait for the Hello reply so the manager is reading before we hang up.
-    if frame::write_json(
-        &mut stream,
-        &Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: MANAGER_CAPABILITIES.to_vec() },
-    )
-    .is_err()
-        || !matches!(frame::read_frame(&mut stream), Ok(Some(_)))
-    {
+    let hello = Request::Hello { version: MANAGER_PROTOCOL_VERSION, capabilities: MANAGER_CAPABILITIES.to_vec() };
+    if frame::write_json(&mut stream, &hello).is_err() {
         return;
     }
-    let _ = frame::write_json(&mut stream, &Request::Report { agent_id, source, event });
-    // Report is never answered; closing the socket ends the exchange.
+    let Some(Response::Hello { capabilities, .. }) = read_response(&mut stream) else { return };
+    // An older manager never answers a report.
+    let reply = capabilities.contains(&Capability::HookReply);
+    if frame::write_json(&mut stream, &Request::Report { agent_id, source, event, reply }).is_err() || !reply {
+        return;
+    }
+    if let Some(Response::HookReply { stdout: Some(text) }) = read_response(&mut stream) {
+        print!("{text}");
+    }
+}
+
+fn read_response(stream: &mut UnixStream) -> Option<Response> {
+    let (_, payload) = frame::read_frame(stream).ok()??;
+    serde_json::from_slice(&payload).ok()
 }
 
 /// Upper bound on how long a stuck manager can hold up one hook event.
