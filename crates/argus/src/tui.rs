@@ -32,7 +32,7 @@ use crate::attach;
 use crate::client::{self, Conn, PsOptions};
 use crate::errors::CodedError;
 use crate::theme::theme;
-use crate::{Cli, Command, stream, term, tmux};
+use crate::{Cli, Command, query, stream, term, tmux};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
 /// list (pushed by Watch, applied as it arrives), preview bytes are always a
@@ -104,14 +104,67 @@ struct GridState {
     selected: usize,
 }
 
+/// The Tree mode panes, in `Tab` order. Keys act on the focused one; the
+/// agent list keeps its selection while another pane has focus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Pane {
+    #[default]
+    Agents,
+    Preview,
+    Title,
+    Recap,
+}
+
+impl Pane {
+    const ALL: [Pane; 4] = [Pane::Agents, Pane::Preview, Pane::Title, Pane::Recap];
+
+    fn next(self) -> Pane {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> Pane {
+        Self::ALL[(self as usize + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The pane `H`/`J`/`K`/`L` move to from this one: the agent list on the
+    /// left, the other three stacked on the right. Moving right returns to
+    /// `right`, the right-hand pane last focused.
+    fn toward(self, key: char, right: Pane) -> Pane {
+        match (key, self) {
+            ('H', _) => Pane::Agents,
+            ('L', Pane::Agents) => right,
+            ('K', Pane::Title) => Pane::Preview,
+            ('K', Pane::Recap) | ('J', Pane::Preview) => Pane::Title,
+            ('J', Pane::Title) => Pane::Recap,
+            _ => self,
+        }
+    }
+
+    /// Whether `e` can spread it over the whole content area.
+    fn zoomable(self) -> bool {
+        matches!(self, Pane::Agents | Pane::Preview)
+    }
+}
+
 #[derive(Default)]
 struct TreeState {
     /// Group paths (e.g. `"company/frontend"`) currently collapsed.
     collapsed: HashSet<String>,
     selected: usize,
+    /// The selected agent's whole current screen, cropped to the preview's
+    /// width; the pane shows as much of its bottom as fits.
     preview: Vec<PreviewLine>,
-    /// Show the tree across the whole content area instead of beside details.
-    expanded: bool,
+    /// Whose screen `preview` is, so moving to another agent starts at its
+    /// bottom again.
+    preview_of: Option<u64>,
+    /// Lines the preview is scrolled up from the bottom of the screen.
+    preview_scroll: usize,
+    focus: Pane,
+    /// The right-hand pane last focused, where `L` returns; the preview
+    /// until another is.
+    right: Option<Pane>,
+    /// The focused pane fills the whole content area.
+    zoomed: bool,
     /// The terminal window lost focus: the selection is drawn faintly so it
     /// does not drown out the activity colors of the row under it.
     blurred: bool,
@@ -405,6 +458,16 @@ fn event_loop(
         };
         if mode == Mode::Tree {
             tree.selected = tree.selected.min(rows.len().saturating_sub(1));
+            let selected_id = match rows.get(tree.selected) {
+                Some(Row::Agent { info, .. }) => Some(info.id),
+                _ => None,
+            };
+            if selected_id != tree.preview_of {
+                tree.preview_of = selected_id;
+                tree.preview.clear();
+                tree.preview_scroll = 0;
+                last_tick = Instant::now() - PREVIEW_TICK; // Show the new agent's screen right away.
+            }
         }
 
         let area: Rect = terminal.size()?.into();
@@ -412,8 +475,8 @@ fn event_loop(
         if last_tick.elapsed() >= PREVIEW_TICK {
             let refreshed = match mode {
                 Mode::Grid => refresh_grid(conn, &table, opts, content_area).map(|tiles| grid.tiles = tiles),
-                Mode::Tree if tree.expanded => Ok(()),
-                Mode::Tree => refresh_tree_preview(conn, &rows, tree.selected, detail_preview_rect(content_area))
+                Mode::Tree if tree.zoomed && tree.focus == Pane::Agents => Ok(()),
+                Mode::Tree => refresh_tree_preview(conn, &rows, tree.selected, tree_preview_rect(content_area, &tree))
                     .map(|preview| tree.preview = preview),
             };
             if let Err(e) = refreshed {
@@ -466,7 +529,25 @@ fn event_loop(
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char(']') => {
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('H' | 'J' | 'K' | 'L') if mode == Mode::Tree => {
+                let focus = match key.code {
+                    KeyCode::Tab => tree.focus.next(),
+                    KeyCode::BackTab => tree.focus.prev(),
+                    KeyCode::Char(c) => tree.focus.toward(c, tree.right.unwrap_or(Pane::Preview)),
+                    _ => tree.focus,
+                };
+                if focus != tree.focus {
+                    if tree.zoomed {
+                        tree.zoomed = false;
+                        last_tick = Instant::now() - PREVIEW_TICK; // Back to the split's preview size.
+                    }
+                    tree.focus = focus;
+                    if focus != Pane::Agents {
+                        tree.right = Some(focus);
+                    }
+                }
+            }
+            KeyCode::Char(']') => {
                 mode = mode.next();
                 last_tick = Instant::now() - PREVIEW_TICK; // Refresh right away.
             }
@@ -476,7 +557,7 @@ fn event_loop(
             }
             KeyCode::Char('1') => mode = Mode::Grid,
             KeyCode::Char('2') => mode = Mode::Tree,
-            KeyCode::Char('K') => {
+            KeyCode::Char('i') => {
                 if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
                     overlay = Overlay::Details { id: info.id, scroll: 0 };
                 }
@@ -510,14 +591,8 @@ fn event_loop(
             }
             KeyCode::Char('c') => {
                 if let Some(info) = selected_agent(mode, &grid, &rows, tree.selected) {
-                    let name = info.name.clone();
-                    status = Some((
-                        match term::copy_to_clipboard(&name) {
-                            Ok(()) => format!("copied {name}"),
-                            Err(e) => format!("copy failed: {e}"),
-                        },
-                        Instant::now(),
-                    ));
+                    let focus = if mode == Mode::Tree { tree.focus } else { Pane::Agents };
+                    status = Some((copy_pane(conn, info, focus), Instant::now()));
                 }
             }
             KeyCode::Char('o') => {
@@ -558,42 +633,65 @@ fn event_loop(
                         _ => {}
                     }
                 }
-                Mode::Tree => match code {
-                    KeyCode::Char('e') => {
-                        tree.expanded = !tree.expanded;
-                        if !tree.expanded {
-                            last_tick = Instant::now() - PREVIEW_TICK; // Restore the detail pane with a fresh preview.
+                Mode::Tree => match (tree.focus, code) {
+                    (focus, KeyCode::Char('e')) if focus.zoomable() => {
+                        tree.zoomed = !tree.zoomed;
+                        last_tick = Instant::now() - PREVIEW_TICK; // A preview sized for the new layout.
+                    }
+                    (Pane::Preview, KeyCode::Up | KeyCode::Char('k')) => {
+                        tree.preview_scroll = (tree.preview_scroll + 1).min(preview_scroll_limit(&tree, content_area));
+                    }
+                    (Pane::Preview, KeyCode::Down | KeyCode::Char('j')) => {
+                        tree.preview_scroll = tree.preview_scroll.saturating_sub(1);
+                    }
+                    (Pane::Preview, KeyCode::PageUp) => {
+                        let page = preview_page_height(&tree, content_area);
+                        tree.preview_scroll =
+                            (tree.preview_scroll + page).min(preview_scroll_limit(&tree, content_area));
+                    }
+                    (Pane::Preview, KeyCode::PageDown) => {
+                        tree.preview_scroll =
+                            tree.preview_scroll.saturating_sub(preview_page_height(&tree, content_area));
+                    }
+                    (Pane::Agents, code) => match code {
+                        KeyCode::Up | KeyCode::Char('k') => tree.selected = tree.selected.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
+                            tree.selected = (tree.selected + 1).min(rows.len() - 1);
                         }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => tree.selected = tree.selected.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
-                        tree.selected = (tree.selected + 1).min(rows.len() - 1);
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        if let Some(Row::Group { path, .. }) = rows.get(tree.selected) {
-                            tree.collapsed.remove(path);
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            if let Some(Row::Group { path, .. }) = rows.get(tree.selected) {
+                                tree.collapsed.remove(path);
+                            }
                         }
-                    }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        if let Some(Row::Group { path, .. }) = rows.get(tree.selected) {
-                            tree.collapsed.insert(path.clone());
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if let Some(Row::Group { path, .. }) = rows.get(tree.selected) {
+                                tree.collapsed.insert(path.clone());
+                            }
                         }
-                    }
-                    KeyCode::Enter => match rows.get(tree.selected) {
-                        Some(Row::Agent { info, .. }) => {
+                        KeyCode::Enter => match rows.get(tree.selected) {
+                            Some(Row::Agent { info, .. }) => {
+                                let (id, name) = (info.id, info.name.clone());
+                                status = Some((attach_to(terminal, id, name)?, Instant::now()));
+                                last_tick = Instant::now() - PREVIEW_TICK;
+                            }
+                            Some(Row::Group { path, expanded, .. }) => {
+                                if *expanded {
+                                    tree.collapsed.insert(path.clone());
+                                } else {
+                                    tree.collapsed.remove(path);
+                                }
+                            }
+                            None => {}
+                        },
+                        _ => {}
+                    },
+                    (_, KeyCode::Enter) => {
+                        if let Some(Row::Agent { info, .. }) = rows.get(tree.selected) {
                             let (id, name) = (info.id, info.name.clone());
                             status = Some((attach_to(terminal, id, name)?, Instant::now()));
                             last_tick = Instant::now() - PREVIEW_TICK;
                         }
-                        Some(Row::Group { path, expanded, .. }) => {
-                            if *expanded {
-                                tree.collapsed.insert(path.clone());
-                            } else {
-                                tree.collapsed.remove(path);
-                            }
-                        }
-                        None => {}
-                    },
+                    }
                     _ => {}
                 },
             },
@@ -661,7 +759,7 @@ fn handle_overlay_key(
             _ => Overlay::Jump { targets, selected },
         },
         Overlay::Details { id, mut scroll } => match code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('K') => Overlay::None,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => Overlay::None,
             KeyCode::Up | KeyCode::Char('k') => {
                 scroll = scroll.saturating_sub(1);
                 Overlay::Details { id, scroll }
@@ -845,7 +943,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color))
             .title(title);
-        let text = preview_text(&tile.lines, cell_area.height.saturating_sub(2));
+        let text = preview_text(&tile.lines, cell_area.height.saturating_sub(2), 0);
         frame.render_widget(Paragraph::new(text).block(block), cell_area);
     }
 }
@@ -916,13 +1014,47 @@ fn count_agents(node: &GroupNode) -> usize {
     node.agents.len() + node.children.values().map(count_agents).sum::<usize>()
 }
 
-/// The right-hand detail pane's preview box, at whatever size the current
-/// terminal works out to — kept in sync with `draw_tree`'s own split so the
-/// `ScreenPreview` request is sized for the box it will actually fill.
-fn detail_preview_rect(area: Rect) -> Rect {
+/// The preview box, at whatever size the current terminal works out to —
+/// kept in sync with `draw_tree`'s own layout so the `ScreenPreview` request
+/// is cropped to the width it will actually fill.
+fn tree_preview_rect(area: Rect, tree: &TreeState) -> Rect {
+    if tree.zoomed && tree.focus == Pane::Preview {
+        return area;
+    }
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
     let detail = tree_detail_rects(cols[1]);
     detail[0]
+}
+
+/// Lines of screen the preview box shows at once.
+fn preview_page_height(tree: &TreeState, area: Rect) -> usize {
+    usize::from(tree_preview_rect(area, tree).height.saturating_sub(2))
+}
+
+/// How far up the preview scrolls: to the top of the agent's screen.
+fn preview_scroll_limit(tree: &TreeState, area: Rect) -> usize {
+    tree.preview.len().saturating_sub(preview_page_height(tree, area))
+}
+
+/// What `c` copies from the focused pane: the agent's name from the list,
+/// its whole current screen (uncropped) from the preview, or a label.
+fn copy_pane(conn: &mut Conn, info: &AgentInfo, focus: Pane) -> String {
+    let (what, text) = match focus {
+        Pane::Agents => ("name", Some(info.name.clone())),
+        Pane::Preview => match query::screen_text(conn, info.id) {
+            Ok(text) if !text.is_empty() => ("screen", Some(text)),
+            Ok(_) => ("screen", None),
+            Err(e) => return format!("copy failed: {e}"),
+        },
+        Pane::Title => ("title", info.labels.get("title").cloned()),
+        Pane::Recap => ("recap", info.labels.get("recap").cloned()),
+    };
+    let Some(text) = text.filter(|t| !t.is_empty()) else { return format!("{} has no {what} to copy", info.name) };
+    match term::copy_to_clipboard(&text) {
+        Ok(()) if focus == Pane::Agents => format!("copied {text}"),
+        Ok(()) => format!("copied the {what} of {}", info.name),
+        Err(e) => format!("copy failed: {e}"),
+    }
 }
 
 fn tree_detail_rects(area: Rect) -> [Rect; 3] {
@@ -932,27 +1064,27 @@ fn tree_detail_rects(area: Rect) -> [Rect; 3] {
 
 fn refresh_tree_preview(conn: &mut Conn, rows: &[Row], selected: usize, area: Rect) -> Result<Vec<PreviewLine>> {
     let Some(Row::Agent { info, .. }) = rows.get(selected) else { return Ok(vec![]) };
+    // Every row, so the pane can scroll through the whole screen.
     let cols = area.width.saturating_sub(2);
-    let rows = area.height.saturating_sub(2);
-    match conn.request(&Request::ScreenPreview { target: info.id.to_string(), rows, cols })? {
+    match conn.request(&Request::ScreenPreview { target: info.id.to_string(), rows: u16::MAX, cols })? {
         Response::ScreenPreview { lines } => Ok(lines),
         _ => Ok(vec![]),
     }
 }
 
 fn draw_tree(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, blink: bool, jump_socket: Option<&str>) {
-    let (selected, preview) = (tree.selected, &tree.preview);
-    if tree.expanded {
-        draw_tree_list(frame, area, rows, tree, blink, jump_socket);
-        return;
+    match (tree.zoomed, tree.focus) {
+        (true, Pane::Agents) => return draw_tree_list(frame, area, rows, tree, blink, jump_socket),
+        (true, Pane::Preview) => return draw_detail_preview(frame, area, rows, tree),
+        _ => {}
     }
     let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
     draw_tree_list(frame, cols[0], rows, tree, blink, jump_socket);
 
     let detail = tree_detail_rects(cols[1]);
-    draw_detail_preview(frame, detail[0], rows, selected, preview);
-    draw_detail_label(frame, detail[1], rows, selected, "title");
-    draw_detail_label(frame, detail[2], rows, selected, "recap");
+    draw_detail_preview(frame, detail[0], rows, tree);
+    draw_detail_label(frame, detail[1], rows, tree, Pane::Title);
+    draw_detail_label(frame, detail[2], rows, tree, Pane::Recap);
 }
 
 fn draw_tree_list(
@@ -963,9 +1095,9 @@ fn draw_tree_list(
     blink: bool,
     jump_socket: Option<&str>,
 ) {
-    let TreeState { selected, blurred, expanded, .. } = *tree;
-    let title = if expanded { " agents · expanded (e restore) " } else { " agents " };
-    let block = panel(title);
+    let TreeState { selected, blurred, zoomed, focus, .. } = *tree;
+    let title = if zoomed { " agents · zoomed (e restore) " } else { " agents " };
+    let block = focusable_panel(title, focus == Pane::Agents);
     if rows.is_empty() {
         frame.render_widget(Paragraph::new("no agents").block(block), area);
         return;
@@ -994,6 +1126,12 @@ fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
         .border_style(Style::default().fg(theme().surface2))
         .title_style(Style::default().fg(theme().text))
         .title(title)
+}
+
+/// A pane that `Tab` can focus: the focused one's border takes the accent.
+fn focusable_panel<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
+    let block = panel(title);
+    if focused { block.border_style(Style::default().fg(theme().mauve)) } else { block }
 }
 
 /// The selected row of a list: a raised surface, not the accent, so the
@@ -1054,30 +1192,46 @@ fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>, highlight: O
     }
 }
 
-fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, preview: &[PreviewLine]) {
-    let title = match rows.get(selected) {
+fn draw_detail_preview(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState) {
+    let height = area.height.saturating_sub(2);
+    let scroll = tree.preview_scroll.min(tree.preview.len().saturating_sub(usize::from(height)));
+    let mut title = match rows.get(tree.selected) {
         Some(Row::Agent { info, .. }) => format!(" {} · {}{} ", info.name, info.activity, attachment_hint(info)),
         Some(Row::Group { name, count, .. }) => format!(" {name} ({count}) — select an agent to preview its screen "),
         None => " no agents ".to_string(),
     };
-    let block = panel(title);
-    let text = preview_text(preview, area.height.saturating_sub(2));
+    if scroll > 0 {
+        title.push_str(&format!("· \u{2191}{scroll} "));
+    }
+    if tree.zoomed {
+        title.push_str("· zoomed (e restore) ");
+    }
+    let block = focusable_panel(title, tree.focus == Pane::Preview);
+    let text = preview_text(&tree.preview, height, scroll);
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn preview_text(preview: &[PreviewLine], height: u16) -> Text<'static> {
-    let pad = usize::from(height).saturating_sub(preview.len());
+/// The `height` lines of `preview` that end `scroll` lines above its bottom,
+/// padded above when the screen is shorter than the box.
+fn preview_text(preview: &[PreviewLine], height: u16, scroll: usize) -> Text<'static> {
+    let end = preview.len().saturating_sub(scroll);
+    let start = end.saturating_sub(usize::from(height));
+    let pad = usize::from(height).saturating_sub(end - start);
     Text::from(
-        std::iter::repeat_with(|| Line::raw("")).take(pad).chain(preview.iter().map(render_line)).collect::<Vec<_>>(),
+        std::iter::repeat_with(|| Line::raw(""))
+            .take(pad)
+            .chain(preview[start..end].iter().map(render_line))
+            .collect::<Vec<_>>(),
     )
 }
 
 /// One of the self-reported labels (`title`, `recap`) an agent is taught to
 /// maintain via `SELF_LABEL_INSTRUCTIONS` — a plain readback of
 /// `AgentInfo.labels`, not a separate data source.
-fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize, key: &str) {
-    let block = panel(format!(" {key} "));
-    let value = match rows.get(selected) {
+fn draw_detail_label(frame: &mut Frame, area: Rect, rows: &[Row], tree: &TreeState, pane: Pane) {
+    let key = if pane == Pane::Title { "title" } else { "recap" };
+    let block = focusable_panel(format!(" {key} "), tree.focus == pane);
+    let value = match rows.get(tree.selected) {
         Some(Row::Agent { info, .. }) => info.labels.get(key).map(String::as_str).unwrap_or("none"),
         _ => "none",
     };
@@ -1111,7 +1265,7 @@ fn draw(
         Mode::Grid => draw_grid(frame, chunks[1], &grid.tiles, grid.selected, blink, jump_socket),
         Mode::Tree => draw_tree(frame, chunks[1], rows, tree, blink, jump_socket),
     }
-    draw_footer(frame, chunks[2], mode, tree.expanded, status);
+    draw_footer(frame, chunks[2], mode, tree, status);
     draw_overlay(frame, area, overlay, table);
 }
 
@@ -1141,7 +1295,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, mode: Mode, stale_manager: bool) {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, status: Option<&str>) {
+fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree: &TreeState, status: Option<&str>) {
     // A fresh status line (rename/kill/copy result) briefly takes over the
     // footer instead of the hint, so the user notices it without a popup.
     if let Some(msg) = status {
@@ -1151,15 +1305,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, mode: Mode, tree_expanded: bool, s
         );
         return;
     }
-    let hint = match mode {
-        Mode::Grid => {
-            " \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   K details   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+    const COMMON: &str = "i details   o jump   a new   r rename   m move group   x kill";
+    const SWITCH: &str = "[/] grid\u{2194}tree   q quit";
+    let zoom = if tree.zoomed { "e restore" } else { "e zoom" };
+    let hint = match (mode, tree.focus) {
+        (Mode::Grid, _) => {
+            format!(" \u{2190}/\u{2192}/\u{2191}/\u{2193} move   enter attach   {COMMON}   c copy name   {SWITCH}")
         }
-        Mode::Tree if tree_expanded => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e restore split   enter attach/toggle   K details   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
-        }
-        Mode::Tree => {
-            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   e expand tree   enter attach/toggle   K details   o jump   a new   r rename   m move group   x kill   c copy name   [/]/tab switch   q quit"
+        (Mode::Tree, Pane::Agents) => format!(
+            " \u{2191}/\u{2193} move   \u{2192} expand   \u{2190} collapse   {zoom}   enter attach/toggle   tab/HJKL pane   {COMMON}   c copy name   {SWITCH}"
+        ),
+        (Mode::Tree, Pane::Preview) => format!(
+            " \u{2191}/\u{2193} scroll   PgUp/PgDn page   {zoom}   enter attach   tab/HJKL pane   c copy screen   {COMMON}   {SWITCH}"
+        ),
+        (Mode::Tree, pane) => {
+            let key = if pane == Pane::Title { "title" } else { "recap" };
+            format!(" c copy {key}   enter attach   tab/HJKL pane   {COMMON}   {SWITCH}")
         }
     };
     frame.render_widget(Paragraph::new(hint).style(Style::default().fg(theme().subtext0).bg(theme().mantle)), area);
@@ -1596,10 +1757,79 @@ mod tests {
             underline: false,
             inverse: false,
         }];
-        let text = preview_text(&[line], 3);
+        let text = preview_text(&[line], 3, 0);
         assert!(text.lines[0].spans.is_empty());
         assert!(text.lines[1].spans.is_empty());
         assert_eq!(text.lines[2].spans[0].content, "latest");
+    }
+
+    fn text_line(text: &str) -> PreviewLine {
+        vec![PreviewSpan {
+            text: text.into(),
+            fg: PreviewColor::Default,
+            bg: PreviewColor::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }]
+    }
+
+    #[test]
+    fn tab_cycles_the_tree_panes_both_ways() {
+        assert_eq!(Pane::Agents.next(), Pane::Preview);
+        assert_eq!(Pane::Recap.next(), Pane::Agents);
+        assert_eq!(Pane::Agents.prev(), Pane::Recap);
+        assert!(Pane::Preview.zoomable() && !Pane::Title.zoomable());
+    }
+
+    #[test]
+    fn capital_hjkl_moves_between_panes_by_position() {
+        let right = Pane::Preview;
+        assert_eq!(Pane::Agents.toward('L', right), Pane::Preview);
+        assert_eq!(Pane::Agents.toward('L', Pane::Recap), Pane::Recap, "back to the last right-hand pane");
+        assert_eq!(Pane::Recap.toward('H', right), Pane::Agents);
+        assert_eq!(Pane::Preview.toward('J', right), Pane::Title);
+        assert_eq!(Pane::Title.toward('J', right), Pane::Recap);
+        assert_eq!(Pane::Recap.toward('K', right), Pane::Title);
+        assert_eq!(Pane::Title.toward('K', right), Pane::Preview);
+        for (pane, key) in [(Pane::Preview, 'K'), (Pane::Recap, 'J'), (Pane::Agents, 'J'), (Pane::Title, 'L')] {
+            assert_eq!(pane.toward(key, right), pane, "{pane:?} {key}");
+        }
+    }
+
+    #[test]
+    fn preview_scrolls_up_from_the_bottom_of_the_screen() {
+        let lines: Vec<PreviewLine> = (0..5).map(|i| text_line(&format!("l{i}"))).collect();
+        let shown = |scroll| -> Vec<String> {
+            preview_text(&lines, 3, scroll).lines.iter().map(|l| l.spans[0].content.to_string()).collect()
+        };
+        assert_eq!(shown(0), ["l2", "l3", "l4"]);
+        assert_eq!(shown(2), ["l0", "l1", "l2"]);
+
+        let content = Rect::new(0, 0, 100, 12);
+        let tree = TreeState { preview: lines.clone(), focus: Pane::Preview, zoomed: true, ..TreeState::default() };
+        assert_eq!(tree_preview_rect(content, &tree), content);
+        assert_eq!(preview_scroll_limit(&tree, content), 0, "a zoomed box that fits the screen does not scroll");
+        let split = TreeState { zoomed: false, ..tree };
+        assert_eq!(preview_page_height(&split, content), 4);
+        assert_eq!(preview_scroll_limit(&split, content), 1);
+    }
+
+    #[test]
+    fn the_focused_pane_has_an_accent_border() {
+        let rows = [Row::Agent { info: agent(1, "a"), depth: 0 }];
+        let tree = TreeState { focus: Pane::Title, ..TreeState::default() };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw_tree(frame, frame.area(), &rows, &tree, true, None)).unwrap();
+        let buf = terminal.backend().buffer();
+        let title = tree_detail_rects(
+            Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(Rect::new(0, 0, 100, 24))[1],
+        )[1];
+        assert_eq!(buf[(title.x, title.y)].fg, theme().mauve);
+        assert_eq!(buf[(0, 0)].fg, theme().surface2, "the agent list is not focused");
     }
 
     #[test]
@@ -1609,7 +1839,7 @@ mod tests {
         let row = Row::Agent { info, depth: 0 };
         let rows = std::slice::from_ref(&row);
         for blurred in [false, true] {
-            let tree = TreeState { blurred, expanded: true, ..TreeState::default() };
+            let tree = TreeState { blurred, zoomed: true, ..TreeState::default() };
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 3)).unwrap();
             terminal.draw(|frame| draw_tree_list(frame, frame.area(), rows, &tree, true, None)).unwrap();
             let buf = terminal.backend().buffer();
@@ -1631,7 +1861,7 @@ mod tests {
         assert_eq!(activity_text_style(&info).fg, Some(theme().yellow));
 
         let rows = [Row::Agent { info, depth: 0 }];
-        let tree = TreeState { expanded: true, ..TreeState::default() };
+        let tree = TreeState { zoomed: true, ..TreeState::default() };
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 3)).unwrap();
         terminal.draw(|frame| draw_tree_list(frame, frame.area(), &rows, &tree, true, None)).unwrap();
         let buf = terminal.backend().buffer();

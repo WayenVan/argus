@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Tree mode: `H` `J` `K` `L` move focus between the agent list, preview,
+  title and recap panes by position, and `Tab` / `Shift-Tab` cycle them; `[` `]` and `1` `2` switch between grid and tree. `e`
+  zooms the focused agent list or preview. The focused preview scrolls
+  through the agent's whole current screen with `↑`/`↓` (`k`/`j`) and
+  `PgUp`/`PgDn`. `c` copies what the focused pane shows: the name, the
+  screen as text, the title or the recap.
+- The dashboard's details popup opens and closes with `i` (was `K`).
+
 ### Fixed
 
 - Detaching from Codex no longer leaves the kitty keyboard protocol on in the

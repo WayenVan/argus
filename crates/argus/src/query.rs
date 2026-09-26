@@ -83,7 +83,7 @@ fn printable(text: &str) -> String {
 }
 
 /// The screen as plain text: styles dropped, trailing blanks trimmed.
-fn screen_text(conn: &mut Conn, id: u64) -> Result<String> {
+pub fn screen_text(conn: &mut Conn, id: u64) -> Result<String> {
     let request = Request::ScreenPreview { target: id.to_string(), rows: u16::MAX, cols: u16::MAX };
     let Response::ScreenPreview { lines } = conn.request(&request)? else {
         bail!("unexpected reply to ScreenPreview");
