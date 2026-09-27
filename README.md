@@ -4,7 +4,7 @@
 
 # argus
 
-**Run coding agents in the background and see what each one is doing.**
+**Manage coding agents, follow their progress, and coordinate their work from your terminal.**
 
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B-B7410E?style=flat-square&logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6289ED?style=flat-square)
@@ -13,16 +13,15 @@
 
 <br><br>
 
-<img src="assets/example.png" alt="The argus agent dashboard in a tmux pane, next to an attached Claude Code session" width="100%">
+<img src="assets/demo.gif" alt="Demo: the argus agent dashboard in a tmux pane, attaching to and managing Claude Code sessions" width="100%">
 
 </div>
 
 ## Features
 
-- **Always running**: a background daemon starts and manages every agent.
-- **Attach anywhere**: attach to any agent from any terminal and detach without stopping it.
-- **Live status**: see what every agent is doing as it happens.
-- **Jump to tmux**: go straight to the tmux pane where an agent is attached (optional; requires tmux).
+- **Manage every agent in one place**: start, name, group, inspect, and stop agents from the CLI or live dashboards. See each agent's screen, activity, title, and self-updated recap so you know what it is working on and where it stands.
+- **Let agents communicate and sync**: agents can find each other, read recaps and recent turns, send prompts, and wait for work to finish. You decide when agents may delegate or message one another.
+- **Attach from any terminal**: agents keep running when you detach or close your terminal. Reattach wherever you like, with no tmux or browser required. If you use tmux, you can also jump to an agent's existing pane.
 
 ## Requirements
 
@@ -81,6 +80,8 @@ Works with [Claude Code](docs/src/agents/claude.md),
 ## Roadmap
 
 - [x] Pi driver
+- [x] omp driver
+- [ ] Hermes driver
 - [ ] Kimi Code driver
 
 ## Docs
