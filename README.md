@@ -50,13 +50,78 @@ argus manager restart
 
 ## Use
 
+### Start and find an agent
+
 ```sh
-argus run claude     # start an agent and attach; detach with Ctrl-\
-argus grid           # dashboard of every agent
+argus run claude          # start Claude Code and attach to it
+argus ps                  # list running agents and their activity
+argus tree                # open the live dashboard, grouped by name
+argus attach claude-1     # attach to the agent from any terminal
 ```
 
-Detaching with `Ctrl-\` leaves the agent running; reattach later with
-`argus attach claude-1` or pick it from `argus grid`.
+Press `Ctrl-\` to detach. The agent keeps running, even if you close the
+terminal. Use `argus grid` for a live thumbnail view of every agent.
+
+### Run several agents
+
+Start agents in the background and give them names that make their work easy
+to find:
+
+```sh
+argus run -d --in backend --name api codex
+argus run -d --in backend --name tests claude
+argus ps backend                  # list agents in this group
+argus tree backend                # open the dashboard for this group
+argus inspect backend/api         # see its activity, title, and recap
+```
+
+Send work to a free agent and wait for that turn to finish:
+
+```sh
+argus send backend/api "Investigate the failing API tests" --wait --then-wait --timeout 600
+argus inspect backend/api --last  # read its latest prompt and reply
+argus status --scope repo         # see who is still working in this repo
+```
+
+### CLI help
+
+```text
+$ argus --help
+Lightweight manager for long-running terminal agents
+
+Usage: argus <COMMAND>
+
+Commands:
+  run      Start an agent and attach to it (use -d to leave it running in the background)
+  ps       List agents
+  inspect  Show one agent in full
+  pending  Show pending interaction prompts for an agent or agents in this directory
+  status   Agents working in a directory, and whether they are all free. Leaves out the agent running this command
+  grid     Full-screen dashboard: a live thumbnail grid of every agent's screen
+  tree     Full-screen dashboard: a group-path tree with a live detail pane for the selected agent (same app as `argus grid`, opened on the tree mode)
+  logs     Print an agent's recent output
+  send     Type a prompt into an agent and press Enter, only while it is idle (or done); otherwise exit 75
+  rename   Rename an agent: a new last segment, a full path, or `group/`
+  mv       Move an agent into another group, keeping its last segment
+  label    Set (key=value) or remove (key-) labels
+  ack      Mark a finished agent as seen (done → idle)
+  events   Print agent events as they happen
+  wait     Block until agents are free (their turn is over) or reach another state; with several, until all have. One agent waited on to exit passes on its exit code
+  attach   Take over an agent's terminal (detach with Ctrl-\)
+  kill     Stop an agent (SIGTERM, then SIGKILL after 5s)
+  rm       Remove an exited agent
+  prune    Remove every exited agent
+  guide    Print the instructions argus gives each agent it starts
+  manager  Manage the manager process
+  setup    One-time changes to an agent's own configuration that widen what it may do; shows them and asks first. Without an agent, sets up every agent found on PATH
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+Run `argus <command> --help` for options, or see the [CLI reference](docs/src/reference/cli.md).
 
 ## Agent setup
 
