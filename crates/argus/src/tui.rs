@@ -21,7 +21,7 @@ use argus_proto::msg::{
     Activity, AgentInfo, Capability, PreviewColor, PreviewLine, PreviewSpan, Request, Response, RunRequest, now_secs,
 };
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -298,12 +298,6 @@ fn jump_marker(info: &AgentInfo, socket: Option<&str>) -> Option<Span<'static>> 
     })
 }
 
-/// Byte offset of the `char_idx`-th character, for editing a `String` by
-/// character position (input is short, so a linear scan is fine).
-fn byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
-}
-
 /// The group the cursor is "inside" right now, to prefill `a`'s `--in`: the
 /// selected group's own path, or the selected agent's group. `None` in Grid
 /// (it has no notion of a current group) or when nothing is selected.
@@ -536,7 +530,7 @@ fn event_loop(
         }
 
         if !matches!(overlay, Overlay::None) {
-            handle_overlay_key(conn, &mut overlay, &mut status, key.code, area, table);
+            handle_overlay_key(conn, &mut overlay, &mut status, key, area, table);
             continue;
         }
 
@@ -717,15 +711,20 @@ fn event_loop(
 /// request and leaving a status line behind once it resolves. Takes
 /// `overlay` by value (via `mem::take`) rather than matching through the
 /// `&mut` so the request call and the reassignment aren't fighting over the
-/// same borrow.
+/// same borrow. Ctrl-C closes any overlay, as Esc does.
 fn handle_overlay_key(
     conn: &mut Conn,
     overlay: &mut Overlay,
     status: &mut Option<(String, Instant)>,
-    code: KeyCode,
+    key: KeyEvent,
     area: Rect,
     table: &BTreeMap<u64, AgentInfo>,
 ) {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        *overlay = Overlay::None;
+        return;
+    }
+    let code = key.code;
     *overlay = match std::mem::take(overlay) {
         Overlay::Edit { id, kind, mut input, mut cursor } => match code {
             KeyCode::Esc => Overlay::None,
@@ -738,7 +737,7 @@ fn handle_overlay_key(
                 Overlay::None
             }
             _ => {
-                edit_text(&mut input, &mut cursor, code);
+                edit_text(&mut input, &mut cursor, key);
                 Overlay::Edit { id, kind, input, cursor }
             }
         },
@@ -807,7 +806,7 @@ fn handle_overlay_key(
             _ => {
                 // Any edit clears a stale error rather than leaving it
                 // pinned under text the user has since changed.
-                edit_text(&mut input, &mut cursor, code);
+                edit_text(&mut input, &mut cursor, key);
                 Overlay::NewAgent { input, cursor, error: None }
             }
         },
@@ -815,33 +814,93 @@ fn handle_overlay_key(
     };
 }
 
-/// Applies one line-editing keypress (typing, backspace, delete, arrows,
-/// home/end) to `input`/`cursor`. Unrecognized keys are a no-op, so callers
-/// can route everything they don't handle themselves straight through.
-fn edit_text(input: &mut String, cursor: &mut usize, code: KeyCode) {
-    match code {
-        KeyCode::Backspace if *cursor > 0 => {
-            let end = byte_index(input, *cursor);
-            let start = byte_index(input, *cursor - 1);
-            input.replace_range(start..end, "");
-            *cursor -= 1;
-        }
-        KeyCode::Delete if *cursor < input.chars().count() => {
-            let start = byte_index(input, *cursor);
-            let end = byte_index(input, *cursor + 1);
-            input.replace_range(start..end, "");
-        }
-        KeyCode::Left => *cursor = cursor.saturating_sub(1),
-        KeyCode::Right => *cursor = (*cursor + 1).min(input.chars().count()),
-        KeyCode::Home => *cursor = 0,
-        KeyCode::End => *cursor = input.chars().count(),
-        KeyCode::Char(c) => {
-            let at = byte_index(input, *cursor);
-            input.insert(at, c);
-            *cursor += 1;
-        }
-        _ => {}
+/// Applies one line-editing keypress to `input`/`cursor`: typing, the
+/// arrows, Home/End, Backspace/Delete, and the emacs keys bash and zsh take
+/// by default. Unrecognized keys are a no-op, so callers can route
+/// everything they don't handle themselves straight through.
+///
+/// Ctrl-W deletes back to whitespace, as in bash; the Alt word keys stop at
+/// punctuation too, so Alt-Backspace takes one segment of a `group/name`.
+fn edit_text(input: &mut String, cursor: &mut usize, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let mut chars: Vec<char> = input.chars().collect();
+    let (len, at) = (chars.len(), (*cursor).min(chars.len()));
+    if let (KeyCode::Char(c), false, false) = (key.code, ctrl, alt) {
+        chars.insert(at, c);
+        *input = chars.into_iter().collect();
+        *cursor = at + 1;
+        return;
     }
+    // Where the key takes the cursor, and whether it deletes what it passes.
+    let (to, delete) = match (key.code, ctrl, alt) {
+        // Alt-Backspace; Ctrl-Backspace where the terminal tells them apart.
+        (KeyCode::Backspace, true, _) | (KeyCode::Backspace, _, true) => (word_start(&chars, at), true),
+        (KeyCode::Backspace, ..) | (KeyCode::Char('h'), true, _) => (at.saturating_sub(1), true),
+        (KeyCode::Delete, ..) | (KeyCode::Char('d'), true, _) => ((at + 1).min(len), true),
+        (KeyCode::Char('w'), true, _) => (blank_word_start(&chars, at), true),
+        (KeyCode::Char('u'), true, _) => (0, true),
+        (KeyCode::Char('k'), true, _) => (len, true),
+        (KeyCode::Left, true, _) | (KeyCode::Left, _, true) | (KeyCode::Char('b'), false, true) => {
+            (word_start(&chars, at), false)
+        }
+        (KeyCode::Right, true, _) | (KeyCode::Right, _, true) | (KeyCode::Char('f'), false, true) => {
+            (word_end(&chars, at), false)
+        }
+        (KeyCode::Left, ..) | (KeyCode::Char('b'), true, _) => (at.saturating_sub(1), false),
+        (KeyCode::Right, ..) | (KeyCode::Char('f'), true, _) => ((at + 1).min(len), false),
+        (KeyCode::Home, ..) | (KeyCode::Char('a'), true, _) => (0, false),
+        (KeyCode::End, ..) | (KeyCode::Char('e'), true, _) => (len, false),
+        _ => return,
+    };
+    if delete {
+        let (from, until) = (to.min(at), to.max(at));
+        chars.drain(from..until);
+        *input = chars.into_iter().collect();
+        *cursor = from;
+    } else {
+        *cursor = to;
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Start of the word before `at`, skipping the non-word characters first.
+fn word_start(chars: &[char], at: usize) -> usize {
+    let mut i = at;
+    while i > 0 && !is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+/// End of the word after `at`, skipping the non-word characters first.
+fn word_end(chars: &[char], at: usize) -> usize {
+    let mut i = at;
+    while i < chars.len() && !is_word_char(chars[i]) {
+        i += 1;
+    }
+    while i < chars.len() && is_word_char(chars[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Start of the whitespace-separated word before `at`, for Ctrl-W.
+fn blank_word_start(chars: &[char], at: usize) -> usize {
+    let mut i = at;
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
 }
 
 fn rename_status(conn: &mut Conn, id: u64, name: &str) -> String {
@@ -2008,6 +2067,62 @@ mod tests {
         idle.activity = "idle".into();
         assert_eq!(activity_symbol(&idle), "● ");
         assert_eq!(activity_text_style(&idle).fg, Some(theme().overlay0));
+    }
+
+    /// `input` with the cursor at `|`, after `keys`, as `input` with `|` again.
+    fn edit(input: &str, keys: &[KeyEvent]) -> String {
+        let mut cursor = input.chars().position(|c| c == '|').expect("a cursor");
+        let mut text: String = input.chars().filter(|&c| c != '|').collect();
+        for &key in keys {
+            edit_text(&mut text, &mut cursor, key);
+        }
+        let mut shown: Vec<char> = text.chars().collect();
+        shown.insert(cursor, '|');
+        shown.into_iter().collect()
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn input_boxes_take_the_emacs_keys() {
+        let line = "claude --in team/frontend|";
+        assert_eq!(edit(line, &[ctrl('w')]), "claude --in |");
+        assert_eq!(edit(line, &[alt(KeyCode::Backspace)]), "claude --in team/|");
+        assert_eq!(edit(line, &[ctrl('u')]), "|");
+        assert_eq!(edit("ab|cd", &[ctrl('k')]), "ab|");
+        assert_eq!(edit("ab|cd", &[ctrl('u')]), "|cd");
+        assert_eq!(edit("ab|cd", &[ctrl('h')]), "a|cd");
+        assert_eq!(edit("ab|cd", &[ctrl('d')]), "ab|d");
+        assert_eq!(edit("ab|cd", &[ctrl('a')]), "|abcd");
+        assert_eq!(edit("ab|cd", &[ctrl('e')]), "abcd|");
+        assert_eq!(edit("ab|cd", &[ctrl('b'), ctrl('b'), ctrl('b')]), "|abcd");
+        assert_eq!(edit("ab|cd", &[ctrl('f'), ctrl('f'), ctrl('f')]), "abcd|");
+        assert_eq!(edit("one two|", &[alt(KeyCode::Char('b'))]), "one |two");
+        assert_eq!(edit("|one two", &[alt(KeyCode::Char('f')), alt(KeyCode::Char('f'))]), "one two|");
+        assert_eq!(edit("a/b c|", &[KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)]), "a/b |c");
+        assert_eq!(edit("x  |", &[ctrl('w')]), "|", "trailing blanks go with the word");
+        assert_eq!(edit("|", &[ctrl('w'), ctrl('h'), ctrl('d'), alt(KeyCode::Backspace)]), "|", "nothing to delete");
+        assert_eq!(edit("组名|", &[plain(KeyCode::Backspace)]), "组|");
+    }
+
+    #[test]
+    fn typing_still_types() {
+        assert_eq!(
+            edit("a|", &[plain(KeyCode::Char('w')), KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT)]),
+            "awU|"
+        );
+        assert_eq!(edit("a|", &[ctrl('x'), alt(KeyCode::Char('x'))]), "a|", "unbound combinations type nothing");
+        assert_eq!(edit("ab|", &[plain(KeyCode::Left), plain(KeyCode::Home), plain(KeyCode::End)]), "ab|");
     }
 
     #[test]

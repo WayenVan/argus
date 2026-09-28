@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Dashboard text boxes take the shell editing keys: `Ctrl-A` `Ctrl-E`
+  `Ctrl-B` `Ctrl-F` `Ctrl-H` `Ctrl-D` `Ctrl-W` `Ctrl-U` `Ctrl-K`, and
+  `Alt-B` `Alt-F` `Alt-Backspace` by word. Ctrl combinations no longer type
+  their letter. `Ctrl-C` closes any popup.
 - `argus attach` now detaches with `Ctrl-]`, which sits in the same place on
   US and UK keyboards, instead of `Ctrl-\`. `Ctrl-\` now reaches the agent.
   Set `detach_key = "ctrl-\\"` to keep the old key.
