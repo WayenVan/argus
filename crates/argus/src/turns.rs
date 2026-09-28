@@ -10,10 +10,9 @@ use argus_proto::paths;
 use serde::{Deserialize, Serialize};
 
 /// Once the log grows past this, it is rewritten with only its newest turns:
-/// at most `KEEP`, and at most `MAX_LOG / 2` bytes of them, so a rewrite always
+/// at most the configured `turn_history`, and at most `MAX_LOG / 2` bytes of them, so a rewrite always
 /// leaves room for many appends before the next.
 const MAX_LOG: u64 = 2 * 1024 * 1024;
-const KEEP: usize = 50;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
@@ -51,7 +50,7 @@ fn compact(path: &Path) -> io::Result<()> {
         .lines()
         .rev()
         .filter(|l| serde_json::from_str::<Turn>(l).is_ok())
-        .take(KEEP)
+        .take(crate::config::manager().turn_history)
         .take_while(|l| {
             let fits = l.len() < budget;
             budget = budget.saturating_sub(l.len() + 1);
@@ -108,12 +107,12 @@ mod tests {
         let last: Vec<u64> = read_from(&path, 2).unwrap().iter().map(|t| t.turn).collect();
         assert_eq!(last, [2, 3]);
 
-        // Small turns: compaction keeps the last KEEP.
+        // Small turns: compaction keeps the last `turn_history`.
         for n in 4..=200 {
             append_to(&path, &turn(n, 20_000)).unwrap();
         }
         let all = read_from(&path, usize::MAX).unwrap();
-        assert!(all.len() <= KEEP + MAX_LOG as usize / 20_000, "{}", all.len());
+        assert!(all.len() <= crate::config::manager().turn_history + MAX_LOG as usize / 20_000, "{}", all.len());
         assert_eq!(all.last().unwrap().turn, 200);
 
         // A torn last line does not hide the others.

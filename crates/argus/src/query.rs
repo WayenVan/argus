@@ -136,6 +136,9 @@ fn describe(a: &AgentInfo) -> String {
     for (k, v) in &a.labels {
         rows.push(("label", format!("{k}={v}")));
     }
+    for w in &a.warnings {
+        rows.push(("warning", w.clone()));
+    }
     for p in &a.pending_interactions {
         let detail = p.summary.as_deref().unwrap_or(&p.kind);
         let options = if p.choices.is_empty() { String::new() } else { format!("; options: {}", p.choices.join(", ")) };
@@ -399,6 +402,14 @@ mod tests {
             "created_at": 0, "status": if live { "running" } else { "exited" }, "activity": activity
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn inspect_lists_start_warnings() {
+        let mut a = agent("idle", true);
+        a.warnings = vec!["first".into(), "second".into()];
+        let text = describe(&a);
+        assert!(text.contains("warning:") && text.contains(" first\n") && text.contains(" second\n"), "{text}");
     }
 
     #[test]

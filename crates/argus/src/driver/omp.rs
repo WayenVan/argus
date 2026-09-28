@@ -30,11 +30,11 @@ impl Driver for Omp {
         true
     }
 
-    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
+    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Vec<String>> {
         // No subcommand is left alone: omp finds a subcommand behind leading
         // options and drops the launch options for it, `-e` and
         // `--append-system-prompt` included.
-        Ok(pi::inject(launch, ctx, &[], EXTENSION_FILE, HOOK_ENV))
+        Ok(pi::inject(launch, ctx, &[], EXTENSION_FILE, HOOK_ENV).into_iter().collect())
     }
 
     fn translate(&self, event: &Value) -> DriverReport {
@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn injects_its_own_extension() {
         let mut l = launch(&["omp", "fix the build"]);
-        assert_eq!(Omp.prepare(&mut l, &ctx()).unwrap(), None);
+        assert_eq!(Omp.prepare(&mut l, &ctx()).unwrap(), Vec::<String>::new());
         assert_eq!(l.command[1..3], ["--append-system-prompt", SELF_LABEL_INSTRUCTIONS]);
         assert_eq!(l.command[3..], ["-e", "/s/drivers/argus-omp.js", "fix the build"]);
         assert_eq!(l.env, [(HOOK_ENV.to_string(), "/opt/argus-hook".to_string())]);

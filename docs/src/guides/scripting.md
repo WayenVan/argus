@@ -113,6 +113,9 @@ line:
   `{"schema":1,"agent":{...}}`: the agent after the command (`rm`: before it
   was removed; `run`: plus `warnings`; `send`: plus `turn`, except with
   `--then-wait`).
+- An agent's `warnings`, left out when empty, are what argus warned about
+  when it started it, such as a missing `argus setup codex`. They are not
+  rechecked later.
 - `wait` prints `agent` when waiting on one named agent, `agents` otherwise.
   `wait` and `send --then-wait` keep their exit codes.
 - `inspect` prints `agent`, plus `screen` with `--screen` (`null` once

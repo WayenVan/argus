@@ -24,6 +24,7 @@
 - [CLI](reference/cli.md)
 - [Activities](reference/activities.md)
 - [Environment](reference/env.md)
+- [Config file](reference/config.md)
 
 ---
 

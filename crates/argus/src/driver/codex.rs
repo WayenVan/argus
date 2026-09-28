@@ -55,7 +55,7 @@ impl Driver for Codex {
         Some(STEADY_CURSOR)
     }
 
-    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
+    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Vec<String>> {
         // Independent of hooks: ARGUS_AGENT_ID is set on the process
         // environment regardless, so self-labeling works even without them.
         // A user's own `-c developer_instructions=` comes later in argv and
@@ -67,7 +67,7 @@ impl Driver for Codex {
         launch.command.splice(1..1, developer_instructions_override());
 
         let Some(hook_exe) = &ctx.hook_exe else {
-            return Ok(Some("argus-hook is not installed next to argus; activity will not be tracked".into()));
+            return Ok(vec!["argus-hook is not installed next to argus; activity will not be tracked".into()]);
         };
         // Checked on the user's own arguments, before ours are added.
         let overridden = launch.command[1..].iter().any(|a| a.starts_with("hooks.") || a.starts_with("-chooks."));
@@ -76,14 +76,15 @@ impl Driver for Codex {
 
         let mut warnings = Vec::new();
         if overridden {
-            warnings.push("your own -c hooks.* overrides may replace argus's hooks for those events");
+            warnings.push("your own -c hooks.* overrides may replace argus's hooks for those events".into());
         } else if !trusted() {
-            warnings.push("Codex will ask you to review argus's hooks once: attach to this agent and trust them");
+            warnings
+                .push("Codex will ask you to review argus's hooks once: attach to this agent and trust them".into());
         }
         if !rules_installed() {
-            warnings.push("Codex's sandbox blocks `argus label` and `argus ps`/`status`/`inspect`/`wait`, so they may need your approval: run `argus setup codex` once to allow them");
+            warnings.push("Codex's sandbox blocks `argus label` and `argus ps`/`status`/`inspect`/`wait`, so they may need your approval: run `argus setup codex` once to allow them".into());
         }
-        Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+        Ok(warnings)
     }
 
     fn translate(&self, event: &Value) -> DriverReport {

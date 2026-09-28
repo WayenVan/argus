@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `argus attach` now detaches with `Ctrl-]`, which sits in the same place on
+  US and UK keyboards, instead of `Ctrl-\`. `Ctrl-\` now reaches the agent.
+  Set `detach_key = "ctrl-\\"` to keep the old key.
+
+### Added
+
+- A config file, `~/.config/argus/config.toml` (or `$ARGUS_CONFIG`): see
+  the Config file reference.
+- `detach_key` sets the key that ends `argus attach`.
+- Profiles: `argus run <name>` can start a preset program with default
+  arguments, kind, group and labels. `--no-profile` skips them.
+- `default_group`, used when neither `--in` nor `$ARGUS_GROUP` gives one.
+- Warnings from starting an agent, such as a missing `argus setup codex`,
+  are kept with the agent: the dashboard marks it with `⚠` and lists them in
+  its details (`i`), and `argus inspect` and `--json` show them. The
+  dashboard no longer cuts the first warning into its status line. Codex's
+  warnings are separate lines instead of one joined by `;`.
+- `[manager]` settings: `silence`, `typing_grace`, `turn_history`,
+  `kill_grace` and `replay_buffer`.
+
 ## [0.2.2] - 2026-09-26
 
 ### Fixed

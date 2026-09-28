@@ -233,6 +233,10 @@ pub struct AgentInfo {
     /// Free-form `key=value` tags, orthogonal to the group path.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// What argus warned about when it started the agent, one line each, e.g.
+    /// a missing one-time setup. Not rechecked later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A native request observed by a driver. `needs_user` means the manager has
@@ -639,6 +643,23 @@ pub struct HolderSpec {
     /// From [`RunRequest::colors`].
     #[serde(default)]
     pub colors: TerminalColors,
+    #[serde(default)]
+    pub limits: HolderLimits,
+}
+
+/// Holder settings the manager takes from the user's config.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HolderLimits {
+    /// From SIGTERM to SIGKILL on a kill.
+    pub kill_grace_ms: u64,
+    /// Bytes of recent output kept for replay and the output log.
+    pub replay_buffer: usize,
+}
+
+impl Default for HolderLimits {
+    fn default() -> HolderLimits {
+        HolderLimits { kill_grace_ms: 5_000, replay_buffer: 1024 * 1024 }
+    }
 }
 
 /// Written by the holder to its stdout as one JSON line once it is serving.

@@ -13,9 +13,8 @@ use argus_proto::msg::{Activity, Response};
 
 use super::registry::AgentRecord;
 use super::{Manager, holder, log, resolve_one};
+use crate::config;
 
-/// Input from an attached terminal this recent means someone is typing.
-const TYPING_GRACE: Duration = Duration::from_secs(10);
 /// How long a submitted prompt may take to show up as activity.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Enter goes in as a separate write after this pause, so TUIs see a
@@ -128,7 +127,7 @@ fn refusal(rec: &AgentRecord, force: bool, now: Instant) -> Option<String> {
     if force {
         return None;
     }
-    if rec.info.attached > 0 && rec.runtime.send.last_input.is_some_and(|t| now < t + TYPING_GRACE) {
+    if rec.info.attached > 0 && rec.runtime.send.last_input.is_some_and(|t| now < t + config::manager().typing_grace) {
         return Some("has someone typing in an attached terminal".into());
     }
     if rec.runtime.send.submitting.is_some_and(|deadline| now < deadline) {
@@ -175,7 +174,7 @@ mod tests {
         assert_eq!(refusal(&rec, false, now), None, "detached input does not count");
         rec.info.attached = 1;
         assert!(refusal(&rec, false, now).is_some());
-        assert_eq!(refusal(&rec, false, now + TYPING_GRACE), None);
+        assert_eq!(refusal(&rec, false, now + config::manager().typing_grace), None);
 
         let mut rec = record("idle");
         rec.runtime.send.submitting = Some(now + SUBMIT_TIMEOUT);

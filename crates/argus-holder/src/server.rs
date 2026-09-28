@@ -39,7 +39,6 @@ use crate::spawn::{self, cloexec_pipe, set_nonblocking};
 use crate::stand_in::StandIn;
 
 const READ_CHUNK: usize = 64 * 1024;
-const KILL_GRACE: Duration = Duration::from_secs(5);
 const LINGER: Duration = Duration::from_secs(60);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 const INPUT_EVENT_INTERVAL: Duration = Duration::from_secs(1);
@@ -112,6 +111,7 @@ impl Holder {
         set_nonblocking(spawned.master.as_raw_fd());
         let current = (spec.rows.max(1), spec.cols.max(1));
         let stand_in = StandIn::new(spec.colors.clone());
+        let ring = Ring::new(spec.limits.replay_buffer);
 
         Ok(Holder {
             spec,
@@ -123,7 +123,7 @@ impl Holder {
             _sigchld_registration: sigchld_registration,
             conns: Vec::new(),
             next_conn_id: 1,
-            ring: Ring::new(),
+            ring,
             exit_code: None,
             kill_deadline: None,
             linger_deadline: None,
@@ -379,7 +379,8 @@ impl Holder {
                 } else {
                     self.signal_agent(signal);
                     if signal == libc::SIGTERM {
-                        self.kill_deadline = Some(Instant::now() + KILL_GRACE);
+                        self.kill_deadline =
+                            Some(Instant::now() + Duration::from_millis(self.spec.limits.kill_grace_ms));
                     }
                     HolderResponse::Ok
                 }

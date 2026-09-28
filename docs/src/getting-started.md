@@ -23,7 +23,7 @@ argus manager restart
 argus run claude          # start Claude Code as `claude-1` and attach
 ```
 
-Detach with `Ctrl-\`. The agent keeps running.
+Detach with `Ctrl-]` (see `detach_key` in the [config file](reference/config.md)). The agent keeps running.
 
 ```sh
 argus ps                  # list agents

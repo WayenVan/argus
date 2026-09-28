@@ -59,8 +59,8 @@ argus tree                # open the live dashboard, grouped by name
 argus attach claude-1     # attach to the agent from any terminal
 ```
 
-Press `Ctrl-\` to detach. The agent keeps running, even if you close the
-terminal. Use `argus grid` for a live thumbnail view of every agent.
+Press `Ctrl-]` to detach (configurable). The agent keeps running, even if you
+close the terminal. Use `argus grid` for a live thumbnail view of every agent.
 
 ### Run several agents
 
@@ -107,8 +107,8 @@ Commands:
   ack      Mark a finished agent as seen (done → idle)
   events   Print agent events as they happen
   wait     Block until agents are free (their turn is over) or reach another state; with several, until all have. One agent waited on to exit passes on its exit code
-  attach   Take over an agent's terminal (detach with Ctrl-\)
-  kill     Stop an agent (SIGTERM, then SIGKILL after 5s)
+  attach   Take over an agent's terminal (detach with Ctrl-] or the configured detach_key)
+  kill     Stop an agent (SIGTERM, then SIGKILL after 5s, or the configured kill_grace)
   rm       Remove an exited agent
   prune    Remove every exited agent
   guide    Print the instructions argus gives each agent it starts

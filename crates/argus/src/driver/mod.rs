@@ -121,9 +121,10 @@ pub trait Driver: Send + Sync {
         None
     }
 
-    /// Rewrites the launch command or environment. Returns a warning to show the user when
-    /// state tracking will be degraded; the agent is started regardless.
-    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>>;
+    /// Rewrites the launch command or environment. Returns warnings to show the user, one
+    /// per problem, when state tracking will be degraded or a one-time setup is missing;
+    /// the agent is started regardless.
+    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Vec<String>>;
 
     /// Translates one hook event.
     fn translate(&self, event: &Value) -> DriverReport;

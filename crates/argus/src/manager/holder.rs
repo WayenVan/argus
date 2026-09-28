@@ -45,6 +45,7 @@ pub async fn start(
         state_dir: dir,
         manager_socket: paths::manager_socket(),
         colors: req.colors.clone(),
+        limits: crate::config::manager().holder_limits(),
     };
 
     let mut child = tokio::process::Command::new(holder_exe)

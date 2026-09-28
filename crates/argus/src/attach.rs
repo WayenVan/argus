@@ -24,12 +24,10 @@ use signal_hook::SigId;
 use signal_hook::consts::SIGWINCH;
 
 use crate::client::Conn;
+use crate::config::{self, DetachKey};
 use crate::modes::{ModeTracker, Screen};
 use crate::term;
 
-/// Ctrl-\ (FS). In raw mode it arrives as a byte instead of SIGQUIT, unless
-/// the agent turned on an extended keyboard mode: see [`find_detach`].
-const DETACH_KEY: u8 = 0x1c;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
@@ -105,6 +103,7 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
     if !isatty(io::stdin().as_raw_fd())? {
         bail!("attach needs a terminal on stdin");
     }
+    let detach_key = config::get()?.detach_key;
     let profile = term::profile();
     let (rows, cols) = crate::client::terminal_size();
     let restore = if opts.alt_screen { None } else { target.id.and_then(fetch_screen) };
@@ -151,7 +150,7 @@ pub fn session(target: &Target, opts: Options) -> Result<String> {
             }
             _ => print_raw(clear),
         }
-        pump(stream, opts.readonly, &mut display.modes)
+        pump(stream, opts.readonly, detach_key, &mut display.modes)
     };
 
     Ok(match ending? {
@@ -204,7 +203,7 @@ pub fn validate_holder_hello(response: HolderResponse) -> Result<()> {
     }
 }
 
-fn pump(stream: UnixStream, readonly: bool, modes: &mut ModeTracker) -> Result<Ending> {
+fn pump(stream: UnixStream, readonly: bool, detach_key: DetachKey, modes: &mut ModeTracker) -> Result<Ending> {
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let detached = Arc::new(AtomicBool::new(false));
     // The user just ran `argus attach` here, so this terminal has focus now;
@@ -219,7 +218,7 @@ fn pump(stream: UnixStream, readonly: bool, modes: &mut ModeTracker) -> Result<E
     let input = {
         let writer = writer.clone();
         let detached = detached.clone();
-        std::thread::spawn(move || forward_input(writer, detached, readonly, stop_rx))
+        std::thread::spawn(move || forward_input(writer, detached, readonly, detach_key, stop_rx))
     };
     // Window size changes → holder. Keep the registration in this function's
     // scope: dropping it unregisters SIGWINCH and closes the pipe writer.
@@ -275,7 +274,13 @@ fn forward_output(stream: &UnixStream, detached: &AtomicBool, modes: &mut ModeTr
 
 /// Reads fd 0 directly rather than through `io::stdin()`: its lock and buffer
 /// would outlive this session, and `stop` could not interrupt a blocked read.
-fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, readonly: bool, stop: UnixStream) {
+fn forward_input(
+    writer: Arc<Mutex<UnixStream>>,
+    detached: Arc<AtomicBool>,
+    readonly: bool,
+    detach_key: DetachKey,
+    stop: UnixStream,
+) {
     let stdin = io::stdin();
     let mut buf = [0u8; 4096];
     loop {
@@ -299,7 +304,7 @@ fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, read
             Err(_) => return,
         };
         let mut chunk = &buf[..n];
-        let detach_at = find_detach(chunk);
+        let detach_at = find_detach(chunk, detach_key);
         if let Some(pos) = detach_at {
             chunk = &chunk[..pos];
         }
@@ -341,17 +346,19 @@ fn forward_input(writer: Arc<Mutex<UnixStream>>, detached: Arc<AtomicBool>, read
     }
 }
 
-/// Where the detach key starts in `input`. Besides the plain byte, agents
-/// such as Claude Code turn on the kitty keyboard protocol or xterm's
-/// modifyOtherKeys, and the terminal then sends Ctrl-\\ as `ESC [ 92 ; 5 u`
-/// or `ESC [ 27 ; 5 ; 92 ~`.
-fn find_detach(input: &[u8]) -> Option<usize> {
-    (0..input.len())
-        .find(|&i| input[i] == DETACH_KEY || input[i..].starts_with(b"\x1b[") && is_ctrl_backslash(&input[i + 2..]))
+/// Where the detach key starts in `input`. In raw mode Ctrl plus a key arrives
+/// as a control byte (Ctrl-] as GS). Besides that byte, agents such as Claude
+/// Code turn on the kitty keyboard protocol or xterm's modifyOtherKeys, and
+/// the terminal then sends Ctrl-] as `ESC [ 93 ; 5 u` or `ESC [ 27 ; 5 ; 93 ~`.
+fn find_detach(input: &[u8], key: DetachKey) -> Option<usize> {
+    (0..input.len()).find(|&i| {
+        input[i] == key.byte() || input[i..].starts_with(b"\x1b[") && is_ctrl_key(&input[i + 2..], key.codepoint())
+    })
 }
 
-/// Whether the CSI sequence whose parameters start `csi` is Ctrl-\\.
-fn is_ctrl_backslash(csi: &[u8]) -> bool {
+/// Whether the CSI sequence whose parameters start `csi` is Ctrl plus the
+/// key with this code.
+fn is_ctrl_key(csi: &[u8], code: u32) -> bool {
     let Some(end) = csi.iter().position(|&b| (0x40..=0x7e).contains(&b)) else { return false };
     let Ok(params) = std::str::from_utf8(&csi[..end]) else { return false };
     // Each parameter may carry `:`-separated sub-fields; the first is the value.
@@ -362,14 +369,14 @@ fn is_ctrl_backslash(csi: &[u8]) -> bool {
     match csi[end] {
         // Kitty: `92[:alternates];modifiers[:event]u`, press or repeat only.
         b'u' => {
-            value(0, 0) == Some(Some(92)) && ctrl_only(value(1, 0)) && matches!(value(1, 1), None | Some(Some(1 | 2)))
+            value(0, 0) == Some(Some(code)) && ctrl_only(value(1, 0)) && matches!(value(1, 1), None | Some(Some(1 | 2)))
         }
         // modifyOtherKeys: `27;modifiers;92~`.
         b'~' => {
             params.len() == 3
                 && value(0, 0) == Some(Some(27))
                 && ctrl_only(value(1, 0))
-                && value(2, 0) == Some(Some(92))
+                && value(2, 0) == Some(Some(code))
         }
         _ => false,
     }
@@ -561,6 +568,7 @@ mod tests {
         NORMAL_SCREEN_LEAVE, Screen, clear_for, find_detach, only_mouse_reports, screen_for, screen_switches,
         snapshot_body, winch_pipe,
     };
+    use crate::config::DetachKey;
     use crate::term;
     use argus_proto::msg::ScreenMode;
 
@@ -600,15 +608,28 @@ mod tests {
 
     #[test]
     fn detach_key_in_every_encoding() {
-        assert_eq!(find_detach(b"ab\x1c"), Some(2));
-        assert_eq!(find_detach(b"x\x1b[92;5u"), Some(1));
-        assert_eq!(find_detach(b"\x1b[92;69u"), Some(0), "caps lock on");
-        assert_eq!(find_detach(b"\x1b[92:124;5:1u"), Some(0));
-        assert_eq!(find_detach(b"\x1b[27;5;92~"), Some(0));
-        assert_eq!(find_detach(b"\x1b[92;5:3u"), None, "release");
-        assert_eq!(find_detach(b"\x1b[92;7u"), None, "ctrl+alt");
-        assert_eq!(find_detach(b"\x1b[92u"), None, "plain backslash");
-        assert_eq!(find_detach(b"\x1b[97;5u\x1b[<0;1;2M"), None);
+        let find = |input: &[u8]| find_detach(input, DetachKey::default());
+        assert_eq!(find(b"ab\x1d"), Some(2));
+        assert_eq!(find(b"x\x1b[93;5u"), Some(1));
+        assert_eq!(find(b"\x1b[93;69u"), Some(0), "caps lock on");
+        assert_eq!(find(b"\x1b[93:125;5:1u"), Some(0));
+        assert_eq!(find(b"\x1b[27;5;93~"), Some(0));
+        assert_eq!(find(b"\x1b[93;5:3u"), None, "release");
+        assert_eq!(find(b"\x1b[93;7u"), None, "ctrl+alt");
+        assert_eq!(find(b"\x1b[93u"), None, "plain bracket");
+        assert_eq!(find(b"\x1c\x1b[92;5u"), None, "Ctrl-\\ goes to the agent");
+        assert_eq!(find(b"\x1b[97;5u\x1b[<0;1;2M"), None);
+    }
+
+    #[test]
+    fn configured_detach_key() {
+        let key = DetachKey::parse("ctrl-b").unwrap();
+        let find = |input: &[u8]| find_detach(input, key);
+        assert_eq!(find(b"ab\x02"), Some(2));
+        assert_eq!(find(b"x\x1b[98;5u"), Some(1));
+        assert_eq!(find(b"\x1b[27;5;98~"), Some(0));
+        assert_eq!(find(b"\x1c\x1b[92;5u"), None, "Ctrl-\\ is just a key now");
+        assert_eq!(find(b"\x1b[98u"), None, "plain b");
     }
 
     #[test]

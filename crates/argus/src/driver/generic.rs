@@ -17,8 +17,8 @@ impl Driver for Generic {
         false
     }
 
-    fn prepare(&self, _launch: &mut Launch, _ctx: &Context) -> Result<Option<String>> {
-        Ok(None)
+    fn prepare(&self, _launch: &mut Launch, _ctx: &Context) -> Result<Vec<String>> {
+        Ok(vec![])
     }
 
     fn translate(&self, _event: &Value) -> DriverReport {

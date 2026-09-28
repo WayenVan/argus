@@ -4,11 +4,12 @@
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ARGUS_GROUP` | none | Default group for `argus run`. |
+| `ARGUS_CONFIG` | `$XDG_CONFIG_HOME/argus/config.toml`, else `~/.config/argus/config.toml` | [Config file](config.md). |
+| `ARGUS_GROUP` | none | Default group for `argus run`; overrides the config file. |
 | `ARGUS_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/argus`, else `$TMPDIR/argus-$UID` | Sockets and lock. |
 | `ARGUS_STATE_DIR` | `$XDG_STATE_HOME/argus`, else `~/.local/state/argus` | Registry and logs. |
 
-Set both directory variables to run a separate, isolated argus.
+Set both directory variables, and `ARGUS_CONFIG`, to run a separate, isolated argus.
 
 ## Set for every agent
 

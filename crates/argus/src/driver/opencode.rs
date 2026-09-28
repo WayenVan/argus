@@ -50,7 +50,7 @@ impl Driver for Opencode {
         Some(Duration::ZERO)
     }
 
-    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
+    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Vec<String>> {
         let existing = launch.env.iter().position(|(k, _)| k == CONFIG_ENV);
         let mut config = match existing {
             Some(i) => serde_json::from_str(&launch.env[i].1).with_context(|| format!("parsing your {CONFIG_ENV}"))?,
@@ -75,7 +75,7 @@ impl Driver for Opencode {
             Some(i) => launch.env[i].1 = value,
             None => launch.env.push((CONFIG_ENV.into(), value)),
         }
-        Ok(warning)
+        Ok(warning.into_iter().collect())
     }
 
     fn translate(&self, event: &Value) -> DriverReport {
@@ -152,7 +152,7 @@ mod tests {
         };
 
         let mut launch = Launch { command: vec!["opencode".into()], env: vec![], agent_dir: PathBuf::new() };
-        assert_eq!(Opencode.prepare(&mut launch, &ctx).unwrap(), None);
+        assert_eq!(Opencode.prepare(&mut launch, &ctx).unwrap(), Vec::<String>::new());
         assert_eq!(launch.command, vec!["opencode"], "the command line is left alone");
         let c = config(&launch);
         assert_eq!(c["instructions"], json!(["/s d/drivers/argus-instructions.md"]));

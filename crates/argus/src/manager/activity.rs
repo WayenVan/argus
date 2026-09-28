@@ -24,10 +24,9 @@ use argus_proto::msg::{Activity, TmuxLocation, now_secs};
 use super::interaction::needs_user;
 use super::registry::AgentRecord;
 use super::{Manager, holder};
+use crate::config;
 use crate::driver::Hint;
 
-/// How long `working` may go without hooks or output before it is `unknown`.
-const SILENCE: Duration = Duration::from_secs(15);
 /// How often hook-less agents are checked for output.
 const GENERIC_POLL: Duration = Duration::from_secs(2);
 
@@ -146,7 +145,7 @@ impl Manager {
                 }
                 match (baseline, offset) {
                     (Some(before), Some(now)) if now > before => {
-                        rec.runtime.watchdog.deadline = Some(Instant::now() + SILENCE);
+                        rec.runtime.watchdog.deadline = Some(Instant::now() + config::manager().silence);
                         Step::Rebase
                     }
                     _ => {
@@ -232,7 +231,7 @@ pub(super) fn arm_watchdog(rec: &mut AgentRecord, was_working: bool) -> bool {
     if !was_working {
         watchdog.generation += 1;
     }
-    watchdog.deadline = Some(Instant::now() + SILENCE);
+    watchdog.deadline = Some(Instant::now() + config::manager().silence);
     !std::mem::replace(&mut watchdog.running, true)
 }
 

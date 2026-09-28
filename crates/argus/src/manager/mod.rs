@@ -60,6 +60,7 @@ async fn serve() -> Result<()> {
     paths::ensure_private_dir(&paths::state_dir())?;
 
     let _lock = acquire_lock()?;
+    crate::config::get()?;
     fs::write(paths::manager_pid(), std::process::id().to_string())?;
     raise_fd_limit();
 
@@ -217,6 +218,7 @@ impl Manager {
                 tmux_locations: Vec::new(),
                 pending_interactions: Vec::new(),
                 labels: req.labels.clone(),
+                warnings: Vec::new(),
             })
         };
 
@@ -224,7 +226,7 @@ impl Manager {
         paths::ensure_private_dir(&dir)?;
         let mut launch = driver::Launch { command: req.command.clone(), env: req.env.clone(), agent_dir: dir };
         let warnings: Vec<String> = match driver.prepare(&mut launch, &self.drivers) {
-            Ok(w) => w.into_iter().collect(),
+            Ok(w) => w,
             Err(e) => vec![format!("{} setup failed, activity will not be tracked: {e:#}", driver.kind())],
         };
 
@@ -239,6 +241,7 @@ impl Manager {
                     }
                     agent.holder_pid = Some(holder_pid);
                     agent.agent_pid = Some(agent_pid);
+                    agent.warnings = warnings.clone();
                     agent.clone()
                 });
                 let info = info.context("the agent was removed while it started")?;

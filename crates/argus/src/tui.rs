@@ -283,6 +283,13 @@ fn jumpable_count(info: &AgentInfo, socket: Option<&str>) -> usize {
     panes.len()
 }
 
+/// `⚠` on a running agent argus warned about when starting it; the details
+/// overlay (`i`) lists the warnings.
+fn warning_marker(info: &AgentInfo) -> Option<Span<'static>> {
+    (info.status.is_live() && !info.warnings.is_empty())
+        .then(|| Span::styled(" ⚠", Style::default().fg(theme().yellow)))
+}
+
 fn jump_marker(info: &AgentInfo, socket: Option<&str>) -> Option<Span<'static>> {
     let count = jumpable_count(info, socket);
     (count > 0).then(|| {
@@ -425,9 +432,10 @@ fn submit_new_agent(conn: &mut Conn, input: &str, area: Rect) -> Result<String, 
         colors: term::profile().colors.clone(),
     };
     Ok(match conn.request(&Request::Run(req)) {
-        Ok(Response::Agent { agent, warnings }) => match warnings.first() {
-            Some(w) => format!("created {} ({w})", agent.name),
-            None => format!("created {}", agent.name),
+        Ok(Response::Agent { agent, warnings }) => match warnings.len() {
+            0 => format!("created {}", agent.name),
+            1 => format!("created {} · ⚠ 1 warning: i on it for details", agent.name),
+            n => format!("created {} · ⚠ {n} warnings: i on it for details", agent.name),
         },
         Ok(_) => "created".to_string(),
         Err(e) => format!("create failed: {e}"),
@@ -933,6 +941,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, tiles: &[Tile], selected: usize, bli
             Span::styled(activity_symbol(&tile.info), Style::default().fg(activity_color(&tile.info, blink))),
             Span::raw(tile.info.name.clone()),
         ];
+        spans.extend(warning_marker(&tile.info));
         if let Some(marker) = jump_marker(&tile.info, jump_socket) {
             spans.push(marker);
         }
@@ -1210,6 +1219,7 @@ fn tree_row_item(row: &Row, blink: bool, jump_socket: Option<&str>, highlight: O
                 Span::styled(activity_symbol(info), Style::default().fg(activity_color(info, blink))),
                 Span::raw(leaf),
             ];
+            spans.extend(warning_marker(info));
             if let Some(marker) = jump_marker(info, jump_socket) {
                 spans.push(marker);
             }
@@ -1541,6 +1551,15 @@ fn details_lines(info: &AgentInfo) -> Vec<Line<'static>> {
             Span::styled(format!("  ·  {activity}"), Style::default().fg(theme().subtext0)),
         ]),
     ];
+    if !info.warnings.is_empty() {
+        detail_section(&mut lines, "WARNINGS");
+        for warning in &info.warnings {
+            lines.push(Line::from(vec![
+                Span::styled("  ⚠ ", Style::default().fg(theme().yellow)),
+                Span::styled(warning.clone(), Style::default().fg(theme().text)),
+            ]));
+        }
+    }
     detail_section(&mut lines, "IDENTITY");
     detail_field(&mut lines, "id", info.id.to_string());
     detail_field(&mut lines, "name", info.name.clone());
@@ -1727,6 +1746,7 @@ mod tests {
             tmux_locations: Vec::new(),
             pending_interactions: Vec::new(),
             labels: BTreeMap::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -1988,6 +2008,29 @@ mod tests {
         idle.activity = "idle".into();
         assert_eq!(activity_symbol(&idle), "● ");
         assert_eq!(activity_text_style(&idle).fg, Some(theme().overlay0));
+    }
+
+    #[test]
+    fn warnings_mark_the_agent_and_show_in_details() {
+        let mut info = agent(7, "codex-1");
+        info.warnings = vec!["run `argus setup codex` once".into()];
+        let rows = [Row::Agent { info: info.clone(), depth: 0 }];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 3)).unwrap();
+        terminal.draw(|frame| draw_tree_list(frame, frame.area(), &rows, &TreeState::default(), true, None)).unwrap();
+        let line: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(line.contains("codex-1 ⚠"), "{line:?}");
+
+        let text: Vec<String> =
+            details_lines(&info).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        let at = text.iter().position(|l| l.trim() == "WARNINGS").expect("a warnings section");
+        assert_eq!(text[at + 1], "  ⚠ run `argus setup codex` once");
+        assert!(at < text.iter().position(|l| l.trim() == "IDENTITY").unwrap(), "shown first");
+
+        info.status = AgentStatus::Exited;
+        assert!(warning_marker(&info).is_none(), "no marker once it exited");
+        info.status = AgentStatus::Running;
+        info.warnings.clear();
+        assert!(warning_marker(&info).is_none());
     }
 
     #[test]

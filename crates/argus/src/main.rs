@@ -5,6 +5,7 @@
 
 mod attach;
 mod client;
+mod config;
 mod driver;
 mod errors;
 mod events;
@@ -43,7 +44,7 @@ enum Command {
         /// Agent name (last path segment, or a full `group/name` path)
         #[arg(long)]
         name: Option<String>,
-        /// Group to create the agent in (default: $ARGUS_GROUP)
+        /// Group to create the agent in (default: $ARGUS_GROUP, then the config)
         #[arg(long = "in", value_name = "GROUP")]
         group: Option<String>,
         /// Working directory (default: current directory)
@@ -58,9 +59,12 @@ enum Command {
         /// Treat the program as this kind of agent (e.g. a wrapper script for claude)
         #[arg(long)]
         kind: Option<String>,
+        /// Run the program as given, even if a profile in the config has its name
+        #[arg(long)]
+        no_profile: bool,
         #[command(flatten)]
         output: OutputArgs,
-        /// Program to run; its name selects the kind unless --kind is given
+        /// Program or profile to run; the program's name selects the kind unless --kind is given
         program: String,
         /// Arguments passed to the program
         #[arg(last = true)]
@@ -258,7 +262,7 @@ enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
-    /// Take over an agent's terminal (detach with Ctrl-\)
+    /// Take over an agent's terminal (detach with Ctrl-] or the configured detach_key)
     Attach {
         /// ID, full group/name, or a globally unique final name
         target: String,
@@ -278,7 +282,7 @@ enum Command {
         #[arg(long, conflicts_with_all = ["replay", "ro"])]
         alt_screen: bool,
     },
-    /// Stop an agent (SIGTERM, then SIGKILL after 5s)
+    /// Stop an agent (SIGTERM, then SIGKILL after 5s, or the configured kill_grace)
     Kill {
         /// ID, name, or `group/**`
         target: String,
@@ -481,8 +485,17 @@ fn main() -> ExitCode {
         return ExitCode::from(errors::exit_status(&e));
     }
     let result = match cli.command {
-        Command::Run { name, group, cwd, detach, label, kind, output, program, args } => client::run(
-            client::RunOptions { name, group, cwd, labels: label, kind, attach: !detach, json: output.json },
+        Command::Run { name, group, cwd, detach, label, kind, no_profile, output, program, args } => client::run(
+            client::RunOptions {
+                name,
+                group,
+                cwd,
+                labels: label,
+                kind,
+                no_profile,
+                attach: !detach,
+                json: output.json,
+            },
             program,
             args,
         ),

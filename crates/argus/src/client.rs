@@ -21,10 +21,11 @@ use argus_proto::{BUILD, HOLDER_PROTOCOL_VERSION, MANAGER_PROTOCOL_VERSION, path
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::{isatty, setsid};
 
+use crate::config::Config;
 use crate::errors::{self, CodedError};
 use crate::output::{self, AgentList, AgentView, AgentWithWarnings, OneAgent};
 use crate::watcher::Watcher;
-use crate::{attach, naming, term};
+use crate::{attach, config, naming, term};
 use serde::Serialize;
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
@@ -135,6 +136,8 @@ impl Conn {
 }
 
 fn spawn_manager() -> Result<()> {
+    // A manager that cannot read the config would not start; say why here.
+    config::get()?;
     paths::ensure_private_dir(&paths::runtime_dir())?;
     paths::ensure_private_dir(&paths::state_dir())?;
     let log = OpenOptions::new().create(true).append(true).open(paths::manager_log())?;
@@ -179,32 +182,59 @@ pub struct RunOptions {
     pub cwd: Option<PathBuf>,
     pub labels: Vec<(String, String)>,
     pub kind: Option<String>,
+    /// Run the program as given, even if a profile has its name.
+    pub no_profile: bool,
     pub attach: bool,
     pub json: bool,
 }
 
-pub fn run(opts: RunOptions, kind: String, args: Vec<String>) -> Result<()> {
+/// What `argus run` asks for once the config had its say.
+#[derive(Debug, PartialEq)]
+struct Launch {
+    command: Vec<String>,
+    group: Option<String>,
+    kind: Option<String>,
+    labels: BTreeMap<String, String>,
+}
+
+/// Applies the profile named `program`, if any, and the default group. A
+/// group comes from `--in`, then `$ARGUS_GROUP`, then the profile, then
+/// `default_group`; command-line labels and `--kind` win over the profile's.
+fn launch(config: &Config, opts: &RunOptions, env_group: Option<String>, program: String, args: Vec<String>) -> Launch {
+    let profile = if opts.no_profile { None } else { config.profile(&program) };
+    let mut command = vec![profile.and_then(|p| p.program.clone()).unwrap_or(program)];
+    command.extend(profile.iter().flat_map(|p| p.args.iter().cloned()));
+    command.extend(args);
+    let non_empty = |g: &Option<String>| g.clone().filter(|g| !g.is_empty());
+    let group = non_empty(&opts.group)
+        .or(non_empty(&env_group))
+        .or_else(|| profile.and_then(|p| non_empty(&p.group)))
+        .or_else(|| non_empty(&config.default_group));
+    let mut labels = profile.map(|p| p.labels.clone()).unwrap_or_default();
+    labels.extend(opts.labels.iter().cloned());
+    Launch { command, group, kind: opts.kind.clone().or_else(|| profile.and_then(|p| p.kind.clone())), labels }
+}
+
+pub fn run(opts: RunOptions, program: String, args: Vec<String>) -> Result<()> {
     if opts.json && opts.attach {
         bail!("--json needs --detach: an attached run prints nothing to parse");
     }
-    let cwd = match opts.cwd {
-        Some(dir) => std::fs::canonicalize(&dir).with_context(|| format!("no such directory: {}", dir.display()))?,
+    let cwd = match &opts.cwd {
+        Some(dir) => std::fs::canonicalize(dir).with_context(|| format!("no such directory: {}", dir.display()))?,
         None => std::env::current_dir()?,
     };
-    let group = opts.group.or_else(|| std::env::var("ARGUS_GROUP").ok()).filter(|g| !g.is_empty());
+    let launch = launch(config::get()?, &opts, std::env::var("ARGUS_GROUP").ok(), program, args);
     let (rows, cols) = terminal_size();
-    let mut command = vec![kind];
-    command.extend(args);
     let req = RunRequest {
-        command,
+        command: launch.command,
         name: opts.name,
-        group,
+        group: launch.group,
         cwd: cwd.to_string_lossy().into_owned(),
         env: std::env::vars().collect(),
         rows,
         cols,
-        labels: opts.labels.into_iter().collect(),
-        kind: opts.kind,
+        labels: launch.labels,
+        kind: launch.kind,
         colors: term::profile().colors.clone(),
     };
     let reply = Conn::connect()?.request(&Request::Run(req))?;
@@ -684,7 +714,64 @@ pub fn terminal_size() -> (u16, u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_name;
+    use super::*;
+
+    fn opts() -> RunOptions {
+        RunOptions {
+            name: None,
+            group: None,
+            cwd: None,
+            labels: vec![],
+            kind: None,
+            no_profile: false,
+            attach: false,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn run_applies_profiles_and_default_group() {
+        let config = config::parse(
+            r#"
+            default_group = "misc"
+            [profiles.review]
+            program = "claude"
+            args = ["--permission-mode", "plan"]
+            group = "review"
+            labels = { role = "reviewer", team = "a" }
+            [profiles.cc]
+            kind = "claude"
+            "#,
+        )
+        .unwrap();
+        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let plain = launch(&config, &opts(), None, "codex".into(), words(&["-m", "x"]));
+        assert_eq!(plain.command, words(&["codex", "-m", "x"]));
+        assert_eq!((plain.group.as_deref(), plain.kind), (Some("misc"), None));
+
+        let mut o = opts();
+        o.labels = vec![("team".into(), "b".into())];
+        let review = launch(&config, &o, None, "review".into(), words(&["fix it"]));
+        assert_eq!(review.command, words(&["claude", "--permission-mode", "plan", "fix it"]));
+        assert_eq!(review.group.as_deref(), Some("review"));
+        assert_eq!(review.labels["role"], "reviewer");
+        assert_eq!(review.labels["team"], "b", "command line wins");
+        assert_eq!(launch(&config, &o, Some("env".into()), "review".into(), vec![]).group.as_deref(), Some("env"));
+        o.group = Some("flag".into());
+        assert_eq!(launch(&config, &o, Some("env".into()), "review".into(), vec![]).group.as_deref(), Some("flag"));
+
+        let cc = launch(&config, &opts(), None, "cc".into(), vec![]);
+        assert_eq!((cc.command, cc.kind.as_deref()), (words(&["cc"]), Some("claude")));
+        let mut o = opts();
+        o.kind = Some("codex".into());
+        assert_eq!(launch(&config, &o, None, "cc".into(), vec![]).kind.as_deref(), Some("codex"));
+
+        let mut o = opts();
+        o.no_profile = true;
+        let raw = launch(&config, &o, None, "review".into(), vec![]);
+        assert_eq!((raw.command, raw.labels.len()), (words(&["review"]), 0));
+    }
 
     #[test]
     fn table_separates_group_from_final_name() {

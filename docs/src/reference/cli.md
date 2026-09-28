@@ -25,8 +25,8 @@ Lightweight manager for long-running terminal agents
 * `ack` — Mark a finished agent as seen (done → idle)
 * `events` — Print agent events as they happen
 * `wait` — Block until agents are free (their turn is over) or reach another state; with several, until all have. One agent waited on to exit passes on its exit code
-* `attach` — Take over an agent's terminal (detach with Ctrl-\)
-* `kill` — Stop an agent (SIGTERM, then SIGKILL after 5s)
+* `attach` — Take over an agent's terminal (detach with Ctrl-] or the configured detach_key)
+* `kill` — Stop an agent (SIGTERM, then SIGKILL after 5s, or the configured kill_grace)
 * `rm` — Remove an exited agent
 * `prune` — Remove every exited agent
 * `guide` — Print the instructions argus gives each agent it starts
@@ -43,17 +43,18 @@ Start an agent and attach to it (use -d to leave it running in the background)
 
 ###### **Arguments:**
 
-* `<PROGRAM>` — Program to run; its name selects the kind unless --kind is given
+* `<PROGRAM>` — Program or profile to run; the program's name selects the kind unless --kind is given
 * `<ARGS>` — Arguments passed to the program
 
 ###### **Options:**
 
 * `--name <NAME>` — Agent name (last path segment, or a full `group/name` path)
-* `--in <GROUP>` — Group to create the agent in (default: $ARGUS_GROUP)
+* `--in <GROUP>` — Group to create the agent in (default: $ARGUS_GROUP, then the config)
 * `--cwd <CWD>` — Working directory (default: current directory)
 * `-d`, `--detach` — Start in the background instead of attaching right away
 * `-l`, `--label <KEY=VALUE>` — Label as key=value (repeatable)
 * `--kind <KIND>` — Treat the program as this kind of agent (e.g. a wrapper script for claude)
+* `--no-profile` — Run the program as given, even if a profile in the config has its name
 * `--json` — Print JSON (one object per line) instead of text
 
 
@@ -330,7 +331,7 @@ Block until agents are free (their turn is over) or reach another state; with se
 
 ## `argus attach`
 
-Take over an agent's terminal (detach with Ctrl-\)
+Take over an agent's terminal (detach with Ctrl-] or the configured detach_key)
 
 **Usage:** `argus attach [OPTIONS] <TARGET>`
 
@@ -350,7 +351,7 @@ Take over an agent's terminal (detach with Ctrl-\)
 
 ## `argus kill`
 
-Stop an agent (SIGTERM, then SIGKILL after 5s)
+Stop an agent (SIGTERM, then SIGKILL after 5s, or the configured kill_grace)
 
 **Usage:** `argus kill [OPTIONS] <TARGET>`
 

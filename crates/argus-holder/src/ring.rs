@@ -5,10 +5,11 @@ use std::collections::{BTreeSet, VecDeque};
 use vte::{Params, Parser, Perform};
 
 const RING_INITIAL: usize = 256 * 1024;
-const RING_MAX: usize = 1024 * 1024;
 
 pub struct Ring {
     buf: VecDeque<u8>,
+    /// Most bytes kept.
+    max: usize,
     /// Terminal mode at the byte just before the retained output begins.
     start_mode: ModeTracker,
     /// Offset one past the last byte ever written.
@@ -16,22 +17,23 @@ pub struct Ring {
 }
 
 impl Ring {
-    pub fn new() -> Ring {
-        Ring { buf: VecDeque::with_capacity(RING_INITIAL), start_mode: ModeTracker::default(), end: 0 }
+    pub fn new(max: usize) -> Ring {
+        let max = max.max(1);
+        Ring { buf: VecDeque::with_capacity(RING_INITIAL.min(max)), max, start_mode: ModeTracker::default(), end: 0 }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
         self.end += bytes.len() as u64;
         // Advance the checkpoint through precisely the bytes evicted from the
         // ring. The parser retains partial CSI sequences across push calls.
-        if bytes.len() >= RING_MAX {
+        if bytes.len() >= self.max {
             let old: Vec<u8> = self.buf.drain(..).collect();
             self.start_mode.advance(&old);
-            self.start_mode.advance(&bytes[..bytes.len() - RING_MAX]);
-            self.buf.extend(&bytes[bytes.len() - RING_MAX..]);
+            self.start_mode.advance(&bytes[..bytes.len() - self.max]);
+            self.buf.extend(&bytes[bytes.len() - self.max..]);
             return;
         }
-        let overflow = (self.buf.len() + bytes.len()).saturating_sub(RING_MAX);
+        let overflow = (self.buf.len() + bytes.len()).saturating_sub(self.max);
         let evicted: Vec<u8> = self.buf.drain(..overflow).collect();
         self.start_mode.advance(&evicted);
         self.buf.extend(bytes);
@@ -103,9 +105,11 @@ impl ModeTracker {
 mod tests {
     use super::*;
 
+    const RING_MAX: usize = 1024 * 1024;
+
     #[test]
     fn keeps_tail_and_offsets() {
-        let mut ring = Ring::new();
+        let mut ring = Ring::new(RING_MAX);
         ring.push(&vec![b'a'; RING_MAX]);
         ring.push(b"xyz");
         assert_eq!(ring.end, RING_MAX as u64 + 3);
@@ -120,7 +124,7 @@ mod tests {
 
     #[test]
     fn remembers_alternate_screen_enter_evicted_from_ring() {
-        let mut ring = Ring::new();
+        let mut ring = Ring::new(RING_MAX);
         ring.push(b"\x1b[?1049h\x1b[?1000;1006h");
         ring.push(&vec![b'x'; RING_MAX]);
         assert!(ring.alternate_at_start());
@@ -134,7 +138,7 @@ mod tests {
 
     #[test]
     fn tracks_split_escape_at_eviction_boundary() {
-        let mut ring = Ring::new();
+        let mut ring = Ring::new(RING_MAX);
         ring.push(&vec![b'x'; RING_MAX - 5]);
         ring.push(b"\x1b[?10");
         ring.push(b"49h");

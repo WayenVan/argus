@@ -8,7 +8,7 @@
 | `blocked` | `attention` | Waiting for you to approve something. |
 | `done` | `free` | Finished a turn nobody has looked at yet. It becomes `idle` once you focus the agent, type, or run `argus ack`. |
 | `error` | `attention` | The turn failed. |
-| `unknown` | `unknown` | No hooks and no output for 15 s while working, or state lost across a manager restart (see below). |
+| `unknown` | `unknown` | No hooks and no output for 15 s (`silence` in the [config file](config.md)) while working, or state lost across a manager restart (see below). |
 | `busy` / `quiet` | `active` / `free` | Programs without hooks: recent output, or none. |
 
 ## Availability

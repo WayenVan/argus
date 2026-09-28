@@ -208,6 +208,7 @@ mod tests {
             tmux_locations: Vec::new(),
             pending_interactions: Vec::new(),
             labels: Default::default(),
+            warnings: Vec::new(),
         }
     }
 

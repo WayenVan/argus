@@ -40,8 +40,8 @@ impl Driver for Pi {
         true
     }
 
-    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
-        Ok(inject(launch, ctx, SUBCOMMANDS, EXTENSION_FILE, HOOK_ENV))
+    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Vec<String>> {
+        Ok(inject(launch, ctx, SUBCOMMANDS, EXTENSION_FILE, HOOK_ENV).into_iter().collect())
     }
 
     fn translate(&self, event: &Value) -> DriverReport {
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn injects_ahead_of_the_users_arguments() {
         let mut l = launch(&["pi", "-e", "mine.ts", "--", "-not-an-option"]);
-        assert_eq!(Pi.prepare(&mut l, &ctx(true)).unwrap(), None);
+        assert_eq!(Pi.prepare(&mut l, &ctx(true)).unwrap(), Vec::<String>::new());
         assert_eq!(l.command[1], "--append-system-prompt");
         assert_eq!(l.command[2], SELF_LABEL_INSTRUCTIONS);
         assert_eq!(l.command[3..], ["-e", "/s/drivers/argus-pi.js", "-e", "mine.ts", "--", "-not-an-option"]);
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn without_argus_hook_only_the_instructions_go_in() {
         let mut l = launch(&["pi"]);
-        assert!(Pi.prepare(&mut l, &ctx(false)).unwrap().is_some());
+        assert_eq!(Pi.prepare(&mut l, &ctx(false)).unwrap().len(), 1);
         assert_eq!(l.command.len(), 3);
         assert!(l.env.is_empty());
     }
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn subcommands_are_left_alone() {
         let mut l = launch(&["pi", "install", "npm:foo"]);
-        assert_eq!(Pi.prepare(&mut l, &ctx(true)).unwrap(), None);
+        assert_eq!(Pi.prepare(&mut l, &ctx(true)).unwrap(), Vec::<String>::new());
         assert_eq!(l.command, ["pi", "install", "npm:foo"]);
         assert!(l.env.is_empty());
     }

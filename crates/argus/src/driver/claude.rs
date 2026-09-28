@@ -42,13 +42,13 @@ impl Driver for Claude {
         true
     }
 
-    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Option<String>> {
+    fn prepare(&self, launch: &mut Launch, ctx: &Context) -> Result<Vec<String>> {
         // Independent of hooks: ARGUS_AGENT_ID is set on the process
         // environment regardless, so self-labeling works even without them.
         launch.command.splice(1..1, ["--append-system-prompt".to_string(), SELF_LABEL_INSTRUCTIONS.to_string()]);
 
         let Some(hook_exe) = &ctx.hook_exe else {
-            return Ok(Some("argus-hook is not installed next to argus; activity will not be tracked".into()));
+            return Ok(vec!["argus-hook is not installed next to argus; activity will not be tracked".into()]);
         };
         let shared = ctx.dir.join(SHARED_FILE);
         match find_settings_arg(&launch.command) {
@@ -69,7 +69,7 @@ impl Driver for Claude {
                 }
             }
         }
-        Ok(None)
+        Ok(vec![])
     }
 
     fn translate(&self, event: &Value) -> DriverReport {
