@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-29
+
 ### Changed
 
 - Dashboard text boxes take the shell editing keys: `Ctrl-A` `Ctrl-E`
@@ -281,7 +283,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `argus run`, `argus attach`, and `argus grid`/`tree` dashboards with
   rename/move/kill/copy/new-agent shortcuts and tmux pane jumps.
 
-[Unreleased]: https://github.com/WayenVan/argus/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/WayenVan/argus/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/WayenVan/argus/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/WayenVan/argus/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/WayenVan/argus/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/WayenVan/argus/compare/v0.1.0...v0.2.0
