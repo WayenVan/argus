@@ -33,7 +33,7 @@ use crate::client::{self, Conn, PsOptions};
 use crate::errors::CodedError;
 use crate::theme::theme;
 use crate::watcher::Watcher;
-use crate::{Cli, Command, query, term, tmux};
+use crate::{Cli, Command, config, naming, query, term, tmux};
 
 /// How often the visible screen preview(s) get refreshed. Unlike the agent
 /// list (pushed by Watch, applied as it arrives), preview bytes are always a
@@ -311,6 +311,15 @@ fn current_group(mode: Mode, rows: &[Row], tree_selected: usize) -> Option<Strin
     }
 }
 
+/// With `dashboard.group_from_tmux`, the dashboard's tmux session name as a
+/// group. `None` when it is off or the dashboard is not in tmux.
+fn tmux_group() -> Option<String> {
+    if !config::get().is_ok_and(|c| c.dashboard.group_from_tmux) {
+        return None;
+    }
+    naming::group_from_text(&tmux::current_session()?)
+}
+
 /// Splits a typed command line into argv the way a shell would: single quotes
 /// are literal, double quotes allow `\"`/`\\`/`\$` escapes, and a bare `\`
 /// escapes the next character outside quotes. Just enough to let `-l
@@ -585,7 +594,8 @@ fn event_loop(
                 }
             }
             KeyCode::Char('a') => {
-                let input = match current_group(mode, &rows, tree.selected) {
+                let group = tmux_group().or_else(|| current_group(mode, &rows, tree.selected));
+                let input = match group {
                     Some(group) => format!("--in {group} "),
                     None => String::new(),
                 };

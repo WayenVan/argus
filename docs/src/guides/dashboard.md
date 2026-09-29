@@ -17,7 +17,7 @@ Both take a group prefix and `-l key=value` filters.
 | `Tab` / `Shift-Tab` | Tree: focus the next or previous pane |
 | `e` | Tree: zoom the focused agent list or preview over the whole dashboard, or restore it |
 | `[` `]`, `1` `2` | Switch between grid and tree |
-| `a` | New agent |
+| `a` | New agent, in the group under the cursor (or the tmux session's, with [`group_from_tmux`](../reference/config.md#dashboard)) |
 | `r` | Rename |
 | `m` | Move to another group |
 | `x` | Kill |

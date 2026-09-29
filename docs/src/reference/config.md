@@ -17,6 +17,9 @@ labels = { role = "reviewer" }
 [profiles.cc]          # a wrapper script for Claude Code
 kind = "claude"
 
+[dashboard]
+group_from_tmux = true
+
 [manager]
 silence = "30s"
 replay_buffer = "4M"
@@ -44,6 +47,12 @@ skips it.
 
 A profile named after a program, such as `[profiles.claude]`, changes what
 `argus run claude` starts. The TUI's `a` (new agent) does not use profiles yet.
+
+## `[dashboard]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `group_from_tmux` | `false` | `a` prefills `--in` with the dashboard's tmux session name instead of the group under the cursor, in Tree and Grid. The name is lowercased, other characters become `-`, and one that is all digits (tmux's default `0`) becomes `tmux-0`. Outside tmux, `a` behaves as without it. |
 
 ## `[manager]`
 

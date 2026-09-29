@@ -46,6 +46,12 @@ pub fn current_location() -> Option<TmuxLocation> {
     (tty.to_string_lossy() == pane_tty).then_some(location)
 }
 
+/// The name of the tmux session this process's pane is in.
+pub fn current_session() -> Option<String> {
+    let location = current_location()?;
+    command(&location.socket, &["display-message", "-p", "-t", &location.pane, "#{session_name}"]).ok()
+}
+
 /// Resolve live panes in the dashboard's tmux server. Other servers and
 /// terminals outside tmux are not jumpable from this tmux client.
 pub fn choices(locations: &[TmuxLocation]) -> Result<Vec<JumpTarget>, String> {

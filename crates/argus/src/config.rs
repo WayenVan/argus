@@ -25,7 +25,16 @@ pub struct Config {
     pub detach_key: DetachKey,
     /// Launch presets, by the name given to `argus run`.
     pub profiles: BTreeMap<String, Profile>,
+    pub dashboard: DashboardConfig,
     pub manager: ManagerConfig,
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct DashboardConfig {
+    /// Prefill `a`'s `--in` with the dashboard's tmux session name instead of
+    /// the group under the cursor.
+    pub group_from_tmux: bool,
 }
 
 /// What `argus run <name>` expands to when `<name>` is a profile.
@@ -273,6 +282,7 @@ mod tests {
         assert_eq!(config.manager.silence, Duration::from_secs(15));
         assert_eq!(config.manager.replay_buffer, 1024 * 1024);
         assert!(config.profiles.is_empty());
+        assert!(!config.dashboard.group_from_tmux);
     }
 
     #[test]
@@ -291,6 +301,9 @@ mod tests {
             [profiles.cc]
             kind = "claude"
 
+            [dashboard]
+            group_from_tmux = true
+
             [manager]
             silence = "30s"
             typing_grace = "5s"
@@ -302,6 +315,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.default_group.as_deref(), Some("work"));
         assert_eq!(config.detach_key.byte(), 0x02);
+        assert!(config.dashboard.group_from_tmux);
         let review = config.profile("review").unwrap();
         assert_eq!(review.program.as_deref(), Some("claude"));
         assert_eq!(review.labels["role"], "reviewer");

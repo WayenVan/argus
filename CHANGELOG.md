@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `[dashboard] group_from_tmux = true` makes the dashboard's `a` prefill
+  `--in` with its tmux session name instead of the group under the cursor.
+
 ## [0.2.3] - 2026-09-29
 
 ### Changed

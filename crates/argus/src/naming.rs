@@ -64,6 +64,26 @@ pub fn normalize_group(group: &str) -> Result<Option<String>> {
     Ok(Some(group.to_string()))
 }
 
+/// Turns free text, such as a tmux session name, into a one-segment group:
+/// lowercase, each run of disallowed characters becomes `-`. A result that
+/// would still be rejected (all digits, `self`, `.`) gets a `tmux-` prefix.
+/// `None` when nothing usable is left.
+pub fn group_from_text(text: &str) -> Option<String> {
+    let mut group = String::new();
+    for c in text.to_lowercase().chars() {
+        if matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-') {
+            group.push(c);
+        } else if !group.ends_with('-') {
+            group.push('-');
+        }
+    }
+    let group = group.trim_matches('-');
+    if group.is_empty() {
+        return None;
+    }
+    Some(if validate_segment(group).is_ok() { group.to_string() } else { format!("tmux-{group}") })
+}
+
 /// Derives the kind from the program name: `/usr/bin/Claude` → `claude`.
 pub fn kind_of(program: &str) -> String {
     let base = program.rsplit('/').next().unwrap_or(program).to_ascii_lowercase();
@@ -186,6 +206,21 @@ mod tests {
         let mut other = "claude-1".to_string();
         expand_self(&mut other).unwrap();
         assert_eq!(other, "claude-1");
+    }
+
+    #[test]
+    fn group_from_text_makes_a_valid_group() {
+        assert_eq!(group_from_text("work").as_deref(), Some("work"));
+        assert_eq!(group_from_text("My Proj: API/v2").as_deref(), Some("my-proj-api-v2"));
+        assert_eq!(group_from_text("  -x- ").as_deref(), Some("x"));
+        assert_eq!(group_from_text("0").as_deref(), Some("tmux-0"));
+        assert_eq!(group_from_text("self").as_deref(), Some("tmux-self"));
+        assert_eq!(group_from_text("..").as_deref(), Some("tmux-.."));
+        assert_eq!(group_from_text("中文"), None);
+        assert_eq!(group_from_text(""), None);
+        for text in ["0", "self", "..", "a b", "A.B_c"] {
+            validate_name(&group_from_text(text).unwrap()).unwrap();
+        }
     }
 
     fn agent(id: u64, name: &str) -> AgentInfo {
