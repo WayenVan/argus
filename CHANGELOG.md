@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-29
+
 ### Added
 
 - `[dashboard] group_from_tmux = true` makes the dashboard's `a` prefill
@@ -288,7 +290,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `argus run`, `argus attach`, and `argus grid`/`tree` dashboards with
   rename/move/kill/copy/new-agent shortcuts and tmux pane jumps.
 
-[Unreleased]: https://github.com/WayenVan/argus/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/WayenVan/argus/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/WayenVan/argus/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/WayenVan/argus/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/WayenVan/argus/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/WayenVan/argus/compare/v0.2.0...v0.2.1
